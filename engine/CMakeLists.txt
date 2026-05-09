@@ -18,12 +18,14 @@ file(GLOB_RECURSE ENGINE_HEADERS
 list(APPEND ENGINE_SOURCES
     "src/renderer/device_context.cpp"
     "src/renderer/display_output.cpp"
+    "src/renderer/display_manager.cpp"
 )
 list(REMOVE_DUPLICATES ENGINE_SOURCES)
 
 list(APPEND ENGINE_HEADERS
     "include/mars_engine/renderer/device_context.h"
     "include/mars_engine/renderer/display_output.h"
+    "include/mars_engine/renderer/display_manager.h"
 )
 list(REMOVE_DUPLICATES ENGINE_HEADERS)
 

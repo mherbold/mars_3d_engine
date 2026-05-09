@@ -2,9 +2,10 @@
 // renderer.h
 // MARS 3D Engine — Renderer public API
 //
-// The Renderer owns a DeviceContext and a DisplayOutput.  For M1 it clears
-// the back buffer to a solid color each frame and presents.  Later milestones
-// will add the DXR path-tracing pipeline, denoising, and DLSS integration.
+// The Renderer owns a DeviceContext and a DisplayManager.  For M1/M2 it
+// clears all active back buffers to a solid color each frame and presents.
+// Later milestones will add the DXR path-tracing pipeline, denoising, and
+// DLSS integration.
 // =============================================================================
 
 #pragma once
@@ -12,11 +13,13 @@
 #include "../engine_api.h"
 #include "../d3d12_agility.h"
 #include "device_context.h"
-#include "display_output.h"
+#include "display_manager.h"
 
 #include <wrl/client.h>
 #include <array>
 #include <cstdint>
+#include <vector>
+#include <string>
 
 namespace mars
 {
@@ -35,27 +38,42 @@ public:
     Renderer(const Renderer&)            = delete;
     Renderer& operator=(const Renderer&) = delete;
 
-    // Create device, queues, swap chain, and per-frame command allocators.
+    // Single-monitor convenience init (M1 API preserved for test_app).
+    // Creates one DisplayOutput for `hwnd` at the given resolution.
     void init(HWND hwnd, uint32_t width, uint32_t height);
+
+    // Multi-monitor init.  Reads `display_json_path` to build display configs;
+    // `hwnds` provides one HWND per configured monitor (or one shared HWND).
+    void init(const std::string&          display_json_path,
+              const std::vector<HWND>&    hwnds);
+
     void shutdown();
 
-    // Call when the window is resized.
+    // Call when output `output_index` has been resized.
+    void on_resize(uint32_t output_index, uint32_t width, uint32_t height);
+
+    // Single-output resize convenience (maps to output 0).
     void on_resize(uint32_t width, uint32_t height);
 
-    // Render one frame: clear the back buffer and present.
+    // Render one frame across all active DisplayOutputs.
     void render_frame();
 
     // ---- Accessors ----------------------------------------------------------
-    DeviceContext&  device_context() { return m_device_ctx; }
-    DisplayOutput&  display_output() { return m_display_output; }
+    DeviceContext&   device_context()              { return m_device_ctx; }
+    DisplayManager&  display_manager()             { return m_display_manager; }
+
+    // Convenience: return the primary (index 0) DisplayOutput.
+    DisplayOutput&   primary_display()             { return m_display_manager.output(0); }
 
 private:
+    void init_internal(const std::vector<DisplayConfig>& configs,
+                       const std::vector<HWND>&          hwnds);
     void create_frame_resources();
     void release_frame_resources();
     void wait_for_frame(uint32_t frame_index);
 
     DeviceContext   m_device_ctx;
-    DisplayOutput   m_display_output;
+    DisplayManager  m_display_manager;
 
     // Per-frame command allocators (one per back buffer).
     std::array<ComPtr<ID3D12CommandAllocator>, k_frame_count>  m_cmd_allocators;

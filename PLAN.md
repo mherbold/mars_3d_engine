@@ -545,9 +545,9 @@ WinMain
 
 | Milestone | Description | Status |
 |---|---|---|
-| **M0** | Repo scaffold, CMake, third-party deps | 🔲 Not started |
-| **M1** | D3D12 device init, swap chain, clear-color present | 🔲 Not started |
-| **M2** | Multi-monitor display system | 🔲 Not started |
+| **M0** | Repo scaffold, CMake, third-party deps | ✅ Complete |
+| **M1** | D3D12 device init, swap chain, clear-color present | ✅ Complete |
+| **M2** | Multi-monitor display system | ✅ Complete |
 | **M3** | Asset pipeline: load FBX/glTF, upload to GPU | 🔲 Not started |
 | **M4** | DXR pipeline: primary rays, basic PBR hit shader | 🔲 Not started |
 | **M5** | Scene file parser, static scene rendering | 🔲 Not started |

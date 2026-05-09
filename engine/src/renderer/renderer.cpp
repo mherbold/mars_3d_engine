@@ -1,6 +1,6 @@
 // =============================================================================
 // renderer.cpp
-// MARS 3D Engine — Renderer implementation (M1: clear + present)
+// MARS 3D Engine — Renderer implementation (M2: multi-monitor clear + present)
 // =============================================================================
 
 #include "mars_engine/renderer/renderer.h"
@@ -18,30 +18,71 @@ static void throw_if_failed(HRESULT hr, const char* msg)
 }
 
 // ---------------------------------------------------------------------------
-// init / shutdown
+// Public init overloads
 // ---------------------------------------------------------------------------
+
+// Single-monitor convenience (M1 API preserved).
 void Renderer::init(HWND hwnd, uint32_t width, uint32_t height)
+{
+    DisplayConfig cfg;
+    cfg.width  = width;
+    cfg.height = height;
+    init_internal({ cfg }, { hwnd });
+}
+
+// Multi-monitor init: load display.json, create one output per entry.
+void Renderer::init(const std::string& display_json_path, const std::vector<HWND>& hwnds)
+{
+    std::vector<DisplayConfig> configs;
+    m_display_manager.load_config(display_json_path, configs);
+
+    // If json was empty/missing, default to one output per provided HWND.
+    if (configs.empty())
+    {
+        for (uint32_t i = 0; i < static_cast<uint32_t>(hwnds.size()); ++i)
+        {
+            DisplayConfig cfg;
+            cfg.monitor_index = i;
+            configs.push_back(cfg);
+        }
+    }
+
+    // Ensure we have enough HWNDs: duplicate the last one if needed.
+    std::vector<HWND> padded_hwnds = hwnds;
+    while (padded_hwnds.size() < configs.size())
+        padded_hwnds.push_back(padded_hwnds.back());
+
+    init_internal(configs, padded_hwnds);
+}
+
+// ---------------------------------------------------------------------------
+// init_internal (private) — common path for both overloads
+// ---------------------------------------------------------------------------
+void Renderer::init_internal(const std::vector<DisplayConfig>& configs,
+                              const std::vector<HWND>&          hwnds)
 {
     if (m_initialised) return;
 
     m_device_ctx.init();
-    m_display_output.init(m_device_ctx, hwnd, width, height);
+    m_display_manager.init(m_device_ctx, configs, hwnds);
     create_frame_resources();
 
     m_initialised = true;
 }
 
+// ---------------------------------------------------------------------------
+// shutdown
+// ---------------------------------------------------------------------------
 void Renderer::shutdown()
 {
     if (!m_initialised) return;
 
-    // Wait for all in-flight frames before releasing resources.
     m_device_ctx.flush_gpu();
     for (uint32_t i = 0; i < k_frame_count; ++i)
         wait_for_frame(i);
 
     release_frame_resources();
-    m_display_output.shutdown();
+    m_display_manager.shutdown();
     m_device_ctx.shutdown();
 
     m_initialised = false;
@@ -68,7 +109,6 @@ void Renderer::create_frame_resources()
         m_frame_fence_values[i] = 0;
     }
 
-    // Single re-usable command list (reset each frame with the matching allocator).
     throw_if_failed(
         device->CreateCommandList(
             0,
@@ -78,9 +118,8 @@ void Renderer::create_frame_resources()
             IID_PPV_ARGS(&m_cmd_list)),
         "CreateCommandList failed");
     m_cmd_list->SetName(L"MARS::MainCmdList");
-    m_cmd_list->Close();  // Start in closed state; we reset before first use.
+    m_cmd_list->Close();
 
-    // Frame fence (signals after each Present).
     throw_if_failed(
         device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_frame_fence)),
         "CreateFence (frame) failed");
@@ -112,54 +151,77 @@ void Renderer::wait_for_frame(uint32_t frame_index)
 }
 
 // ---------------------------------------------------------------------------
-// on_resize
+// on_resize overloads
 // ---------------------------------------------------------------------------
-void Renderer::on_resize(uint32_t width, uint32_t height)
+void Renderer::on_resize(uint32_t output_index, uint32_t width, uint32_t height)
 {
     m_device_ctx.flush_gpu();
-    m_display_output.resize(width, height);
+    m_display_manager.resize(output_index, width, height);
+}
+
+void Renderer::on_resize(uint32_t width, uint32_t height)
+{
+    on_resize(0, width, height);
 }
 
 // ---------------------------------------------------------------------------
-// render_frame  (M1: clear back buffer to a color, present)
+// render_frame  (M2: clear all outputs to distinct colors, then present each)
+//
+// Each DisplayOutput is independent — we record a separate command list
+// submission for each monitor so they can have different back-buffer indices
+// in flight simultaneously.  (For M2 all outputs share the same k_frame_count
+// fencing; a future milestone can give each output its own fence ring.)
 // ---------------------------------------------------------------------------
 void Renderer::render_frame()
 {
-    uint32_t back_index = m_display_output.current_back_buffer_index();
+    // All outputs share the same command allocator ring for now.
+    // The back-buffer index for fencing comes from the primary output (index 0).
+    uint32_t back_index = (m_display_manager.output_count() > 0)
+        ? m_display_manager.output(0).current_back_buffer_index()
+        : 0;
 
-    // Wait for the GPU to finish using this back buffer's allocator.
     wait_for_frame(back_index);
 
-    // Reset command allocator + list for this frame.
     throw_if_failed(m_cmd_allocators[back_index]->Reset(), "CommandAllocator::Reset failed");
     throw_if_failed(m_cmd_list->Reset(m_cmd_allocators[back_index].Get(), nullptr),
                     "CommandList::Reset failed");
 
-    // Transition back buffer: Present → Render Target.
-    m_display_output.transition(m_cmd_list.Get(),
-                                D3D12_RESOURCE_STATE_PRESENT,
-                                D3D12_RESOURCE_STATE_RENDER_TARGET);
+    // Distinct clear colors per output role so multi-monitor is visually obvious.
+    static constexpr FLOAT k_clear_colors[][4] = {
+        { 0.01f, 0.05f, 0.15f, 1.0f },  // Center  — deep navy
+        { 0.12f, 0.04f, 0.04f, 1.0f },  // Left    — deep red
+        { 0.04f, 0.12f, 0.04f, 1.0f },  // Right   — deep green
+        { 0.10f, 0.08f, 0.02f, 1.0f },  // Overhead— deep amber
+        { 0.05f, 0.05f, 0.05f, 1.0f },  // Custom / extra
+    };
 
-    // Clear to a deep navy color (visible, non-black, easy to confirm).
-    const FLOAT clear_color[4] = { 0.01f, 0.05f, 0.15f, 1.0f };
-    auto rtv = m_display_output.current_rtv();
-    m_cmd_list->ClearRenderTargetView(rtv, clear_color, 0, nullptr);
+    for (uint32_t oi = 0; oi < m_display_manager.output_count(); ++oi)
+    {
+        DisplayOutput& out = m_display_manager.output(oi);
 
-    // Transition back buffer: Render Target → Present.
-    m_display_output.transition(m_cmd_list.Get(),
-                                D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                D3D12_RESOURCE_STATE_PRESENT);
+        out.transition(m_cmd_list.Get(),
+                       D3D12_RESOURCE_STATE_PRESENT,
+                       D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+        const FLOAT* color = k_clear_colors[
+            oi < std::size(k_clear_colors) ? oi : (std::size(k_clear_colors) - 1)];
+        auto rtv = out.current_rtv();
+        m_cmd_list->ClearRenderTargetView(rtv, color, 0, nullptr);
+
+        out.transition(m_cmd_list.Get(),
+                       D3D12_RESOURCE_STATE_RENDER_TARGET,
+                       D3D12_RESOURCE_STATE_PRESENT);
+    }
 
     throw_if_failed(m_cmd_list->Close(), "CommandList::Close failed");
 
-    // Execute.
     ID3D12CommandList* lists[] = { m_cmd_list.Get() };
     m_device_ctx.direct_queue()->ExecuteCommandLists(1, lists);
 
-    // Present.
-    m_display_output.present(true);
+    // Present all outputs.
+    for (uint32_t oi = 0; oi < m_display_manager.output_count(); ++oi)
+        m_display_manager.output(oi).present(true);
 
-    // Signal frame fence so we know when the GPU is done with this frame.
     ++m_frame_fence_next;
     m_device_ctx.direct_queue()->Signal(m_frame_fence.Get(), m_frame_fence_next);
     m_frame_fence_values[back_index] = m_frame_fence_next;

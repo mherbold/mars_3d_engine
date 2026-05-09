@@ -1,6 +1,6 @@
 # PROGRESS.md — MARS 3D Engine Implementation Progress
 
-Last updated: 2025-07
+Last updated: 2025-07 (M2)
 
 ---
 
@@ -15,8 +15,8 @@ Last updated: 2025-07
 ---
 
 ## Current Focus
-> **M1 fully complete** — D3D12 device, swap chain, clear-color present all working. Window displays a deep navy clear color.
-> Next step: **Milestone M2** — Multi-monitor display system.
+> **M2 fully complete** — Multi-monitor display system implemented. `DisplayManager` enumerates DXGI outputs, creates one `DisplayOutput` per `display.json` entry, and renders distinct clear colors per monitor.
+> Next step: **Milestone M3** — Asset pipeline: FBX/glTF load + GPU upload.
 
 ---
 
@@ -26,7 +26,7 @@ Last updated: 2025-07
 |---|---|---|---|
 | M0 | Repo scaffold, CMake, third-party deps | ✅ | See M0 details below |
 | M1 | D3D12 device init, swap chain, clear-color present | ✅ | See M1 details below |
-| M2 | Multi-monitor display system | 🔲 | |
+| M2 | Multi-monitor display system | ✅ | See M2 details below |
 | M3 | Asset pipeline: FBX/glTF load + GPU upload | 🔲 | |
 
 ---
@@ -111,11 +111,16 @@ Last updated: 2025-07
 - ✅ Test app: Win32 window + message loop driving M1 code
 
 ### M2 — Multi-Monitor Display System
-- 🔲 `DisplayManager`: enumerate `IDXGIOutput` objects
-- 🔲 Parse `display.json` config
-- 🔲 Create one `DisplayOutput` per enabled monitor
-- 🔲 Per-display `Camera` with yaw/pitch/fov offsets
-- 🔲 Test: render a different clear color on each monitor
+- ✅ `DisplayManager` class: enumerates `IDXGIOutput` objects on the selected adapter
+- ✅ `load_config()`: parses `display.json` via nlohmann/json; falls back to single-monitor default
+- ✅ `DisplayConfig` / `MonitorRole` structs for per-display yaw/pitch/fov offsets
+- ✅ Creates one `DisplayOutput` per `DisplayConfig` entry (native-resolution auto-detection from DXGI output desc)
+- ✅ `Renderer` updated: owns `DisplayManager`; single-monitor `init(hwnd, w, h)` overload preserved
+- ✅ `render_frame()` loops over all outputs, clears each to a distinct color, presents all
+- ✅ `on_resize(output_index, w, h)` per-output resize path
+- ✅ Test app: creates one Win32 window per `DisplayConfig`; reads `display.json` from working directory
+- ✅ Sample `display.json` added at repo root
+- ✅ Build clean
 
 ### M3 — Asset Pipeline
 - 🔲 `MeshLoader`: Assimp → interleaved vertex / index buffer on GPU

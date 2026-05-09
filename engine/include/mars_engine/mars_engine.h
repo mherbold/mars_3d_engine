@@ -14,4 +14,5 @@
 #include "camera/camera.h"
 #include "renderer/device_context.h"
 #include "renderer/display_output.h"
+#include "renderer/display_manager.h"
 #include "renderer/renderer.h"
