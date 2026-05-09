@@ -15,9 +15,11 @@
                 "value": "x64",
                 "strategy": "set"
             },
-            "binaryDir": "${sourceDir}/build/debug",
+            "binaryDir": "C:/mars_build/debug",
             "cacheVariables": {
-                "CMAKE_INSTALL_PREFIX": "${sourceDir}/install/debug"
+                "CMAKE_INSTALL_PREFIX": "C:/mars_build/install/debug",
+                "FETCHCONTENT_BASE_DIR": "C:/mars_build/fetchcontent",
+                "MARS_ENABLE_DEV_UI": "ON"
             },
             "condition": {
                 "type": "equals",
@@ -34,9 +36,11 @@
                 "value": "x64",
                 "strategy": "set"
             },
-            "binaryDir": "${sourceDir}/build/release",
+            "binaryDir": "C:/mars_build/release",
             "cacheVariables": {
-                "CMAKE_INSTALL_PREFIX": "${sourceDir}/install/release"
+                "CMAKE_INSTALL_PREFIX": "C:/mars_build/install/release",
+                "FETCHCONTENT_BASE_DIR": "C:/mars_build/fetchcontent",
+                "MARS_ENABLE_DEV_UI": "OFF"
             },
             "condition": {
                 "type": "equals",

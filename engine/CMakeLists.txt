@@ -1,5 +1,5 @@
 # =============================================================================
-# mars_engine — MARS Full Path Tracing 3D Engine (Windows Shared Library / DLL)
+# mars_engine — MARS Full Path Tracing 3D Engine (Static Library)
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -17,9 +17,9 @@ file(GLOB_RECURSE ENGINE_HEADERS
 
 # -----------------------------------------------------------------------------
 # Library target
-# SHARED produces a .dll + .lib import library on Windows.
+# STATIC produces a .lib that the test_app links directly.
 # -----------------------------------------------------------------------------
-add_library(mars_engine SHARED
+add_library(mars_engine STATIC
     ${ENGINE_SOURCES}
     ${ENGINE_HEADERS}
 )
@@ -33,9 +33,6 @@ add_library(MARS::Engine ALIAS mars_engine)
 set_target_properties(mars_engine PROPERTIES
     OUTPUT_NAME   "mars_engine"
     VERSION       ${PROJECT_VERSION}
-    SOVERSION     ${PROJECT_VERSION_MAJOR}
-    # Symbols are controlled manually via MARS_ENGINE_API macro (see engine_api.h)
-    WINDOWS_EXPORT_ALL_SYMBOLS OFF
 )
 
 # -----------------------------------------------------------------------------
@@ -57,14 +54,11 @@ target_include_directories(mars_engine
 #   MARS_ENGINE_IMPORTS — inherited by consumers; enables dllimport.
 # -----------------------------------------------------------------------------
 target_compile_definitions(mars_engine
-    PRIVATE
-        MARS_ENGINE_EXPORTS
+    PUBLIC
         WIN32_LEAN_AND_MEAN
         NOMINMAX
         UNICODE
         _UNICODE
-    INTERFACE
-        MARS_ENGINE_IMPORTS
 )
 
 # -----------------------------------------------------------------------------
@@ -81,6 +75,18 @@ target_compile_options(mars_engine
 )
 
 # -----------------------------------------------------------------------------
+# Windows Agility SDK — Agility headers shadow the Windows SDK d3d12.h;
+# d3dx12_property_format_table.cpp is added to engine sources here.
+# -----------------------------------------------------------------------------
+mars_configure_agility_sdk(mars_engine)
+
+# -----------------------------------------------------------------------------
+# Shader compilation target (HLSL -> DXIL via DXC)
+# -----------------------------------------------------------------------------
+add_subdirectory(shaders)
+add_dependencies(mars_engine shaders_dxil)
+
+# -----------------------------------------------------------------------------
 # Windows / DirectX 12 system libraries
 #   d3d12      — Direct3D 12 (GPU commands, DXR ray tracing pipeline)
 #   dxgi       — DXGI swap chain and adapter enumeration
@@ -88,9 +94,44 @@ target_compile_options(mars_engine
 #   d3dcompiler — Runtime HLSL shader compilation
 # -----------------------------------------------------------------------------
 target_link_libraries(mars_engine
-    PRIVATE
+    PUBLIC
         d3d12.lib
         dxgi.lib
         dxguid.lib
         d3dcompiler.lib
+        assimp::assimp
+        nlohmann_json::nlohmann_json
+        D3D12MemoryAllocator
+        harfbuzz
+        freetype
+        MARS::DirectXTK12
+        MARS::DirectXTex
+        MARS::DirectXMesh
+        MARS::Streamline
 )
+
+# NVIDIA Nsight Aftermath — GPU crash-dump capture; treated as dev/debug tool
+if(AFTERMATH_SDK_FOUND)
+    target_link_libraries(mars_engine PRIVATE MARS::NsightAftermath)
+endif()
+
+# MARS_ENABLE_DEV_UI
+if(MARS_ENABLE_DEV_UI)
+    target_compile_definitions(mars_engine PUBLIC MARS_ENABLE_DEV_UI)
+    # ImGui is header-only from FetchContent; create an interface target
+    add_library(imgui_impl STATIC
+        ${imgui_SOURCE_DIR}/imgui.cpp
+        ${imgui_SOURCE_DIR}/imgui_draw.cpp
+        ${imgui_SOURCE_DIR}/imgui_tables.cpp
+        ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_dx12.cpp
+    )
+    target_include_directories(imgui_impl
+        PUBLIC
+            ${imgui_SOURCE_DIR}
+            ${imgui_SOURCE_DIR}/backends
+    )
+    target_link_libraries(imgui_impl PUBLIC d3d12.lib dxgi.lib)
+    target_link_libraries(mars_engine PUBLIC imgui_impl)
+endif()

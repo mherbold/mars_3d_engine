@@ -21,6 +21,11 @@ int WINAPI WinMain(
     _In_     LPSTR     lpCmdLine,
     _In_     int       nShowCmd)
 {
+    (void)hInstance;
+    (void)hPrevInstance;
+    (void)lpCmdLine;
+    (void)nShowCmd;
+
     // TODO: Implement application startup, main loop, and shutdown.
     return 0;
 }

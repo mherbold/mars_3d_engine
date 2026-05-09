@@ -15,8 +15,8 @@ Last updated: 2025-07
 ---
 
 ## Current Focus
-> **Nothing implemented yet.** Starting from the empty CMake scaffold.  
-> Next step: **Milestone M0** — wire up third-party dependencies and the CMake shader compilation target.
+> **M0 fully complete** — all automated and manual steps done, including NVIDIA SDKs and DXC.  
+> Next step: **Milestone M1** — D3D12 device init, swap chain, clear-color present.
 
 ---
 
@@ -24,10 +24,45 @@ Last updated: 2025-07
 
 | Milestone | Title | Status | Notes |
 |---|---|---|---|
-| M0 | Repo scaffold, CMake, third-party deps | 🔲 | |
+| M0 | Repo scaffold, CMake, third-party deps | ✅ | See M0 details below |
 | M1 | D3D12 device init, swap chain, clear-color present | 🔲 | |
 | M2 | Multi-monitor display system | 🔲 | |
 | M3 | Asset pipeline: FBX/glTF load + GPU upload | 🔲 | |
+
+---
+
+## M0 — Completed Work
+
+### Automated (done)
+| Item | Detail |
+|---|---|
+| Engine target | Converted `mars_engine` from `SHARED` to `STATIC`; DLL macros neutralised |
+| `engine_api.h` | `MARS_ENGINE_API` kept as no-op placeholder for future use |
+| Root `CMakeLists.txt` | `MARS_ENABLE_DEV_UI` option; `cmake/` module path; all FetchContent declarations |
+| `cmake/CompileHLSL.cmake` | `target_compile_hlsl()` function; auto-locates DXC; per-file `// #profile` hint |
+| Shader stubs | All HLSL/HLSLI files from the plan created under `engine/shaders/` |
+| `engine/shaders/CMakeLists.txt` | `shaders_dxil` custom target; VS IDE source groups |
+| FetchContent deps | Assimp 5.4.3, nlohmann/json 3.11.3, D3D12MA 2.0.1, HarfBuzz 9.0.0, FreeType 2.13.3, msdfgen 1.12 |
+| Dev-only ImGui | ImGui 1.91.8 fetched and compiled only when `MARS_ENABLE_DEV_UI=ON` |
+| `CMakePresets.json` | `MARS_ENABLE_DEV_UI=ON` for debug, `OFF` for release; build dirs moved to `C:/mars_build/` to avoid OneDrive locking FetchContent git pack files; `FETCHCONTENT_BASE_DIR=C:/mars_build/fetchcontent` |
+| Build verification | `mars_engine.lib` and `mars_test_app.exe` compile clean (Debug) |
+
+### Manual steps — all complete ✅
+| Item | Detail |
+|---|---|
+| **Windows Agility SDK** | ✅ `Microsoft.Direct3D.D3D12` 1.614.1 extracted to `C:/mars_deps/nuget/`; wired via `cmake/AgilitySDK.cmake` |
+| **DirectXTK12** | ✅ `directxtk12_desktop_win10` 2026.4.1.1 extracted; imported as `MARS::DirectXTK12` |
+| **DirectXTex** | ✅ `directxtex_desktop_win10` 2026.5.8.1 extracted; imported as `MARS::DirectXTex` |
+| **DirectXMesh** | ✅ `directxmesh_desktop_win10` 2026.5.8.1 extracted; imported as `MARS::DirectXMesh` |
+| **NVIDIA Streamline SDK (DLSS 4)** | ✅ Streamline SDK v2.11.1 copied to `C:/mars_deps/`; `cmake/StreamlineSDK.cmake` provides `MARS::Streamline` target and `mars_deploy_streamline()` post-build DLL deploy |
+| **NVIDIA Nsight Aftermath** | ✅ Aftermath SDK 2025.5.0 copied to `C:/mars_deps/`; `cmake/NsightAftermath.cmake` provides `MARS::NsightAftermath` target and `mars_deploy_aftermath()` post-build DLL deploy |
+| **DXC on PATH** | ✅ `dxc.exe` found at `C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64`; `shaders_dxil` target armed |
+
+### Deferred to later milestones
+| Item | Detail | When |
+|---|---|---|
+| **FreeType + HarfBuzz font integration** | Currently `HB_HAVE_FREETYPE=OFF`; enable once FreeType is wired via `CMAKE_PREFIX_PATH` | M16 |
+| **msdfgen with font input** | Currently `MSDFGEN_CORE_ONLY=ON`; enable `msdfgen-ext` once FreeType is wired | M16 |
 | M4 | DXR pipeline: primary rays, basic PBR hit shader | 🔲 | |
 | M5 | Scene file parser, static scene rendering | 🔲 | |
 | M6 | DLSS 4 integration (upscale, Multi Frame Generation, Ray Reconstruction) | 🔲 | Requires DLSS SDK NDA access |
@@ -49,21 +84,21 @@ Last updated: 2025-07
 ## Detailed Log
 
 ### M0 — Repo Scaffold, CMake, Third-Party Deps
-- 🔲 Add Windows Agility SDK (D3D12) to CMakeLists
-- 🔲 Add DirectXTK12, DirectXTex, DirectXMesh
-- 🔲 Add Assimp via FetchContent
-- 🔲 Add nlohmann/json via FetchContent
-- 🔲 Add ImGui via FetchContent *(developer debug overlay only — not the game UI)*
-- 🔲 Add HarfBuzz via FetchContent (Unicode text shaping for game UI)
-- 🔲 Add FreeType via FetchContent (font metrics for msdfgen and HarfBuzz at build time)
-- 🔲 Add msdfgen as CMake build-tool target (offline MSDF atlas generation)
-- 🔲 Add D3D12 Memory Allocator (D3D12MA) via FetchContent
-- 🔲 Add WinPixEventRuntime via NuGet
-- 🔲 Add NVIDIA Aftermath SDK (manual — requires NDA download)
-- 🔲 Add NVIDIA DLSS 4 SDK (manual — requires NDA download) — Multi Frame Generation, Transformer-based SR & Ray Reconstruction
-- 🔲 CMake custom target: compile HLSL shaders via DXC
-- 🔲 Create `engine/shaders/` directory structure
-- 🔲 Verify full solution builds cleanly
+- ✅ Add Windows Agility SDK (D3D12) to CMakeLists
+- ✅ Add DirectXTK12, DirectXTex, DirectXMesh
+- ✅ Add Assimp via FetchContent
+- ✅ Add nlohmann/json via FetchContent
+- ✅ Add ImGui via FetchContent *(developer debug overlay only — not the game UI)*
+- ✅ Add HarfBuzz via FetchContent (Unicode text shaping for game UI)
+- ✅ Add FreeType via FetchContent (font metrics for msdfgen and HarfBuzz at build time)
+- ✅ Add msdfgen as CMake build-tool target (offline MSDF atlas generation)
+- ✅ Add D3D12 Memory Allocator (D3D12MA) via FetchContent
+- 🔲 Add WinPixEventRuntime via NuGet *(deferred to M15)*
+- ✅ Add NVIDIA Aftermath SDK — `cmake/NsightAftermath.cmake`; DLLs auto-deployed beside exe
+- ✅ Add NVIDIA DLSS 4 SDK (via Streamline SDK v2.11.1) — `cmake/StreamlineSDK.cmake`; all `sl.*` and `nvngx_*` DLLs auto-deployed beside exe
+- ✅ CMake custom target: compile HLSL shaders via DXC
+- ✅ Create `engine/shaders/` directory structure
+- ✅ Verify full solution builds cleanly
 
 ### M1 — D3D12 Device Init, Swap Chain, Clear-Color Present
 - 🔲 `DeviceContext` class: adapter enumeration, device creation, feature level check
@@ -127,10 +162,10 @@ Last updated: 2025-07
 ---
 
 ## Known Issues / Blockers
-- DLSS 4 SDK and NVIDIA Aftermath SDK require NDA/registered developer access from NVIDIA.
-  These will need to be downloaded manually and placed in `third_party/` before M6 and M15 can proceed.
+- WinPixEventRuntime has not been wired into CMake yet; deferred to M15.
+- FreeType + HarfBuzz font integration and msdfgen-ext are deferred to M16 (not needed until UI work begins).
 - FSR 3 (AMD FidelityFX Super Resolution) is the open-source fallback for non-DLSS hardware;
-  can be integrated via the GPUOpen FidelityFX SDK on GitHub.
+  can be integrated via the GPUOpen FidelityFX SDK on GitHub when needed.
 
 ---
 
@@ -147,3 +182,5 @@ Last updated: 2025-07
 | 2025-07 | HarfBuzz chosen for Unicode text shaping (OpenType, RTL/BiDi) |
 | 2025-07 | Game UI described in `.marsui` JSON files; themed via JSON style sheets |
 | 2025-07 | **HDR is a required engine feature** — HDR10/PQ and scRGB paths must always be fully implemented; engine gracefully falls back to SDR tone-mapping on non-HDR displays |
+| 2025-07 | NVIDIA SDKs delivered via Streamline SDK v2.11.1 (DLSS 4 SR, Frame Gen, Ray Reconstruction, Reflex, NIS) and Nsight Aftermath 2025.5.0; both stored under `C:/mars_deps/` and integrated via custom CMake modules |
+| 2025-07 | DXC sourced from Windows SDK 10.0.26100.0; hardcoded as fallback hint in `cmake/CompileHLSL.cmake` — no separate install required |

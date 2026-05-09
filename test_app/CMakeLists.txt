@@ -38,13 +38,7 @@ target_link_libraries(mars_test_app
 # -----------------------------------------------------------------------------
 # Compile definitions
 # -----------------------------------------------------------------------------
-target_compile_definitions(mars_test_app
-    PRIVATE
-        WIN32_LEAN_AND_MEAN
-        NOMINMAX
-        UNICODE
-        _UNICODE
-)
+# Compile definitions are inherited from mars_engine (PUBLIC) — no extras needed here.
 
 # -----------------------------------------------------------------------------
 # Compiler options (MSVC)
@@ -63,3 +57,30 @@ target_compile_options(mars_test_app
 # Make mars_test_app the default startup project in Visual Studio
 # -----------------------------------------------------------------------------
 set_property(DIRECTORY ${CMAKE_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT mars_test_app)
+
+# -----------------------------------------------------------------------------
+# Windows Agility SDK — deploy runtime DLLs beside the executable
+#
+# mars_configure_agility_sdk() was already called on mars_engine (which
+# provides the headers and d3dx12 impl via PUBLIC linkage).
+# mars_deploy_agility_sdk() must be called on the executable so that
+# D3D12Core.dll / d3d12SDKLayers.dll land next to mars_test_app.exe.
+# agility_sdk_exports.cpp exports D3D12SDKVersion + D3D12SDKPath — these
+# MUST be in the executable, not in the static lib.
+# -----------------------------------------------------------------------------
+target_sources(mars_test_app PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/agility_sdk_exports.cpp"
+)
+mars_deploy_agility_sdk(mars_test_app)
+
+# -----------------------------------------------------------------------------
+# NVIDIA Streamline — deploy sl.*.dll and nvngx_*.dll beside the executable.
+# The engine links sl.interposer.lib (via MARS::Streamline); the DLLs must
+# be co-located with the exe for the runtime loader to find them.
+# -----------------------------------------------------------------------------
+mars_deploy_streamline(mars_test_app)
+
+# -----------------------------------------------------------------------------
+# NVIDIA Nsight Aftermath — deploy GFSDK_Aftermath_Lib.x64.dll beside the exe.
+# -----------------------------------------------------------------------------
+mars_deploy_aftermath(mars_test_app)

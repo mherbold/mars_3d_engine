@@ -10,10 +10,7 @@
 
 #pragma once
 
-#if defined(MARS_ENGINE_EXPORTS)
-    #define MARS_ENGINE_API __declspec(dllexport)
-#elif defined(MARS_ENGINE_IMPORTS)
-    #define MARS_ENGINE_API __declspec(dllimport)
-#else
-    #define MARS_ENGINE_API
-#endif
+// mars_engine is a static library — no dllexport/dllimport needed.
+// MARS_ENGINE_API is kept as a no-op placeholder so that existing and future
+// declarations compile unchanged if the library is ever converted to a DLL.
+#define MARS_ENGINE_API
