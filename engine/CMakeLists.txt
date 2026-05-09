@@ -19,6 +19,10 @@ list(APPEND ENGINE_SOURCES
     "src/renderer/device_context.cpp"
     "src/renderer/display_output.cpp"
     "src/renderer/display_manager.cpp"
+    "src/asset/asset_importer.cpp"
+    "src/asset/gpu_mesh_buffer.cpp"
+    "src/asset/texture_loader.cpp"
+    "src/asset/resource_manager.cpp"
 )
 list(REMOVE_DUPLICATES ENGINE_SOURCES)
 
@@ -26,6 +30,11 @@ list(APPEND ENGINE_HEADERS
     "include/mars_engine/renderer/device_context.h"
     "include/mars_engine/renderer/display_output.h"
     "include/mars_engine/renderer/display_manager.h"
+    "include/mars_engine/asset/asset_types.h"
+    "include/mars_engine/asset/asset_importer.h"
+    "include/mars_engine/asset/gpu_mesh_buffer.h"
+    "include/mars_engine/asset/texture_loader.h"
+    "include/mars_engine/asset/resource_manager.h"
 )
 list(REMOVE_DUPLICATES ENGINE_HEADERS)
 
@@ -60,6 +69,7 @@ target_include_directories(mars_engine
         $<INSTALL_INTERFACE:include>
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${d3d12memoryallocator_SOURCE_DIR}/include
 )
 
 # -----------------------------------------------------------------------------

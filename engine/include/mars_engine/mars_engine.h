@@ -16,3 +16,8 @@
 #include "renderer/display_output.h"
 #include "renderer/display_manager.h"
 #include "renderer/renderer.h"
+#include "asset/asset_types.h"
+#include "asset/asset_importer.h"
+#include "asset/gpu_mesh_buffer.h"
+#include "asset/texture_loader.h"
+#include "asset/resource_manager.h"

@@ -1,6 +1,6 @@
 # PROGRESS.md — MARS 3D Engine Implementation Progress
 
-Last updated: 2025-07 (M2)
+Last updated: 2025-07 (M3)
 
 ---
 
@@ -15,8 +15,8 @@ Last updated: 2025-07 (M2)
 ---
 
 ## Current Focus
-> **M2 fully complete** — Multi-monitor display system implemented. `DisplayManager` enumerates DXGI outputs, creates one `DisplayOutput` per `display.json` entry, and renders distinct clear colors per monitor.
-> Next step: **Milestone M3** — Asset pipeline: FBX/glTF load + GPU upload.
+> **M3 fully complete** — Asset pipeline implemented. `AssetImporter` (Assimp) loads FBX/glTF/OBJ into CPU `ModelAsset` structures. `GpuMeshBuffer` uploads interleaved vertex + index data to D3D12 DEFAULT-heap buffers via the Copy queue and registers a bindless SRV. `TextureLoader` (DirectXTex) loads DDS/PNG/EXR/HDR textures with mip generation and registers bindless SRVs. `ResourceManager` owns the D3D12MA allocator, caches loaded assets by path, and exposes `load_model()` / `load_texture()`. Math types (`Vec2`, `Vec3`, `Vec4`, `Mat4x4`, `Quaternion`, `Transform`, `AABB`) fully defined. `Scene` wired to hold `SceneModelInstance` list backed by `ResourceManager`.
+> Next step: **Milestone M4** — DXR pipeline: primary rays, basic PBR hit shader.
 
 ---
 
@@ -27,7 +27,7 @@ Last updated: 2025-07 (M2)
 | M0 | Repo scaffold, CMake, third-party deps | ✅ | See M0 details below |
 | M1 | D3D12 device init, swap chain, clear-color present | ✅ | See M1 details below |
 | M2 | Multi-monitor display system | ✅ | See M2 details below |
-| M3 | Asset pipeline: FBX/glTF load + GPU upload | 🔲 | |
+| M3 | Asset pipeline: FBX/glTF load + GPU upload | ✅ | See M3 details below |
 
 ---
 
@@ -163,6 +163,32 @@ Last updated: 2025-07 (M2)
 - 🔲 Theme/style sheet system (JSON): colors, spacing, animation curves
 - 🔲 HDR-aware color pipeline for UI (linear → tone map per display)
 - 🔲 Per-monitor DPI scaling support
+
+---
+
+## M3 — Completed Work
+
+### New Files
+| File | Purpose |
+|---|---|
+| `engine/include/mars_engine/math/math_types.h` | `Vec2`, `Vec3`, `Vec4`, `Mat4x4`, `Quaternion`, `Transform`, `AABB` — inline math types |
+| `engine/include/mars_engine/asset/asset_types.h` | CPU-side: `Vertex`, `MeshData`, `MaterialData`, `ModelAsset`, `TextureRef` |
+| `engine/include/mars_engine/asset/asset_importer.h` | `AssetImporter` — Assimp-based FBX/glTF/OBJ loader |
+| `engine/src/asset/asset_importer.cpp` | Implementation: scene-graph traversal, mesh/material extraction |
+| `engine/include/mars_engine/asset/gpu_mesh_buffer.h` | `GpuMeshBuffer` — D3D12 VB/IB + bindless SRV |
+| `engine/src/asset/gpu_mesh_buffer.cpp` | Upload via Copy queue, D3D12MA DEFAULT-heap allocation |
+| `engine/include/mars_engine/asset/texture_loader.h` | `GpuTexture`, `TextureLoader` — DirectXTex loader |
+| `engine/src/asset/texture_loader.cpp` | DDS/PNG/EXR/HDR load, mip generation, bindless SRV registration |
+| `engine/include/mars_engine/asset/resource_manager.h` | `ResourceManager`, `GpuModel` — owns allocator + asset caches |
+| `engine/src/asset/resource_manager.cpp` | D3D12MA allocator init, `load_model()` / `load_texture()` |
+
+### Updated Files
+| File | Change |
+|---|---|
+| `engine/include/mars_engine/scene/scene.h` | `Scene` now holds `SceneModelInstance` list; `add_model()` wired to `ResourceManager` |
+| `engine/src/scene/scene.cpp` | Scene load/unload/add_model implemented |
+| `engine/include/mars_engine/mars_engine.h` | Added all new asset headers to public single-include |
+| `engine/CMakeLists.txt` | Added asset source files, D3D12MA private include path |
 
 ---
 
