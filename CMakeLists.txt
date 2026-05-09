@@ -118,6 +118,9 @@ if(MARS_ENABLE_DEV_UI)
 endif()
 
 # Make all declared packages available (downloads + configures)
+# FETCHCONTENT_UPDATES_DISCONNECTED prevents re-download/re-clone when the
+# source directory already exists (avoids OneDrive file-lock issues).
+set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL "" FORCE)
 if(MARS_ENABLE_DEV_UI)
     FetchContent_MakeAvailable(assimp nlohmann_json D3D12MemoryAllocator harfbuzz freetype msdfgen imgui)
 else()

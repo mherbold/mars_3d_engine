@@ -4,7 +4,6 @@
 
 # -----------------------------------------------------------------------------
 # Source and header discovery
-# Using explicit globbing here; switch to explicit file lists as the project grows.
 # -----------------------------------------------------------------------------
 file(GLOB_RECURSE ENGINE_SOURCES
     "src/*.cpp"
@@ -14,6 +13,19 @@ file(GLOB_RECURSE ENGINE_HEADERS
     "include/*.h"
     "include/*.hpp"
 )
+
+# Explicit list ensures new files are included even before the next GLOB re-run.
+list(APPEND ENGINE_SOURCES
+    "src/renderer/device_context.cpp"
+    "src/renderer/display_output.cpp"
+)
+list(REMOVE_DUPLICATES ENGINE_SOURCES)
+
+list(APPEND ENGINE_HEADERS
+    "include/mars_engine/renderer/device_context.h"
+    "include/mars_engine/renderer/display_output.h"
+)
+list(REMOVE_DUPLICATES ENGINE_HEADERS)
 
 # -----------------------------------------------------------------------------
 # Library target

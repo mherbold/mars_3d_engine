@@ -12,7 +12,6 @@
 #include "math/math_types.h"
 #include "scene/scene.h"
 #include "camera/camera.h"
+#include "renderer/device_context.h"
+#include "renderer/display_output.h"
 #include "renderer/renderer.h"
-
-// TODO: Declare top-level engine lifecycle functions (e.g. MarsEngine_Initialize,
-//       MarsEngine_Shutdown) once the public API is designed.

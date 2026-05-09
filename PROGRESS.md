@@ -15,8 +15,8 @@ Last updated: 2025-07
 ---
 
 ## Current Focus
-> **M0 fully complete** — all automated and manual steps done, including NVIDIA SDKs and DXC.  
-> Next step: **Milestone M1** — D3D12 device init, swap chain, clear-color present.
+> **M1 fully complete** — D3D12 device, swap chain, clear-color present all working. Window displays a deep navy clear color.
+> Next step: **Milestone M2** — Multi-monitor display system.
 
 ---
 
@@ -25,7 +25,7 @@ Last updated: 2025-07
 | Milestone | Title | Status | Notes |
 |---|---|---|---|
 | M0 | Repo scaffold, CMake, third-party deps | ✅ | See M0 details below |
-| M1 | D3D12 device init, swap chain, clear-color present | 🔲 | |
+| M1 | D3D12 device init, swap chain, clear-color present | ✅ | See M1 details below |
 | M2 | Multi-monitor display system | 🔲 | |
 | M3 | Asset pipeline: FBX/glTF load + GPU upload | 🔲 | |
 
@@ -101,14 +101,14 @@ Last updated: 2025-07
 - ✅ Verify full solution builds cleanly
 
 ### M1 — D3D12 Device Init, Swap Chain, Clear-Color Present
-- 🔲 `DeviceContext` class: adapter enumeration, device creation, feature level check
-- 🔲 Verify DXR Tier 1.1 support; hard-exit if not met
-- 🔲 Three command queues (Direct, Compute, Copy)
-- 🔲 Bindless CBV/SRV/UAV descriptor heap (1M slots)
-- 🔲 `DisplayOutput` class: swap chain creation, resize handling
-- 🔲 HDR color space detection (`CheckColorSpaceSupport`): activate HDR10/PQ or scRGB when available, SDR ACES fallback otherwise
-- 🔲 First frame: clear back buffer to a color and present
-- 🔲 Test app: Win32 window + message loop driving M1 code
+- ✅ `DeviceContext` class: adapter enumeration, device creation, feature level check
+- ✅ Verify DXR Tier 1.1 support; hard-exit if not met
+- ✅ Three command queues (Direct, Compute, Copy)
+- ✅ Bindless CBV/SRV/UAV descriptor heap (1M slots)
+- ✅ `DisplayOutput` class: swap chain creation, resize handling
+- ✅ HDR color space detection (`CheckColorSpaceSupport`): activate scRGB → HDR10/PQ → SDR fallback
+- ✅ First frame: clear back buffer to deep navy and present
+- ✅ Test app: Win32 window + message loop driving M1 code
 
 ### M2 — Multi-Monitor Display System
 - 🔲 `DisplayManager`: enumerate `IDXGIOutput` objects
@@ -184,3 +184,6 @@ Last updated: 2025-07
 | 2025-07 | **HDR is a required engine feature** — HDR10/PQ and scRGB paths must always be fully implemented; engine gracefully falls back to SDR tone-mapping on non-HDR displays |
 | 2025-07 | NVIDIA SDKs delivered via Streamline SDK v2.11.1 (DLSS 4 SR, Frame Gen, Ray Reconstruction, Reflex, NIS) and Nsight Aftermath 2025.5.0; both stored under `C:/mars_deps/` and integrated via custom CMake modules |
 | 2025-07 | DXC sourced from Windows SDK 10.0.26100.0; hardcoded as fallback hint in `cmake/CompileHLSL.cmake` — no separate install required |
+| 2025-07 | `FETCHCONTENT_UPDATES_DISCONNECTED ON` set globally in root `CMakeLists.txt` to prevent FetchContent re-clone failures caused by OneDrive file locks on `C:/mars_build/fetchcontent` |
+| 2025-07 | Wide string literals in Win32 window titles must use ASCII-only characters; em dashes and other multi-byte UTF-8 characters cause garbled titles without explicit `/utf-8` MSVC flag |
+| 2025-07 | `engine/CMakeLists.txt` uses `GLOB_RECURSE` for source discovery but also maintains an explicit `list(APPEND)` for new files so they are included immediately without waiting for a CMake re-run |

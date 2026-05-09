@@ -10,7 +10,14 @@ and lessons learned.  Update it whenever a significant decision is made.
 
 ---
 
-## Project Overview
+## Agent Working Rules
+- **Always update `PROGRESS.md`** at the end of every task — mark completed items ✅, update "Current Focus", and add any new decisions to the "Decisions Made" table.
+- **Always update `PLAN.md`** if any architectural decision, design detail, or milestone scope changes during a task — keep it current and accurate.
+- Never leave `PROGRESS.md` or `PLAN.md` stale after making code changes.
+
+---
+
+
 Two CMake sub-projects live under the repo root:
 | Sub-project | Location | Purpose |
 |---|---|---|
