@@ -92,11 +92,18 @@ function(target_compile_hlsl)
             set(profile "lib_6_8")   # default: DXR ray-tracing library
         endif()
 
+        # Library shader profiles (lib_*) have no single entry point.
+        if(profile MATCHES "^lib_")
+            set(entry_flag "")
+        else()
+            set(entry_flag "-E;main")
+        endif()
+
         add_custom_command(
             OUTPUT  "${dxil_out}"
             COMMAND "${DXC_EXECUTABLE}"
                     -T "${profile}"
-                    -E main
+                    ${entry_flag}
                     -Fo "${dxil_out}"
                     -nologo
                     -WX              # warnings as errors

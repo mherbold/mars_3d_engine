@@ -54,10 +54,6 @@ target_compile_hlsl(
     OUTPUT_DIR  "${CMAKE_BINARY_DIR}/dxil"
     INCLUDE_DIRS
         "${CMAKE_CURRENT_SOURCE_DIR}"
-        "${CMAKE_CURRENT_SOURCE_DIR}/common"
-        "${CMAKE_CURRENT_SOURCE_DIR}/material"
-        "${CMAKE_CURRENT_SOURCE_DIR}/sky"
-        "${CMAKE_CURRENT_SOURCE_DIR}/gi"
 )
 
 # ---------------------------------------------------------------------------

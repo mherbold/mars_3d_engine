@@ -41,18 +41,19 @@
 - Separate `shaders/` tree with a CMake custom target that compiles HLSL → DXIL via **DXC**
 
 ### Key Tasks
-- [ ] Add Windows Agility SDK (D3D12 1.614+) via NuGet
-- [ ] Add DirectXTK12, DirectXTex, DirectXMesh via NuGet / vcpkg
-- [ ] Add Assimp, nlohmann/json via `FetchContent`
-- [ ] Add ImGui via `FetchContent` *(developer/debug builds only — not the game UI)*
-- [ ] Add D3D12 Memory Allocator (D3D12MA) via `FetchContent`
-- [ ] Add HarfBuzz via `FetchContent` (Unicode text shaping for game UI)
-- [ ] Add FreeType via `FetchContent` (font metrics for msdfgen and HarfBuzz at build time)
-- [ ] Add msdfgen as CMake build-tool target (offline MSDF atlas generation)
-- [ ] Add NVIDIA DLSS 4 SDK (GDK / standalone) — includes Multi Frame Generation, Transformer-based SR and Ray Reconstruction
-- [ ] Add NVIDIA Shader Library (NvAPI / Aftermath for GPU crash dumps)
-- [ ] CMake shader compilation target: `.hlsl` → `.dxil` → embedded as byte arrays
-- [ ] CI-friendly directory layout; `.gitignore` for `build/`
+- [x] Add Windows Agility SDK (D3D12 1.614+) via NuGet — `Microsoft.Direct3D.D3D12` 1.614.1 in `C:/mars_deps/nuget/`
+- [x] Add DirectXTK12, DirectXTex, DirectXMesh via NuGet / vcpkg — all 2026.x versions extracted, CMake targets wired
+- [x] Add Assimp, nlohmann/json via `FetchContent` — Assimp 5.4.3, nlohmann/json 3.11.3
+- [x] Add ImGui via `FetchContent` *(developer/debug builds only — not the game UI)* — 1.91.8, gated by `MARS_ENABLE_DEV_UI`
+- [x] Add D3D12 Memory Allocator (D3D12MA) via `FetchContent` — 2.0.1
+- [x] Add HarfBuzz via `FetchContent` (Unicode text shaping for game UI) — 9.0.0 (`HB_HAVE_FREETYPE=OFF` until M16)
+- [x] Add FreeType via `FetchContent` (font metrics for msdfgen and HarfBuzz at build time) — 2.13.3 (wired at M16)
+- [x] Add msdfgen as CMake build-tool target (offline MSDF atlas generation) — 1.12 (`MSDFGEN_CORE_ONLY=ON` until M16)
+- [x] Add NVIDIA DLSS 4 SDK — Streamline SDK v2.11.1; `cmake/StreamlineSDK.cmake`; all `sl.*` / `nvngx_*` DLLs auto-deployed
+- [x] Add NVIDIA Shader Library / Aftermath — Nsight Aftermath 2025.5.0; `cmake/NsightAftermath.cmake`; DLLs auto-deployed
+- [x] CMake shader compilation target: `.hlsl` → `.dxil` — `cmake/CompileHLSL.cmake`; DXC from Windows SDK 10.0.26100.0
+- [x] CI-friendly directory layout; `.gitignore` for `build/`; `CMakePresets.json` with debug/release presets
+- [ ] Add WinPixEventRuntime via NuGet *(deferred to M15)*
 
 ---
 
@@ -549,7 +550,7 @@ WinMain
 | **M1** | D3D12 device init, swap chain, clear-color present | ✅ Complete |
 | **M2** | Multi-monitor display system | ✅ Complete |
 | **M3** | Asset pipeline: load FBX/glTF, upload to GPU | ✅ Complete |
-| **M4** | DXR pipeline: primary rays, basic PBR hit shader | 🔲 Not started |
+| **M4** | DXR pipeline: primary rays, basic PBR hit shader | ✅ Complete |
 | **M5** | Scene file parser, static scene rendering | 🔲 Not started |
 | **M6** | DLSS 4 integration (upscale, Multi Frame Generation, Ray Reconstruction) | 🔲 Not started |
 | **M7** | ReSTIR DI — direct lighting with ray-traced shadows | 🔲 Not started |

@@ -109,3 +109,14 @@ Two CMake sub-projects live under the repo root:
 ## Notes & Lessons Learned
 *(append new entries here as the project evolves)*
 - 2025-07: Initial scaffold created. No rendering code yet.
+- 2025-07: **Milestone M0 complete.** All third-party deps wired (Assimp 5.4.3, nlohmann/json 3.11.3, D3D12MA 2.0.1, HarfBuzz 9.0.0, FreeType 2.13.3, msdfgen 1.12, ImGui 1.91.8). NuGet deps (Agility SDK 1.614.1, DirectXTK12/Tex/Mesh 2026.x) extracted to `C:/mars_deps/nuget/`. Streamline SDK v2.11.1 and Nsight Aftermath 2025.5.0 stored under `C:/mars_deps/`. DXC sourced from Windows SDK 10.0.26100.0.
+- 2025-07: **Milestone M1 complete.** D3D12 device, three command queues, bindless CBV/SRV/UAV heap (1M slots), swap chain with HDR color-space detection, first clear-color present.
+- 2025-07: **Milestone M2 complete.** `DisplayManager` / `DisplayOutput` multi-monitor system operational; `display.json` config parsed via nlohmann/json; one Win32 window per monitor; per-output swap chain and resize.
+- 2025-07: **Milestone M3 complete.** `AssetImporter` (Assimp), `TextureLoader` (DirectXTex), `GpuMeshBuffer`, and `ResourceManager` (D3D12MA) all implemented and building cleanly. Bindless SRV registration working.
+- 2025-07: **Milestone M4 complete.** Full DXR pipeline operational: RTPSO built from `path_trace.dxil` (lib_6_3), global root signature (bindless heap + frame-constants CB), shader tables (ray-gen / miss / hit-group), BLAS/TLAS from scene meshes, RGBA16F UAV per output, `DispatchRays` each frame. Closest-hit evaluates GGX/Smith/Fresnel PBR with bindless textures and traces a shadow ray. Results blit to swap-chain back buffer via `copy_to_back_buffer()`.
+- 2025-07: FetchContent builds must use `FETCHCONTENT_UPDATES_DISCONNECTED ON` globally to prevent re-clone failures caused by OneDrive file locks on `C:/mars_build/fetchcontent`.
+- 2025-07: Build/fetch directories moved to `C:/mars_build/` to avoid OneDrive locking FetchContent git pack files. Set in `CMakePresets.json`.
+- 2025-07: Wide string literals in Win32 window titles must use ASCII-only characters; em dashes and other multi-byte UTF-8 characters cause garbled titles without explicit `/utf-8` MSVC flag.
+- 2025-07: `engine/CMakeLists.txt` uses `GLOB_RECURSE` for source discovery but also maintains an explicit `list(APPEND)` for new files so they are included immediately without a CMake re-run.
+- 2025-07: HarfBuzz compiled with `HB_HAVE_FREETYPE=OFF` and msdfgen with `MSDFGEN_CORE_ONLY=ON` until font pipeline work begins in M16.
+- 2025-07: Camera system (`camera.h` / `camera.cpp`) is scaffolded but not yet implemented; full `Camera` class (view/proj matrices, motion vectors, jitter) is part of M5.

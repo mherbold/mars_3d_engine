@@ -1,11 +1,285 @@
-// #profile lib_6_8
+// #profile lib_6_3
 // =============================================================================
 // path_trace.hlsl
 // MARS Path Tracer — ray generation, closest hit, and miss shaders.
 //
-// Shader model: lib_6_8 (DXR ray-tracing library)
+// Shader model: lib_6_3 (DXR ray-tracing library)
 // =============================================================================
 
-// TODO: Implement ray generation shader (RayGeneration)
-// TODO: Implement closest-hit shader (ClosestHit)
-// TODO: Implement miss shader (Miss)
+#include "common/math.hlsli"
+#include "common/random.hlsli"
+#include "material/material_data.hlsli"
+#include "material/pbr_brdf.hlsli"
+
+// ---------------------------------------------------------------------------
+// Per-frame constant buffer (bound at b0, space0)
+// ---------------------------------------------------------------------------
+struct FrameConstants
+{
+    float4x4 view_inv;          // inverse view matrix
+    float4x4 proj_inv;          // inverse projection matrix
+    float3   camera_pos;        // world-space camera position
+    uint     frame_index;       // monotonically increasing frame counter
+    uint     output_width;
+    uint     output_height;
+    uint     tlas_slot;         // bindless SRV slot of the TLAS
+    uint     material_buffer_slot; // bindless SRV slot for GpuMaterialData[]
+    uint     instance_buffer_slot; // bindless SRV slot for GpuInstanceData[]
+    uint     output_uav_slot;   // bindless UAV slot for the output texture
+    float    _pad[22];          // explicit padding to 256 bytes (matches C++ FrameConstants)
+};
+
+ConstantBuffer<FrameConstants> g_Frame : register(b0, space0);
+
+// TLAS acceleration structure (bindless via slot in frame constants)
+RaytracingAccelerationStructure g_TLAS[] : register(t0, space4);
+
+// Output UAV — RGBA16F (scRGB linear, HDR-ready)
+RWTexture2D<float4> g_OutputUAV[] : register(u0, space1);
+
+// ---------------------------------------------------------------------------
+// Payload structures
+// ---------------------------------------------------------------------------
+struct PrimaryPayload
+{
+    float3 radiance;
+    float  hit_t;
+    bool   missed;
+};
+
+struct ShadowPayload
+{
+    bool occluded;
+};
+
+// ---------------------------------------------------------------------------
+// Vertex fetch helper — reads vertex data from the bindless vertex buffer.
+// Interpolates using the built-in barycentrics from the hit attributes.
+// ---------------------------------------------------------------------------
+struct TriangleVertices
+{
+    float3 position;
+    float3 normal;
+    float3 tangent;
+    float2 uv;
+};
+
+struct GpuVertex
+{
+    float3 position;
+    float3 normal;
+    float3 tangent;
+    float2 uv;
+    uint4  bone_indices;
+    float4 bone_weights;
+};
+
+TriangleVertices FetchInterpolatedVertex(uint instanceIndex, uint primitiveIndex,
+                                         float2 bary)
+{
+    GpuInstanceData inst = g_InstanceBuffer[g_Frame.instance_buffer_slot][instanceIndex];
+
+    // Index buffer — stored as ByteAddressBuffer in g_Buffers; each index is uint32
+    uint baseIdx = primitiveIndex * 3u;
+    uint i0 = g_Buffers[inst.index_buffer_srv].Load((baseIdx + 0u) * 4u);
+    uint i1 = g_Buffers[inst.index_buffer_srv].Load((baseIdx + 1u) * 4u);
+    uint i2 = g_Buffers[inst.index_buffer_srv].Load((baseIdx + 2u) * 4u);
+
+    // Vertex buffer — manual byte fetch from ByteAddressBuffer.
+    // GpuVertex layout (must match the C++ struct):
+    //   float3 position  @  0 (12 bytes)
+    //   float3 normal    @ 12 (12 bytes)
+    //   float3 tangent   @ 24 (12 bytes)
+    //   float2 uv        @ 36 ( 8 bytes)
+    //   uint4  bone_idx  @ 44 (16 bytes)   -- not needed here, skipped
+    //   float4 bone_wt   @ 60 (16 bytes)   -- not needed here, skipped
+    // stride = 76 bytes
+    static const uint k_stride = 76u;
+    uint vbSrv = inst.vertex_buffer_srv;
+
+    GpuVertex v0, v1, v2;
+
+    uint base0 = i0 * k_stride;
+    v0.position = asfloat(g_Buffers[vbSrv].Load3(base0 +  0u));
+    v0.normal   = asfloat(g_Buffers[vbSrv].Load3(base0 + 12u));
+    v0.tangent  = asfloat(g_Buffers[vbSrv].Load3(base0 + 24u));
+    v0.uv       = asfloat(g_Buffers[vbSrv].Load2(base0 + 36u));
+    v0.bone_indices = (uint4)0; v0.bone_weights = (float4)0;
+
+    uint base1 = i1 * k_stride;
+    v1.position = asfloat(g_Buffers[vbSrv].Load3(base1 +  0u));
+    v1.normal   = asfloat(g_Buffers[vbSrv].Load3(base1 + 12u));
+    v1.tangent  = asfloat(g_Buffers[vbSrv].Load3(base1 + 24u));
+    v1.uv       = asfloat(g_Buffers[vbSrv].Load2(base1 + 36u));
+    v1.bone_indices = (uint4)0; v1.bone_weights = (float4)0;
+
+    uint base2 = i2 * k_stride;
+    v2.position = asfloat(g_Buffers[vbSrv].Load3(base2 +  0u));
+    v2.normal   = asfloat(g_Buffers[vbSrv].Load3(base2 + 12u));
+    v2.tangent  = asfloat(g_Buffers[vbSrv].Load3(base2 + 24u));
+    v2.uv       = asfloat(g_Buffers[vbSrv].Load2(base2 + 36u));
+    v2.bone_indices = (uint4)0; v2.bone_weights = (float4)0;
+
+    float w0 = 1.0f - bary.x - bary.y;
+    float w1 = bary.x;
+    float w2 = bary.y;
+
+    TriangleVertices tri;
+    tri.position = v0.position * w0 + v1.position * w1 + v2.position * w2;
+    tri.normal   = normalize(v0.normal   * w0 + v1.normal   * w1 + v2.normal   * w2);
+    tri.tangent  = normalize(v0.tangent  * w0 + v1.tangent  * w1 + v2.tangent  * w2);
+    tri.uv       = v0.uv * w0 + v1.uv * w1 + v2.uv * w2;
+    return tri;
+}
+
+// Transform a normal from object to world space using the stored inverse-transpose.
+float3 TransformNormal(float3 n, float4x4 invTranspose)
+{
+    return normalize(mul((float3x3)invTranspose, n));
+}
+
+// ---------------------------------------------------------------------------
+// [shader("raygeneration")]  RayGen
+// Fires one primary ray per pixel.  The ray direction is reconstructed from
+// the inverse view-projection matrices stored in the per-frame CB.
+// ---------------------------------------------------------------------------
+[shader("raygeneration")]
+void RayGen()
+{
+    uint2 launchIdx  = DispatchRaysIndex().xy;
+    uint2 launchDim  = DispatchRaysDimensions().xy;
+
+    if (launchIdx.x >= g_Frame.output_width || launchIdx.y >= g_Frame.output_height)
+        return;
+
+    // Sub-pixel jitter via Halton sequence for temporal accumulation
+    float2 jitter = HaltonJitter(g_Frame.frame_index);
+    float2 pixel  = (float2(launchIdx) + jitter) / float2(launchDim);
+
+    // Reconstruct ray origin and direction from inverse VP matrices
+    float2 ndc     = pixel * 2.0f - 1.0f;
+    ndc.y          = -ndc.y;   // flip Y (D3D NDC has +Y up)
+
+    float4 rayOriginH = mul(g_Frame.view_inv, float4(0, 0, 0, 1));
+    float4 rayTargetH = mul(g_Frame.proj_inv, float4(ndc, 1, 1));
+    float3 rayTarget  = mul(g_Frame.view_inv, float4(rayTargetH.xyz, 0)).xyz;
+
+    RayDesc ray;
+    ray.Origin    = rayOriginH.xyz;
+    ray.Direction = normalize(rayTarget);
+    ray.TMin      = 1e-4f;
+    ray.TMax      = 1e6f;
+
+    PrimaryPayload payload;
+    payload.radiance = float3(0, 0, 0);
+    payload.hit_t    = -1.0f;
+    payload.missed   = false;
+
+    TraceRay(g_TLAS[g_Frame.tlas_slot],
+             0,              // RAY_FLAG_NONE
+             0xFF,           // instance mask
+             0,              // hit group index
+             1,              // contribution to hit group index
+             0,              // miss shader index
+             ray,
+             payload);
+
+    g_OutputUAV[g_Frame.output_uav_slot][launchIdx] = float4(payload.radiance, 1.0f);
+}
+
+// ---------------------------------------------------------------------------
+// [shader("miss")]  Miss — sky color gradient
+// ---------------------------------------------------------------------------
+[shader("miss")]
+void Miss(inout PrimaryPayload payload)
+{
+    // Simple sky gradient: horizon pale blue, zenith deep blue
+    float3 dir     = normalize(WorldRayDirection());
+    float  t       = saturate(dir.y * 0.5f + 0.5f);
+    float3 horizon = float3(0.6f, 0.8f, 1.0f);
+    float3 zenith  = float3(0.05f, 0.1f, 0.5f);
+    payload.radiance = lerp(horizon, zenith, t);
+    payload.hit_t    = -1.0f;
+    payload.missed   = true;
+}
+
+// ---------------------------------------------------------------------------
+// [shader("miss")]  ShadowMiss — ray is not occluded
+// ---------------------------------------------------------------------------
+[shader("miss")]
+void ShadowMiss(inout ShadowPayload payload)
+{
+    payload.occluded = false;
+}
+
+// ---------------------------------------------------------------------------
+// [shader("closesthit")]  ClosestHit — basic PBR shading (single directional light)
+// ---------------------------------------------------------------------------
+[shader("closesthit")]
+void ClosestHit(inout PrimaryPayload payload, in BuiltInTriangleIntersectionAttributes attr)
+{
+    uint instanceIndex  = InstanceIndex();
+    uint primitiveIndex = PrimitiveIndex();
+    float2 bary         = attr.barycentrics;
+
+    // Fetch interpolated vertex data
+    TriangleVertices tri = FetchInterpolatedVertex(instanceIndex, primitiveIndex, bary);
+
+    // Transform to world space
+    GpuInstanceData inst      = g_InstanceBuffer[g_Frame.instance_buffer_slot][instanceIndex];
+    float3 worldPos           = mul(inst.world_transform, float4(tri.position, 1)).xyz;
+    float3 worldNormal        = TransformNormal(tri.normal,   inst.world_transform_inv_transpose);
+    float3 worldTangent       = TransformNormal(tri.tangent,  inst.world_transform_inv_transpose);
+    float3 worldBitangent     = cross(worldNormal, worldTangent);
+
+    // Fetch material
+    GpuMaterialData mat       = FetchMaterial(g_Frame.material_buffer_slot, inst.material_index);
+
+    // Resolve material parameters
+    float4 baseColorA         = ResolveBaseColor(mat, tri.uv);
+    float3 baseColor          = baseColorA.rgb;
+    float2 metalRough         = ResolveMetallicRoughness(mat, tri.uv);
+    float  metallic           = metalRough.x;
+    float  roughness          = max(metalRough.y, 0.04f);
+    float3 N                  = ResolveNormal(mat, tri.uv, worldNormal, worldTangent, worldBitangent);
+    float3 emissive           = ResolveEmissive(mat, tri.uv);
+
+    float3 V = normalize(g_Frame.camera_pos - worldPos);
+    if (dot(N, V) < 0.0f)
+        N = -N;   // flip for double-sided surfaces
+
+    // Hard-coded single directional light (sun) — will be replaced in M5+ by scene lights
+    float3 sunDir      = normalize(float3(0.4f, 1.0f, 0.3f));
+    float3 sunRadiance = float3(5.0f, 4.8f, 4.5f);  // warm white, ~5 klux in linear
+
+    // Shadow ray
+    ShadowPayload shadowPayload;
+    shadowPayload.occluded = true;
+
+    RayDesc shadowRay;
+    shadowRay.Origin    = worldPos + N * 1e-3f;
+    shadowRay.Direction = sunDir;
+    shadowRay.TMin      = 1e-4f;
+    shadowRay.TMax      = 1e6f;
+
+    TraceRay(g_TLAS[g_Frame.tlas_slot],
+             0x4 | 0x8, // RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER
+             0xFF,
+             0,
+             1,
+             1,   // ShadowMiss index
+             shadowRay,
+             shadowPayload);
+
+    float3 directLight = float3(0, 0, 0);
+    if (!shadowPayload.occluded)
+        directLight = EvaluatePBR(baseColor, metallic, roughness, N, V, sunDir) * sunRadiance;
+
+    // Simple ambient (will be replaced by path-traced GI in M7/M8)
+    float3 ambient = baseColor * 0.02f;
+
+    payload.radiance = directLight + ambient + emissive;
+    payload.hit_t    = RayTCurrent();
+    payload.missed   = false;
+}
+

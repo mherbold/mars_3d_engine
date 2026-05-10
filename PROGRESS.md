@@ -1,6 +1,6 @@
 # PROGRESS.md — MARS 3D Engine Implementation Progress
 
-Last updated: 2025-07 (M3)
+Last updated: 2025-07 (M4)
 
 ---
 
@@ -15,8 +15,8 @@ Last updated: 2025-07 (M3)
 ---
 
 ## Current Focus
-> **M3 fully complete** — Asset pipeline implemented. `AssetImporter` (Assimp) loads FBX/glTF/OBJ into CPU `ModelAsset` structures. `GpuMeshBuffer` uploads interleaved vertex + index data to D3D12 DEFAULT-heap buffers via the Copy queue and registers a bindless SRV. `TextureLoader` (DirectXTex) loads DDS/PNG/EXR/HDR textures with mip generation and registers bindless SRVs. `ResourceManager` owns the D3D12MA allocator, caches loaded assets by path, and exposes `load_model()` / `load_texture()`. Math types (`Vec2`, `Vec3`, `Vec4`, `Mat4x4`, `Quaternion`, `Transform`, `AABB`) fully defined. `Scene` wired to hold `SceneModelInstance` list backed by `ResourceManager`.
-> Next step: **Milestone M4** — DXR pipeline: primary rays, basic PBR hit shader.
+> **M4 fully complete** — DXR pipeline implemented. `PathTracer` creates its own D3D12MA allocator, loads `path_trace.dxil` (compiled from `lib_6_3`), builds the RTPSO with a global root signature (bindless CBV/SRV/UAV heap + frame constants CB), writes shader tables (ray-gen, miss, hit-group), builds BLAS/TLAS from scene meshes, allocates per-output RGBA16F UAV textures, and drives `DispatchRays` each frame. Closest-hit shader fetches interpolated vertices via raw byte-address loads, resolves PBR material parameters (base color, normal map, metallic/roughness, emissive) from bindless textures, traces a shadow ray, and evaluates a GGX/Smith/Fresnel BRDF under a hard-coded directional sun light. Miss shader returns a sky gradient. Results are copied to swap-chain back buffers via `copy_to_back_buffer()`. `Renderer` drives `PathTracer` for all outputs; falls back to clear-color present if not initialized.
+> Next step: **Milestone M5** — Scene file parser, static scene rendering.
 
 ---
 
@@ -28,6 +28,7 @@ Last updated: 2025-07 (M3)
 | M1 | D3D12 device init, swap chain, clear-color present | ✅ | See M1 details below |
 | M2 | Multi-monitor display system | ✅ | See M2 details below |
 | M3 | Asset pipeline: FBX/glTF load + GPU upload | ✅ | See M3 details below |
+| M4 | DXR pipeline: primary rays, basic PBR hit shader | ✅ | See M4 details below |
 
 ---
 
@@ -63,7 +64,6 @@ Last updated: 2025-07 (M3)
 |---|---|---|
 | **FreeType + HarfBuzz font integration** | Currently `HB_HAVE_FREETYPE=OFF`; enable once FreeType is wired via `CMAKE_PREFIX_PATH` | M16 |
 | **msdfgen with font input** | Currently `MSDFGEN_CORE_ONLY=ON`; enable `msdfgen-ext` once FreeType is wired | M16 |
-| M4 | DXR pipeline: primary rays, basic PBR hit shader | 🔲 | |
 | M5 | Scene file parser, static scene rendering | 🔲 | |
 | M6 | DLSS 4 integration (upscale, Multi Frame Generation, Ray Reconstruction) | 🔲 | Requires DLSS SDK NDA access |
 | M7 | ReSTIR DI — direct lighting + ray-traced shadows | 🔲 | |
@@ -123,20 +123,23 @@ Last updated: 2025-07 (M3)
 - ✅ Build clean
 
 ### M3 — Asset Pipeline
-- 🔲 `MeshLoader`: Assimp → interleaved vertex / index buffer on GPU
-- 🔲 `TextureLoader`: DirectXTex → `ID3D12Resource` (BC7/BC6H DDS preferred)
-- 🔲 `ResourceManager`: handle pool, upload heap, copy queue flush
-- 🔲 Bindless registration of textures
+- ✅ `AssetImporter` (`MeshLoader`): Assimp → interleaved vertex / index buffer on GPU
+- ✅ `TextureLoader`: DirectXTex → `ID3D12Resource` (BC7/BC6H DDS preferred)
+- ✅ `ResourceManager`: handle pool, D3D12MA allocator, copy queue flush
+- ✅ `GpuMeshBuffer`: D3D12 VB/IB + bindless SRV registration
+- ✅ Bindless registration of textures
 
 ### M4 — DXR Pipeline
-- 🔲 DXR pipeline state object (RTPSO)
-- 🔲 Shader table: ray-gen, miss, hit group records
-- 🔲 BLAS build for static mesh
-- 🔲 TLAS build
-- 🔲 Ray-gen shader: one ray per pixel, write to UAV
-- 🔲 Closest-hit shader: basic PBR (albedo × NdotL)
-- 🔲 Miss shader: solid sky color
-- 🔲 Display result via copy to swap chain back buffer
+- ✅ DXR pipeline state object (RTPSO) built from `path_trace.dxil` (`lib_6_3`)
+- ✅ Global root signature: bindless CBV/SRV/UAV heap + frame constants CB
+- ✅ Shader tables: ray-gen, miss, and hit-group records written
+- ✅ BLAS build from scene `GpuMeshBuffer` instances
+- ✅ TLAS build and update
+- ✅ Ray-gen shader: one ray per pixel, result written to RGBA16F UAV
+- ✅ Closest-hit shader: interpolated vertices via raw byte-address loads; GGX/Smith/Fresnel PBR BRDF; bindless texture fetch (base color, normal, metallic/roughness, emissive); shadow ray for directional sun
+- ✅ Miss shader: sky gradient return
+- ✅ `copy_to_back_buffer()`: blit UAV → swap-chain back buffer
+- ✅ `Renderer` drives `PathTracer` for all `DisplayOutput` instances; clear-color fallback if not initialised
 
 ### M5 — Scene File Parser & Static Scene
 - 🔲 `SceneLoader`: parse `.marsscene` JSON
@@ -163,6 +166,34 @@ Last updated: 2025-07 (M3)
 - 🔲 Theme/style sheet system (JSON): colors, spacing, animation curves
 - 🔲 HDR-aware color pipeline for UI (linear → tone map per display)
 - 🔲 Per-monitor DPI scaling support
+
+---
+
+## M4 — Completed Work
+
+### New Files
+| File | Purpose |
+|---|---|
+| `engine/include/mars_engine/renderer/path_tracer.h` | `PathTracer` — DXR pipeline, RTPSO, shader tables, BLAS/TLAS, per-output UAV textures, frame-constants ring buffer |
+| `engine/src/renderer/path_tracer.cpp` | Full implementation: allocator, DXIL load, RTPSO build, shader table write, BLAS/TLAS construction, `DispatchRays`, UAV blit |
+| `engine/include/mars_engine/renderer/frame_constants.h` | `FrameConstants` HLSL-compatible CB struct (camera matrices, frame index, sun direction/colour) |
+| `engine/shaders/path_trace.hlsl` | Ray-gen, closest-hit (GGX PBR + shadow ray), and miss shaders |
+| `engine/shaders/shadow_ray.hlsl` | Shadow visibility ray (any-hit returns 0; miss returns 1) |
+| `engine/shaders/material/pbr_brdf.hlsli` | GGX / Smith / Fresnel BRDF functions |
+| `engine/shaders/material/material_data.hlsli` | Bindless material parameter fetch |
+| `engine/shaders/sky/physical_sky.hlsli` | Sky gradient stub (full Hillaire model deferred to M5+) |
+| `engine/shaders/sky/hdri_sky.hlsli` | HDRI sky stub |
+| `engine/shaders/common/bindless.hlsli` | Bindless heap accessor macros |
+| `engine/shaders/common/math.hlsli` | Common HLSL math helpers |
+| `engine/shaders/common/random.hlsli` | PCG hash / Halton sequence |
+| `engine/shaders/gi/restir_di.hlsl` | ReSTIR DI stub (deferred to M7) |
+| `engine/shaders/gi/restir_gi.hlsl` | ReSTIR GI stub (deferred to M8) |
+
+### Updated Files
+| File | Change |
+|---|---|
+| `engine/src/renderer/renderer.cpp` | Owns and drives `PathTracer`; `render_frame()` calls `begin_frame()` / `trace()` / `copy_to_back_buffer()` for every `DisplayOutput` |
+| `engine/CMakeLists.txt` | Added `path_tracer.cpp` to sources; wired `shaders_dxil` dependency |
 
 ---
 

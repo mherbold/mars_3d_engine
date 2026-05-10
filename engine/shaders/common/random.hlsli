@@ -3,7 +3,8 @@
 // MARS Common — random number generation (PCG hash, Halton sequence).
 // =============================================================================
 
-#pragma once
+#ifndef MARS_RANDOM_HLSLI
+#define MARS_RANDOM_HLSLI
 
 // ---------------------------------------------------------------------------
 // PCG hash — fast, high-quality 32-bit PRNG
@@ -52,3 +53,5 @@ float2 HaltonJitter(uint frameIndex)
 {
     return float2(Halton(frameIndex, 2), Halton(frameIndex, 3));
 }
+
+#endif // MARS_RANDOM_HLSLI

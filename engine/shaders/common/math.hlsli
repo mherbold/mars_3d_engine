@@ -3,7 +3,8 @@
 // MARS Common — math constants and utility functions.
 // =============================================================================
 
-#pragma once
+#ifndef MARS_MATH_HLSLI
+#define MARS_MATH_HLSLI
 
 static const float PI      = 3.14159265358979323846f;
 static const float TWO_PI  = 6.28318530717958647692f;
@@ -39,3 +40,5 @@ float3 LocalToWorld(float3 dir, float3 tangent, float3 bitangent, float3 normal)
 {
     return dir.x * tangent + dir.y * bitangent + dir.z * normal;
 }
+
+#endif // MARS_MATH_HLSLI

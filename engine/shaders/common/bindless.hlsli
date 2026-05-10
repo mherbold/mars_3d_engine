@@ -7,7 +7,8 @@
 // Shaders receive per-draw descriptor indices via root constants.
 // =============================================================================
 
-#pragma once
+#ifndef MARS_BINDLESS_HLSLI
+#define MARS_BINDLESS_HLSLI
 
 // Bindless heap register space
 // Space 0: CBV/SRV/UAV heap (1M slots)
@@ -42,3 +43,5 @@ float4 SampleTextureLevel0(uint texIndex, float2 uv)
 {
     return g_Textures[texIndex].SampleLevel(g_SamplerLinear, uv, 0);
 }
+
+#endif // MARS_BINDLESS_HLSLI

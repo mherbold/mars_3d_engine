@@ -15,6 +15,8 @@
 #include "renderer/device_context.h"
 #include "renderer/display_output.h"
 #include "renderer/display_manager.h"
+#include "renderer/frame_constants.h"
+#include "renderer/path_tracer.h"
 #include "renderer/renderer.h"
 #include "asset/asset_types.h"
 #include "asset/asset_importer.h"

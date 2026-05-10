@@ -1,6 +1,6 @@
 // =============================================================================
 // renderer.cpp
-// MARS 3D Engine — Renderer implementation (M2: multi-monitor clear + present)
+// MARS 3D Engine — Renderer implementation (M4: DXR path tracing)
 // =============================================================================
 
 #include "mars_engine/renderer/renderer.h"
@@ -67,6 +67,27 @@ void Renderer::init_internal(const std::vector<DisplayConfig>& configs,
     m_display_manager.init(m_device_ctx, configs, hwnds);
     create_frame_resources();
 
+    // Initialise PathTracer for the primary output dimensions.
+    // Additional outputs get resize_output() calls when they are rendered.
+    uint32_t output_count = m_display_manager.output_count();
+    if (output_count > 0)
+    {
+        DisplayOutput& primary = m_display_manager.output(0);
+        m_path_tracer.init(m_device_ctx,
+                           primary.width(), primary.height(),
+                           output_count);
+
+        // Prime resize for all outputs
+        for (uint32_t i = 0; i < output_count; ++i)
+        {
+            DisplayOutput& disp = m_display_manager.output(i);
+            m_path_tracer.resize_output(m_device_ctx, i, disp.width(), disp.height());
+        }
+    }
+
+    // Initialise per-output camera state list
+    m_cameras.resize(output_count);
+
     m_initialised = true;
 }
 
@@ -81,6 +102,7 @@ void Renderer::shutdown()
     for (uint32_t i = 0; i < k_frame_count; ++i)
         wait_for_frame(i);
 
+    m_path_tracer.shutdown();
     release_frame_resources();
     m_display_manager.shutdown();
     m_device_ctx.shutdown();
@@ -157,6 +179,8 @@ void Renderer::on_resize(uint32_t output_index, uint32_t width, uint32_t height)
 {
     m_device_ctx.flush_gpu();
     m_display_manager.resize(output_index, width, height);
+    if (m_path_tracer.is_initialised())
+        m_path_tracer.resize_output(m_device_ctx, output_index, width, height);
 }
 
 void Renderer::on_resize(uint32_t width, uint32_t height)
@@ -165,14 +189,100 @@ void Renderer::on_resize(uint32_t width, uint32_t height)
 }
 
 // ---------------------------------------------------------------------------
-// render_frame  (M2: clear all outputs to distinct colors, then present each)
-//
-// Each DisplayOutput is independent — we record a separate command list
-// submission for each monitor so they can have different back-buffer indices
-// in flight simultaneously.  (For M2 all outputs share the same k_frame_count
-// fencing; a future milestone can give each output its own fence ring.)
+// set_camera
+// ---------------------------------------------------------------------------
+void Renderer::set_camera(uint32_t output_index,
+                           const Vec3& position,
+                           const Mat4x4& view_inv,
+                           const Mat4x4& proj_inv)
+{
+    if (output_index >= m_cameras.size())
+        m_cameras.resize(output_index + 1);
+
+    m_cameras[output_index] = { position, view_inv, proj_inv };
+}
+
+// ---------------------------------------------------------------------------
+// render_frame — dispatches to path-traced or clear-color path
 // ---------------------------------------------------------------------------
 void Renderer::render_frame()
+{
+    if (m_path_tracer.is_initialised() && m_path_tracer.tlas_srv_slot() != UINT32_MAX)
+        render_frame_path_traced();
+    else
+        render_frame_clear();
+
+    ++m_frame_index;
+}
+
+// ---------------------------------------------------------------------------
+// render_frame_path_traced
+// ---------------------------------------------------------------------------
+void Renderer::render_frame_path_traced()
+{
+    uint32_t back_index = (m_display_manager.output_count() > 0)
+        ? m_display_manager.output(0).current_back_buffer_index()
+        : 0;
+
+    wait_for_frame(back_index);
+
+    throw_if_failed(m_cmd_allocators[back_index]->Reset(), "CommandAllocator::Reset failed");
+    throw_if_failed(m_cmd_list->Reset(m_cmd_allocators[back_index].Get(), nullptr),
+                    "CommandList::Reset failed");
+
+    // Bind the bindless heap so DXR shaders can access all resources.
+    ID3D12DescriptorHeap* heaps[] = { m_device_ctx.bindless_heap() };
+    m_cmd_list->SetDescriptorHeaps(1, heaps);
+
+    for (uint32_t oi = 0; oi < m_display_manager.output_count(); ++oi)
+    {
+        // Update per-frame constants
+        const CameraState& cam = (oi < m_cameras.size()) ? m_cameras[oi] : m_cameras[0];
+        m_path_tracer.update_frame_constants(m_device_ctx, oi, m_frame_index,
+                                             cam.position, cam.view_inv, cam.proj_inv);
+
+        // Trace rays → UAV
+        m_path_tracer.trace(m_cmd_list.Get(), oi);
+
+        // UAV barrier between trace and copy
+        D3D12_RESOURCE_BARRIER uav{};
+        uav.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        uav.UAV.pResource = nullptr; // all UAVs
+        m_cmd_list->ResourceBarrier(1, &uav);
+
+        // Transition back buffer: PRESENT → COPY_DEST
+        DisplayOutput& out = m_display_manager.output(oi);
+        out.transition(m_cmd_list.Get(),
+                       D3D12_RESOURCE_STATE_PRESENT,
+                       D3D12_RESOURCE_STATE_COPY_DEST);
+
+        // Blit UAV → back buffer
+        m_path_tracer.copy_to_back_buffer(m_cmd_list.Get(), oi,
+                                           out.current_back_buffer());
+
+        // Transition back buffer: COPY_DEST → PRESENT
+        out.transition(m_cmd_list.Get(),
+                       D3D12_RESOURCE_STATE_COPY_DEST,
+                       D3D12_RESOURCE_STATE_PRESENT);
+    }
+
+    throw_if_failed(m_cmd_list->Close(), "CommandList::Close failed");
+
+    ID3D12CommandList* lists[] = { m_cmd_list.Get() };
+    m_device_ctx.direct_queue()->ExecuteCommandLists(1, lists);
+
+    for (uint32_t oi = 0; oi < m_display_manager.output_count(); ++oi)
+        m_display_manager.output(oi).present(true);
+
+    ++m_frame_fence_next;
+    m_device_ctx.direct_queue()->Signal(m_frame_fence.Get(), m_frame_fence_next);
+    m_frame_fence_values[back_index] = m_frame_fence_next;
+}
+
+// ---------------------------------------------------------------------------
+// render_frame_clear  (M2 fallback: solid-color clear + present)
+// ---------------------------------------------------------------------------
+void Renderer::render_frame_clear()
 {
     // All outputs share the same command allocator ring for now.
     // The back-buffer index for fencing comes from the primary output (index 0).
