@@ -75,10 +75,11 @@ public:
     void present(bool vsync = true);
 
     // ---- Accessors ----------------------------------------------------------
-    HdrMode   hdr_mode()  const { return m_hdr_mode; }
-    uint32_t  width()     const { return m_width; }
-    uint32_t  height()    const { return m_height; }
-    IDXGISwapChain4* swap_chain() const { return m_swap_chain.Get(); }
+    HdrMode     hdr_mode()           const { return m_hdr_mode; }
+    DXGI_FORMAT back_buffer_format() const { return m_back_buffer_format; }
+    uint32_t    width()              const { return m_width; }
+    uint32_t    height()             const { return m_height; }
+    IDXGISwapChain4* swap_chain()    const { return m_swap_chain.Get(); }
 
 private:
     void create_swap_chain(HWND hwnd);

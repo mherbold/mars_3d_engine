@@ -98,3 +98,24 @@ add_custom_command(TARGET mars_test_app POST_BUILD
     VERBATIM
 )
 add_dependencies(mars_test_app shaders_dxil)
+
+# -----------------------------------------------------------------------------
+# Scene assets — copy test_scene.marsscene and the models/ folder next to the
+# executable so the app can find them regardless of working directory.
+# The VS debugger working directory is also set to the source root so that
+# F5 launches find the assets via either the CWD or the exe-relative path.
+# -----------------------------------------------------------------------------
+add_custom_command(TARGET mars_test_app POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/test_scene.marsscene"
+        "$<TARGET_FILE_DIR:mars_test_app>/test_scene.marsscene"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_SOURCE_DIR}/models"
+        "$<TARGET_FILE_DIR:mars_test_app>/models"
+    COMMENT "Copying scene file and models to output directory..."
+    VERBATIM
+)
+
+set_target_properties(mars_test_app PROPERTIES
+    VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+)

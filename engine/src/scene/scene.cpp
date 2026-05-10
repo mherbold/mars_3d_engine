@@ -4,12 +4,22 @@
 // =============================================================================
 
 #include "mars_engine/scene/scene.h"
+#include "mars_engine/scene/scene_loader.h"
 #include "mars_engine/renderer/device_context.h"
 
 #include <print>
 
 namespace mars
 {
+
+bool Scene::load_from_file(const std::string& file_path,
+                            DeviceContext&     ctx,
+                            ResourceManager&   resource_mgr)
+{
+    unload();
+    SceneLoader loader;
+    return loader.load(file_path, ctx, resource_mgr, *this);
+}
 
 void Scene::load(DeviceContext& /*ctx*/, ResourceManager& /*resource_mgr*/, const std::string& scene_name)
 {
@@ -42,7 +52,10 @@ uint32_t Scene::add_model(
 void Scene::unload()
 {
     m_instances.clear();
-    m_loaded = false;
+    m_lights.clear();
+    m_cameras.clear();
+    m_skybox  = {};
+    m_loaded  = false;
 }
 
 } // namespace mars

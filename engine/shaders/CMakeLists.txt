@@ -15,6 +15,8 @@ include(CompileHLSL)
 set(HLSL_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/path_trace.hlsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shadow_ray.hlsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tone_map_blit_vs.hlsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tone_map_blit_ps.hlsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/gi/restir_di.hlsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/gi/restir_gi.hlsl"
 )
@@ -76,4 +78,8 @@ source_group("Shaders\\\\sky"       FILES
 source_group("Shaders\\\\gi"        FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/gi/restir_di.hlsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/gi/restir_gi.hlsl"
+)
+source_group("Shaders\\\\post"      FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/tone_map_blit_vs.hlsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tone_map_blit_ps.hlsl"
 )

@@ -30,6 +30,20 @@ void DisplayOutput::init(DeviceContext& device_ctx, HWND hwnd, uint32_t width, u
 
     create_swap_chain(hwnd);
     detect_hdr_support();
+
+    // If HDR detection upgraded the format, resize the swap chain buffers to
+    // match before creating RTVs.  The swap chain was initially created with
+    // DXGI_FORMAT_R8G8B8A8_UNORM; back buffers must match m_back_buffer_format.
+    if (m_back_buffer_format != DXGI_FORMAT_R8G8B8A8_UNORM)
+    {
+        throw_if_failed(
+            m_swap_chain->ResizeBuffers(
+                k_frame_count, m_width, m_height,
+                m_back_buffer_format,
+                DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING),
+            "ResizeBuffers (HDR format upgrade) failed");
+    }
+
     create_rtvs();
 
     m_initialised = true;

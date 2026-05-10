@@ -1,12 +1,14 @@
 // =============================================================================
 // renderer.cpp
-// MARS 3D Engine — Renderer implementation (M4: DXR path tracing)
+// MARS 3D Engine — Renderer implementation (M5: scene loading + static scene)
 // =============================================================================
 
 #include "mars_engine/renderer/renderer.h"
+#include "mars_engine/scene/scene_loader.h"
 
 #include <stdexcept>
 #include <format>
+#include <print>
 
 namespace mars
 {
@@ -65,6 +67,7 @@ void Renderer::init_internal(const std::vector<DisplayConfig>& configs,
 
     m_device_ctx.init();
     m_display_manager.init(m_device_ctx, configs, hwnds);
+    m_resource_mgr.init(m_device_ctx);
     create_frame_resources();
 
     // Initialise PathTracer for the primary output dimensions.
@@ -103,6 +106,8 @@ void Renderer::shutdown()
         wait_for_frame(i);
 
     m_path_tracer.shutdown();
+    m_scene.unload();
+    m_resource_mgr.shutdown();
     release_frame_resources();
     m_display_manager.shutdown();
     m_device_ctx.shutdown();
@@ -203,11 +208,175 @@ void Renderer::set_camera(uint32_t output_index,
 }
 
 // ---------------------------------------------------------------------------
+// load_scene
+// ---------------------------------------------------------------------------
+bool Renderer::load_scene(const std::string& marsscene_path)
+{
+    if (!m_initialised)
+    {
+        std::println("[Renderer] load_scene() called before init().");
+        return false;
+    }
+
+    m_device_ctx.flush_gpu();
+    m_scene.unload();
+
+    SceneLoader loader;
+    if (!loader.load(marsscene_path, m_device_ctx, m_resource_mgr, m_scene))
+        return false;
+
+    // Build BLAS for every mesh in every model instance.
+    // One BLAS per GpuMeshBuffer; share when the same model is used multiple times.
+    std::vector<uint32_t> blas_base_index(m_resource_mgr.model_count(), UINT32_MAX);
+
+    std::println("[Renderer] load_scene: {} scene instance(s), {} model(s) in resource manager.",
+                 m_scene.instances().size(), m_resource_mgr.model_count());
+
+    for (const auto& inst : m_scene.instances())
+    {
+        if (inst.model_index == UINT32_MAX) continue;
+
+        const GpuModel& model = m_resource_mgr.model(inst.model_index);
+        std::println("[Renderer]   Instance '{}': model_index={}, mesh_count={}",
+                     inst.name, inst.model_index, model.mesh_buffers.size());
+
+        for (uint32_t mi = 0; mi < static_cast<uint32_t>(model.mesh_buffers.size()); ++mi)
+        {
+            // Build BLAS once per mesh_buffer (model_index + mesh_index key).
+            uint32_t key_index = inst.model_index * 1024u + mi; // simple unique key
+            if (blas_base_index[inst.model_index] == UINT32_MAX || mi > 0)
+            {
+                std::println("[Renderer]     Building BLAS for model[{}] mesh[{}] ({} verts, {} idx)",
+                             inst.model_index, mi,
+                             model.mesh_buffers[mi].vertex_count(),
+                             model.mesh_buffers[mi].index_count());
+
+                uint32_t blas_idx = m_path_tracer.build_blas(
+                    m_device_ctx, model.mesh_buffers[mi]);
+
+                std::println("[Renderer]     -> BLAS index {}", blas_idx);
+
+                if (mi == 0)
+                    blas_base_index[inst.model_index] = blas_idx;
+
+                (void)key_index; // used conceptually above
+            }
+        }
+    }
+
+    // Populate TLAS instances from scene instances.
+    // Also build CpuInstanceData and CpuMaterialData arrays for the shader.
+    uint32_t tlas_instance = 0;
+    std::vector<CpuInstanceData> cpu_instances;
+    std::vector<CpuMaterialData> cpu_materials;
+
+    // One default white material (index 0)
+    {
+        CpuMaterialData def{};
+        def.base_color_factor[0] = 0.8f;
+        def.base_color_factor[1] = 0.8f;
+        def.base_color_factor[2] = 0.8f;
+        def.base_color_factor[3] = 1.0f;
+        def.roughness_factor = 1.0f;
+        cpu_materials.push_back(def);
+    }
+
+    for (const auto& inst : m_scene.instances())
+    {
+        if (inst.model_index == UINT32_MAX) continue;
+
+        const GpuModel& model = m_resource_mgr.model(inst.model_index);
+        Mat4x4 world = inst.transform.to_matrix();
+
+        for (uint32_t mi = 0; mi < static_cast<uint32_t>(model.mesh_buffers.size()); ++mi)
+        {
+            uint32_t blas_idx = blas_base_index[inst.model_index] + mi;
+
+            // Material: use a per-mesh material entry (white for now; extend when
+            // proper material data is plumbed through ResourceManager)
+            uint32_t mat_idx = static_cast<uint32_t>(cpu_materials.size());
+            {
+                CpuMaterialData mat{};
+                mat.base_color_factor[0] = 0.8f;
+                mat.base_color_factor[1] = 0.8f;
+                mat.base_color_factor[2] = 0.8f;
+                mat.base_color_factor[3] = 1.0f;
+                mat.roughness_factor = 0.8f;
+                // If the model has a bound texture for this mesh, wire it in
+                if (mi < model.texture_slots.size() && model.texture_slots[mi] != UINT32_MAX)
+                    mat.base_color_tex = model.texture_slots[mi];
+                cpu_materials.push_back(mat);
+            }
+
+            // Instance record
+            CpuInstanceData inst_data{};
+            memcpy(inst_data.world_transform, world.m, sizeof(world.m));
+            // For TRS with uniform scale the inverse-transpose upper-3x3 equals
+            // the world upper-3x3.  Copy the same matrix; normals will be
+            // re-normalised in the shader anyway.
+            memcpy(inst_data.world_transform_inv_transpose, world.m, sizeof(world.m));
+            inst_data.material_index    = mat_idx;
+            inst_data.vertex_buffer_srv = model.mesh_buffers[mi].vertex_srv_slot();
+            inst_data.index_buffer_srv  = model.mesh_buffers[mi].index_srv_slot();
+            cpu_instances.push_back(inst_data);
+
+            std::println("[Renderer]   TLAS instance {}: blas={} mat={} vtx_srv={} idx_srv={} ('{}')",
+                         tlas_instance, blas_idx, mat_idx,
+                         inst_data.vertex_buffer_srv, inst_data.index_buffer_srv,
+                         inst.name);
+            m_path_tracer.set_instance(tlas_instance++, blas_idx, world, mat_idx);
+        }
+    }
+
+    std::println("[Renderer] Total TLAS instances to build: {}", tlas_instance);
+
+    // Build the TLAS and flush.
+    throw_if_failed(m_cmd_allocators[0]->Reset(), "CmdAlloc::Reset (load_scene)");
+    throw_if_failed(m_cmd_list->Reset(m_cmd_allocators[0].Get(), nullptr),
+                    "CmdList::Reset (load_scene)");
+
+    rebuild_tlas();
+
+    throw_if_failed(m_cmd_list->Close(), "CmdList::Close (load_scene)");
+    ID3D12CommandList* lists[] = { m_cmd_list.Get() };
+    m_device_ctx.direct_queue()->ExecuteCommandLists(1, lists);
+    m_device_ctx.flush_gpu();
+
+    // Upload per-instance and per-material structured buffers to the GPU.
+    m_path_tracer.upload_scene_buffers(m_device_ctx, cpu_instances, cpu_materials);
+
+    std::println("[Renderer] Scene '{}' loaded: {} TLAS instance(s).",
+                 m_scene.name(), tlas_instance);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// rebuild_tlas
+// ---------------------------------------------------------------------------
+void Renderer::rebuild_tlas()
+{
+    m_path_tracer.build_tlas(m_device_ctx, m_cmd_list.Get());
+}
+
+// ---------------------------------------------------------------------------
 // render_frame — dispatches to path-traced or clear-color path
 // ---------------------------------------------------------------------------
 void Renderer::render_frame()
 {
-    if (m_path_tracer.is_initialised() && m_path_tracer.tlas_srv_slot() != UINT32_MAX)
+    bool path_traced = m_path_tracer.is_initialised() && m_path_tracer.tlas_srv_slot() != UINT32_MAX;
+
+    // Log the render path exactly once so the output isn't spammed every frame.
+    if (m_frame_index == 0)
+    {
+        std::println("[Renderer] render_frame() path: {}",
+                     path_traced ? "PATH_TRACED" : "CLEAR_COLOR_FALLBACK");
+        std::println("[Renderer]   path_tracer.is_initialised() = {}",
+                     m_path_tracer.is_initialised() ? "true" : "false");
+        std::println("[Renderer]   path_tracer.tlas_srv_slot()  = {}",
+                     m_path_tracer.tlas_srv_slot());
+    }
+
+    if (path_traced)
         render_frame_path_traced();
     else
         render_frame_clear();
@@ -250,19 +419,22 @@ void Renderer::render_frame_path_traced()
         uav.UAV.pResource = nullptr; // all UAVs
         m_cmd_list->ResourceBarrier(1, &uav);
 
-        // Transition back buffer: PRESENT → COPY_DEST
-        DisplayOutput& out = m_display_manager.output(oi);
-        out.transition(m_cmd_list.Get(),
+        // Transition back buffer: PRESENT → RENDER_TARGET
+        DisplayOutput& display_out = m_display_manager.output(oi);
+        display_out.transition(m_cmd_list.Get(),
                        D3D12_RESOURCE_STATE_PRESENT,
-                       D3D12_RESOURCE_STATE_COPY_DEST);
+                       D3D12_RESOURCE_STATE_RENDER_TARGET);
 
-        // Blit UAV → back buffer
+        // Blit UAV → back buffer with tone-mapping
         m_path_tracer.copy_to_back_buffer(m_cmd_list.Get(), oi,
-                                           out.current_back_buffer());
+                                           display_out.current_back_buffer(),
+                                           display_out.current_rtv(),
+                                           static_cast<uint32_t>(display_out.hdr_mode()),
+                                           display_out.back_buffer_format());
 
-        // Transition back buffer: COPY_DEST → PRESENT
-        out.transition(m_cmd_list.Get(),
-                       D3D12_RESOURCE_STATE_COPY_DEST,
+        // Transition back buffer: RENDER_TARGET → PRESENT
+        display_out.transition(m_cmd_list.Get(),
+                       D3D12_RESOURCE_STATE_RENDER_TARGET,
                        D3D12_RESOURCE_STATE_PRESENT);
     }
 

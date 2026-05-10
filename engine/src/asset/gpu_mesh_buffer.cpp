@@ -164,23 +164,42 @@ void GpuMeshBuffer::upload(DeviceContext& ctx, D3D12MA::Allocator* allocator, co
     m_ibv.SizeInBytes    = static_cast<UINT>(ib_size);
     m_ibv.Format         = DXGI_FORMAT_R32_UINT;
 
-    // ---- Register vertex buffer SRV in the bindless heap ----
+    // ---- Register vertex buffer SRV in the bindless heap (ByteAddressBuffer) ----
+    // The path-trace shader reads vertices via g_Buffers[vbSrv].Load*() (raw byte access).
     m_vertex_srv_slot = ctx.allocate_bindless_slot();
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
-    srv_desc.Format                     = DXGI_FORMAT_UNKNOWN;
+    srv_desc.Format                     = DXGI_FORMAT_R32_TYPELESS;
     srv_desc.ViewDimension              = D3D12_SRV_DIMENSION_BUFFER;
     srv_desc.Shader4ComponentMapping    = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv_desc.Buffer.FirstElement        = 0;
-    srv_desc.Buffer.NumElements         = m_vertex_count;
-    srv_desc.Buffer.StructureByteStride = sizeof(Vertex);
-    srv_desc.Buffer.Flags               = D3D12_BUFFER_SRV_FLAG_NONE;
+    srv_desc.Buffer.NumElements         = static_cast<UINT>(vb_size / 4); // count in DWORDs
+    srv_desc.Buffer.StructureByteStride = 0;
+    srv_desc.Buffer.Flags               = D3D12_BUFFER_SRV_FLAG_RAW;
 
     D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle =
         ctx.bindless_heap()->GetCPUDescriptorHandleForHeapStart();
     cpu_handle.ptr += static_cast<SIZE_T>(m_vertex_srv_slot) * ctx.bindless_descriptor_size();
 
     ctx.device()->CreateShaderResourceView(m_vertex_buffer, &srv_desc, cpu_handle);
+
+    // ---- Register index buffer SRV in the bindless heap (ByteAddressBuffer) ----
+    m_index_srv_slot = ctx.allocate_bindless_slot();
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC ib_srv_desc{};
+    ib_srv_desc.Format                    = DXGI_FORMAT_R32_TYPELESS;
+    ib_srv_desc.ViewDimension             = D3D12_SRV_DIMENSION_BUFFER;
+    ib_srv_desc.Shader4ComponentMapping   = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    ib_srv_desc.Buffer.FirstElement       = 0;
+    ib_srv_desc.Buffer.NumElements        = m_index_count;
+    ib_srv_desc.Buffer.StructureByteStride= 0;
+    ib_srv_desc.Buffer.Flags              = D3D12_BUFFER_SRV_FLAG_RAW;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE ib_cpu_handle =
+        ctx.bindless_heap()->GetCPUDescriptorHandleForHeapStart();
+    ib_cpu_handle.ptr += static_cast<SIZE_T>(m_index_srv_slot) * ctx.bindless_descriptor_size();
+
+    ctx.device()->CreateShaderResourceView(m_index_buffer, &ib_srv_desc, ib_cpu_handle);
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +216,7 @@ void GpuMeshBuffer::destroy()
     m_vertex_count    = 0;
     m_index_count     = 0;
     m_vertex_srv_slot = UINT32_MAX;
+    m_index_srv_slot  = UINT32_MAX;
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +232,7 @@ GpuMeshBuffer::GpuMeshBuffer(GpuMeshBuffer&& o) noexcept
     , m_vertex_count(o.m_vertex_count)
     , m_index_count(o.m_index_count)
     , m_vertex_srv_slot(o.m_vertex_srv_slot)
+    , m_index_srv_slot(o.m_index_srv_slot)
     , m_bounds(o.m_bounds)
 {
     o.m_vertex_alloc  = nullptr;
@@ -221,6 +242,7 @@ GpuMeshBuffer::GpuMeshBuffer(GpuMeshBuffer&& o) noexcept
     o.m_vertex_count  = 0;
     o.m_index_count   = 0;
     o.m_vertex_srv_slot = UINT32_MAX;
+    o.m_index_srv_slot  = UINT32_MAX;
 }
 
 GpuMeshBuffer& GpuMeshBuffer::operator=(GpuMeshBuffer&& o) noexcept

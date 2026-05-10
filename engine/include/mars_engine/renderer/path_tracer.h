@@ -35,6 +35,35 @@ namespace D3D12MA { class Allocator; class Allocation; }
 namespace mars
 {
 
+// ---------------------------------------------------------------------------
+// CPU-side mirror of the HLSL GpuInstanceData / GpuMaterialData structs.
+// Sizes and field order MUST match the HLSL definitions in material_data.hlsli.
+// ---------------------------------------------------------------------------
+struct CpuInstanceData
+{
+    float    world_transform[4][4]              = {};
+    float    world_transform_inv_transpose[4][4]= {};
+    uint32_t material_index    = 0;
+    uint32_t vertex_buffer_srv = UINT32_MAX;
+    uint32_t index_buffer_srv  = UINT32_MAX;
+    uint32_t _pad              = 0;
+};
+
+struct CpuMaterialData
+{
+    float    base_color_factor[4]  = {1,1,1,1};
+    float    metallic_factor       = 0.0f;
+    float    roughness_factor      = 1.0f;
+    float    emissive_scale        = 1.0f;
+    float    alpha_cutoff          = 0.5f;
+    uint32_t base_color_tex        = UINT32_MAX;
+    uint32_t normal_tex            = UINT32_MAX;
+    uint32_t metallic_roughness_tex= UINT32_MAX;
+    uint32_t emissive_tex          = UINT32_MAX;
+    float    emissive_factor[3]    = {};
+    uint32_t flags                 = 0;  // bit0=double_sided, bit1=alpha_masked
+};
+
 using Microsoft::WRL::ComPtr;
 
 class DeviceContext;
@@ -80,6 +109,13 @@ public:
                         const GpuMeshBuffer& mesh,
                         bool allow_update = false);
 
+    // Upload instance and material structured buffers and register their
+    // bindless SRV slots so shaders can fetch per-instance/material data.
+    // Must be called after all set_instance() calls and before the first trace().
+    void upload_scene_buffers(DeviceContext& ctx,
+                              const std::vector<CpuInstanceData>& instances,
+                              const std::vector<CpuMaterialData>& materials);
+
     // ---------------------------------------------------------------------------
     // TLAS management
     // Rebuilds the top-level AS from the current instance list.
@@ -111,10 +147,16 @@ public:
                uint32_t output_index);
 
     // Blit the UAV for `output_index` into `back_buffer` (which must be in
-    // COPY_DEST state; caller is responsible for transitions).
+    // RENDER_TARGET state; caller is responsible for transitions).
+    // `rtv` is the CPU descriptor handle for the back-buffer RTV.
+    // `hdr_mode` controls the tone-map / color-space path.
+    // `back_buffer_format` must match the swap-chain format.
     void copy_to_back_buffer(ID3D12GraphicsCommandList6* cmd_list,
                              uint32_t output_index,
-                             ID3D12Resource* back_buffer);
+                             ID3D12Resource* back_buffer,
+                             D3D12_CPU_DESCRIPTOR_HANDLE rtv,
+                             uint32_t hdr_mode,
+                             DXGI_FORMAT back_buffer_format);
 
     // Resize the UAV texture for a given output (e.g. on WM_SIZE).
     void resize_output(DeviceContext& ctx,
@@ -132,6 +174,8 @@ private:
     void create_shader_tables(DeviceContext& ctx);
     void create_output_textures(DeviceContext& ctx);
     void create_cb_ring(DeviceContext& ctx);
+
+    void create_blit_pipeline(DeviceContext& ctx);
 
     void release_output_textures();
 
@@ -194,6 +238,7 @@ private:
         D3D12MA::Allocation* alloc    = nullptr;
         ID3D12Resource*      resource = nullptr;
         uint32_t             uav_slot = UINT32_MAX;  // bindless UAV slot
+        uint32_t             srv_slot = UINT32_MAX;  // bindless SRV slot (for tone-map blit)
         uint32_t             width    = 0;
         uint32_t             height   = 0;
     };
@@ -210,6 +255,23 @@ private:
     };
     // Indexed as m_frame_cbs[output_index * k_frame_count + back_index]
     std::vector<FrameCBSlot> m_frame_cbs;
+
+    // --- Blit (tone-map) pipeline -------------------------------------------
+    // One PSO per swap-chain format (SDR, HDR10, scRGB).
+    ComPtr<ID3D12RootSignature> m_blit_root_sig;
+    ComPtr<ID3D12PipelineState> m_blit_pso_sdr;    // DXGI_FORMAT_R8G8B8A8_UNORM
+    ComPtr<ID3D12PipelineState> m_blit_pso_hdr10;  // DXGI_FORMAT_R10G10B10A2_UNORM
+    ComPtr<ID3D12PipelineState> m_blit_pso_scrgb;  // DXGI_FORMAT_R16G16B16A16_FLOAT
+    D3D12_GPU_DESCRIPTOR_HANDLE m_bindless_heap_gpu_start{}; // cached from DeviceContext
+
+    // --- Scene instance / material structured buffers -----------------------
+    D3D12MA::Allocation* m_instance_data_alloc   = nullptr;
+    ID3D12Resource*      m_instance_data_buffer  = nullptr;
+    uint32_t             m_instance_data_srv_slot= UINT32_MAX;
+
+    D3D12MA::Allocation* m_material_data_alloc   = nullptr;
+    ID3D12Resource*      m_material_data_buffer  = nullptr;
+    uint32_t             m_material_data_srv_slot= UINT32_MAX;
 
     // --- D3D12MA allocator (owned by PathTracer) -----------------------------
     D3D12MA::Allocator* m_allocator = nullptr;

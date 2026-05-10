@@ -24,6 +24,9 @@ list(APPEND ENGINE_SOURCES
     "src/asset/gpu_mesh_buffer.cpp"
     "src/asset/texture_loader.cpp"
     "src/asset/resource_manager.cpp"
+    "src/scene/scene.cpp"
+    "src/scene/scene_loader.cpp"
+    "src/camera/camera.cpp"
 )
 list(REMOVE_DUPLICATES ENGINE_SOURCES)
 
@@ -38,6 +41,10 @@ list(APPEND ENGINE_HEADERS
     "include/mars_engine/asset/gpu_mesh_buffer.h"
     "include/mars_engine/asset/texture_loader.h"
     "include/mars_engine/asset/resource_manager.h"
+    "include/mars_engine/scene/scene_types.h"
+    "include/mars_engine/scene/scene_loader.h"
+    "include/mars_engine/scene/scene.h"
+    "include/mars_engine/camera/camera.h"
 )
 list(REMOVE_DUPLICATES ENGINE_HEADERS)
 

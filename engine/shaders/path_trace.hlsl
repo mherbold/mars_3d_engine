@@ -6,6 +6,8 @@
 // Shader model: lib_6_3 (DXR ray-tracing library)
 // =============================================================================
 
+#pragma pack_matrix(row_major)
+
 #include "common/math.hlsli"
 #include "common/random.hlsli"
 #include "material/material_data.hlsli"
@@ -188,17 +190,91 @@ void RayGen()
 }
 
 // ---------------------------------------------------------------------------
-// [shader("miss")]  Miss — sky color gradient
+// [shader("miss")]  Miss — procedural orientation skybox
+//
+// Each cube face is colour-coded and overlaid with an 8×8 UV grid and a
+// centre crosshair so the viewer can immediately tell which direction they
+// are looking.
+//
+// Face → colour mapping:
+//   +X  East    red       (0.80, 0.15, 0.15)
+//   −X  West    orange    (0.80, 0.45, 0.10)
+//   +Y  Up      white     (0.90, 0.90, 0.90)
+//   −Y  Down    brown     (0.25, 0.15, 0.05)
+//   +Z  South   blue      (0.15, 0.40, 0.80)
+//   −Z  North   green     (0.15, 0.70, 0.25)
 // ---------------------------------------------------------------------------
 [shader("miss")]
 void Miss(inout PrimaryPayload payload)
 {
-    // Simple sky gradient: horizon pale blue, zenith deep blue
-    float3 dir     = normalize(WorldRayDirection());
-    float  t       = saturate(dir.y * 0.5f + 0.5f);
-    float3 horizon = float3(0.6f, 0.8f, 1.0f);
-    float3 zenith  = float3(0.05f, 0.1f, 0.5f);
-    payload.radiance = lerp(horizon, zenith, t);
+    float3 dir = normalize(WorldRayDirection());
+    float  ax  = abs(dir.x);
+    float  ay  = abs(dir.y);
+    float  az  = abs(dir.z);
+
+    float2 uv;
+    float3 faceColor;
+
+    if (ax >= ay && ax >= az)
+    {
+        float inv = 0.5f / ax;
+        if (dir.x > 0.0f)
+        {
+            uv        = float2(-dir.z, -dir.y) * inv + 0.5f;  // +X  East
+            faceColor = float3(0.80f, 0.15f, 0.15f);
+        }
+        else
+        {
+            uv        = float2( dir.z, -dir.y) * inv + 0.5f;  // -X  West
+            faceColor = float3(0.80f, 0.45f, 0.10f);
+        }
+    }
+    else if (ay >= ax && ay >= az)
+    {
+        float inv = 0.5f / ay;
+        if (dir.y > 0.0f)
+        {
+            uv        = float2( dir.x,  dir.z) * inv + 0.5f;  // +Y  Up
+            faceColor = float3(0.90f, 0.90f, 0.90f);
+        }
+        else
+        {
+            uv        = float2( dir.x, -dir.z) * inv + 0.5f;  // -Y  Down
+            faceColor = float3(0.25f, 0.15f, 0.05f);
+        }
+    }
+    else
+    {
+        float inv = 0.5f / az;
+        if (dir.z > 0.0f)
+        {
+            uv        = float2( dir.x, -dir.y) * inv + 0.5f;  // +Z  South
+            faceColor = float3(0.15f, 0.40f, 0.80f);
+        }
+        else
+        {
+            uv        = float2(-dir.x, -dir.y) * inv + 0.5f;  // -Z  North
+            faceColor = float3(0.15f, 0.70f, 0.25f);
+        }
+    }
+
+    // 8×8 UV grid with thin black lines
+    const float k_cells    = 8.0f;
+    const float k_line     = 0.04f;  // line half-width in cell UV space
+    float2 cellUV = frac(uv * k_cells);
+    bool   onGrid = cellUV.x < k_line || cellUV.x > (1.0f - k_line)
+                 || cellUV.y < k_line || cellUV.y > (1.0f - k_line);
+
+    // White crosshair at the face centre so the exact forward direction is clear
+    float2 fromCentre = abs(uv - 0.5f);
+    bool   onCross    = (fromCentre.x < 0.006f && fromCentre.y < 0.05f)
+                     || (fromCentre.y < 0.006f && fromCentre.x < 0.05f);
+
+    float3 color = onCross ? float3(1.0f, 1.0f, 1.0f)
+                 : onGrid  ? float3(0.0f, 0.0f, 0.0f)
+                 : faceColor;
+
+    payload.radiance = color;
     payload.hit_t    = -1.0f;
     payload.missed   = true;
 }

@@ -10,7 +10,9 @@
 
 #include "engine_api.h"
 #include "math/math_types.h"
+#include "scene/scene_types.h"
 #include "scene/scene.h"
+#include "scene/scene_loader.h"
 #include "camera/camera.h"
 #include "renderer/device_context.h"
 #include "renderer/display_output.h"

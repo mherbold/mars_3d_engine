@@ -61,6 +61,9 @@ public:
     // Bindless SRV slot for the vertex buffer (structured buffer, stride = sizeof(Vertex)).
     uint32_t vertex_srv_slot() const { return m_vertex_srv_slot; }
 
+    // Bindless SRV slot for the index buffer (ByteAddressBuffer).
+    uint32_t index_srv_slot()  const { return m_index_srv_slot; }
+
     const AABB& bounds() const { return m_bounds; }
 
 private:
@@ -76,6 +79,7 @@ private:
     uint32_t m_vertex_count    = 0;
     uint32_t m_index_count     = 0;
     uint32_t m_vertex_srv_slot = UINT32_MAX;
+    uint32_t m_index_srv_slot  = UINT32_MAX;
 
     AABB m_bounds = {};
 };

@@ -12,6 +12,7 @@
 #include <vector>
 #include <string>
 #include <cassert>
+#include <print>
 
 // D3D12 Memory Allocator
 #pragma warning(push, 0)
@@ -54,9 +55,36 @@ static std::vector<uint8_t> load_dxil_blob(const std::wstring& filename)
         return data;
     };
 
-    auto blob = try_load(exe_dir + L"dxil\\" + filename);
+    std::wstring path1 = exe_dir + L"dxil\\" + filename;
+    std::wstring path2 = std::wstring(L"dxil\\") + filename;
+
+    // Convert wstring to string for logging (ASCII paths only — DXIL filenames are safe).
+    auto wstr_to_str = [](const std::wstring& ws) -> std::string
+    {
+        std::string s(ws.size(), '\0');
+        for (size_t i = 0; i < ws.size(); ++i)
+            s[i] = static_cast<char>(ws[i]);
+        return s;
+    };
+
+    std::println("[PathTracer] Searching for DXIL blob:");
+    std::println("[PathTracer]   Try 1: '{}'", wstr_to_str(path1));
+
+    auto blob = try_load(path1);
     if (blob.empty())
-        blob = try_load(std::wstring(L"dxil\\") + filename);
+    {
+        std::println("[PathTracer]   Try 1 FAILED — not found or empty.");
+        std::println("[PathTracer]   Try 2: '{}'", wstr_to_str(path2));
+        blob = try_load(path2);
+        if (blob.empty())
+            std::println("[PathTracer]   Try 2 FAILED — not found or empty.");
+        else
+            std::println("[PathTracer]   Try 2 OK — {} bytes loaded.", blob.size());
+    }
+    else
+    {
+        std::println("[PathTracer]   Try 1 OK — {} bytes loaded.", blob.size());
+    }
 
     if (blob.empty())
         throw std::runtime_error(
@@ -137,16 +165,14 @@ void PathTracer::init(DeviceContext& ctx,
 
     create_allocator(ctx);
     create_rtpso(ctx);
+    create_blit_pipeline(ctx);
     create_shader_tables(ctx);
     create_output_textures(ctx);
     create_cb_ring(ctx);
 
     // Resize all output textures to the given dimensions
     for (uint32_t i = 0; i < output_count; ++i)
-    {
-        m_outputs[i].width  = output_width;
-        m_outputs[i].height = output_height;
-    }
+        resize_output(ctx, i, output_width, output_height);
 
     m_initialised = true;
 }
@@ -182,6 +208,12 @@ void PathTracer::shutdown()
     if (m_tlas_scratch_alloc) { m_tlas_scratch_alloc->Release(); m_tlas_scratch_alloc = nullptr; m_tlas_scratch     = nullptr; }
     if (m_instance_buf_alloc) { m_instance_buf_alloc->Release(); m_instance_buf_alloc = nullptr; m_instance_buffer  = nullptr; }
 
+    // Release scene instance / material buffers
+    if (m_instance_data_alloc) { m_instance_data_alloc->Release(); m_instance_data_alloc = nullptr; m_instance_data_buffer = nullptr; }
+    if (m_material_data_alloc) { m_material_data_alloc->Release(); m_material_data_alloc = nullptr; m_material_data_buffer = nullptr; }
+    m_instance_data_srv_slot = UINT32_MAX;
+    m_material_data_srv_slot = UINT32_MAX;
+
     // Release BLAS list
     for (auto& b : m_blas_list)
         if (b.alloc) { b.alloc->Release(); b.alloc = nullptr; b.resource = nullptr; }
@@ -192,9 +224,116 @@ void PathTracer::shutdown()
     m_global_root_sig.Reset();
     m_local_root_sig.Reset();
 
+    m_blit_pso_sdr.Reset();
+    m_blit_pso_hdr10.Reset();
+    m_blit_pso_scrgb.Reset();
+    m_blit_root_sig.Reset();
+
     if (m_allocator) { m_allocator->Release(); m_allocator = nullptr; }
 
     m_initialised = false;
+}
+
+// ---------------------------------------------------------------------------
+// create_blit_pipeline
+// Builds a root signature and 3 PSOs (SDR / HDR10 / scRGB) for the
+// tone-map blit that converts the RGBA16F path-tracer output into the
+// swap-chain back buffer format.
+// ---------------------------------------------------------------------------
+void PathTracer::create_blit_pipeline(DeviceContext& ctx)
+{
+    auto* device = ctx.device();
+
+    // ---- 1. Root signature --------------------------------------------------
+    // Param 0: 2 root constants (src_texture_slot, hdr_mode)          b0 space0
+    // Param 1: descriptor table — same bindless SRV heap as DXR shaders
+    {
+        CD3DX12_ROOT_PARAMETER1 params[2]{};
+        params[0].InitAsConstants(2, 0, 0, D3D12_SHADER_VISIBILITY_PIXEL);
+
+        static constexpr D3D12_DESCRIPTOR_RANGE_FLAGS k_vol =
+            D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE |
+            D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+        CD3DX12_DESCRIPTOR_RANGE1 srv_range;
+        srv_range.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, 0, k_vol, 0);
+        params[1].InitAsDescriptorTable(1, &srv_range, D3D12_SHADER_VISIBILITY_PIXEL);
+
+        CD3DX12_STATIC_SAMPLER_DESC point_sampler(1,
+            D3D12_FILTER_MIN_MAG_MIP_POINT,
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+        // Also expose the linear sampler at s0 so bindless.hlsli macros compile.
+        CD3DX12_STATIC_SAMPLER_DESC linear_sampler(0,
+            D3D12_FILTER_ANISOTROPIC,
+            D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+            D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+            D3D12_TEXTURE_ADDRESS_MODE_WRAP);
+
+        CD3DX12_STATIC_SAMPLER_DESC samplers[2] = { linear_sampler, point_sampler };
+
+        CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rs_desc;
+        rs_desc.Init_1_1(2, params, 2, samplers,
+                         D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
+        ComPtr<ID3DBlob> rs_blob, err_blob;
+        throw_if_failed(
+            D3DX12SerializeVersionedRootSignature(&rs_desc,
+                D3D_ROOT_SIGNATURE_VERSION_1_1, &rs_blob, &err_blob),
+            "PathTracer: serialize blit root signature failed");
+
+        throw_if_failed(
+            device->CreateRootSignature(0,
+                rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(),
+                IID_PPV_ARGS(&m_blit_root_sig)),
+            "PathTracer: create blit root signature failed");
+
+        m_blit_root_sig->SetName(L"MARS::PathTracer::BlitRootSig");
+    }
+
+    // ---- 2. Load VS and PS DXIL blobs ---------------------------------------
+    auto vs_blob = load_dxil_blob(L"tone_map_blit_vs.dxil");
+    auto ps_blob = load_dxil_blob(L"tone_map_blit_ps.dxil");
+
+    D3D12_SHADER_BYTECODE vs_bc{ vs_blob.data(), vs_blob.size() };
+    D3D12_SHADER_BYTECODE ps_bc{ ps_blob.data(), ps_blob.size() };
+
+    // ---- 3. Build PSOs for each back-buffer format --------------------------
+    auto make_pso = [&](DXGI_FORMAT rt_format) -> ComPtr<ID3D12PipelineState>
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc{};
+        pso_desc.pRootSignature = m_blit_root_sig.Get();
+        pso_desc.VS             = vs_bc;
+        pso_desc.PS             = ps_bc;
+
+        pso_desc.RasterizerState.FillMode              = D3D12_FILL_MODE_SOLID;
+        pso_desc.RasterizerState.CullMode              = D3D12_CULL_MODE_NONE;
+        pso_desc.RasterizerState.DepthClipEnable       = FALSE;
+
+        pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+        pso_desc.SampleMask                = UINT_MAX;
+        pso_desc.PrimitiveTopologyType     = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pso_desc.NumRenderTargets          = 1;
+        pso_desc.RTVFormats[0]             = rt_format;
+        pso_desc.SampleDesc.Count          = 1;
+        pso_desc.DepthStencilState.DepthEnable = FALSE;
+        pso_desc.DepthStencilState.StencilEnable = FALSE;
+
+        ComPtr<ID3D12PipelineState> pso;
+        throw_if_failed(
+            device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso)),
+            "PathTracer: create blit PSO failed");
+        return pso;
+    };
+
+    m_blit_pso_sdr   = make_pso(DXGI_FORMAT_R8G8B8A8_UNORM);
+    m_blit_pso_hdr10 = make_pso(DXGI_FORMAT_R10G10B10A2_UNORM);
+    m_blit_pso_scrgb = make_pso(DXGI_FORMAT_R16G16B16A16_FLOAT);
+
+    // Cache the GPU start of the bindless heap so copy_to_back_buffer can use it
+    // without needing a DeviceContext pointer.
+    m_bindless_heap_gpu_start = ctx.bindless_heap()->GetGPUDescriptorHandleForHeapStart();
 }
 
 // ---------------------------------------------------------------------------
@@ -440,6 +579,7 @@ void PathTracer::release_output_textures()
     {
         if (out.alloc) { out.alloc->Release(); out.alloc = nullptr; out.resource = nullptr; }
         out.uav_slot = UINT32_MAX;
+        out.srv_slot = UINT32_MAX;
     }
 }
 
@@ -518,6 +658,19 @@ void PathTracer::resize_output(DeviceContext& ctx,
     D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle = ctx.bindless_heap()->GetCPUDescriptorHandleForHeapStart();
     cpu_handle.ptr += static_cast<SIZE_T>(out.uav_slot) * ctx.bindless_descriptor_size();
     device->CreateUnorderedAccessView(out.resource, nullptr, &uav_desc, cpu_handle);
+
+    // Allocate bindless SRV slot (used by the tone-map blit pixel shader)
+    out.srv_slot = ctx.allocate_bindless_slot();
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+    srv_desc.Format                        = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    srv_desc.ViewDimension                 = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Shader4ComponentMapping       = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv_desc.Texture2D.MipLevels           = 1;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE srv_handle = ctx.bindless_heap()->GetCPUDescriptorHandleForHeapStart();
+    srv_handle.ptr += static_cast<SIZE_T>(out.srv_slot) * ctx.bindless_descriptor_size();
+    device->CreateShaderResourceView(out.resource, &srv_desc, srv_handle);
 }
 
 // ---------------------------------------------------------------------------
@@ -533,7 +686,7 @@ uint32_t PathTracer::build_blas(DeviceContext& ctx,
     geom_desc.Type                                 = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
     geom_desc.Flags                                = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
     geom_desc.Triangles.VertexBuffer.StartAddress  = mesh.vertex_buffer_view().BufferLocation;
-    geom_desc.Triangles.VertexBuffer.StrideInBytes = sizeof(float) * 3; // position is first 12 bytes of Vertex
+    geom_desc.Triangles.VertexBuffer.StrideInBytes = sizeof(Vertex); // full interleaved vertex stride
     geom_desc.Triangles.VertexFormat               = DXGI_FORMAT_R32G32B32_FLOAT;
     geom_desc.Triangles.VertexCount                = mesh.vertex_count();
     geom_desc.Triangles.IndexBuffer                = mesh.index_buffer_view().BufferLocation;
@@ -646,7 +799,12 @@ void PathTracer::build_tlas(DeviceContext& ctx,
     auto* device = ctx.device();
 
     uint32_t instance_count = static_cast<uint32_t>(m_instances.size());
-    if (instance_count == 0) return;
+    if (instance_count == 0)
+    {
+        std::println("[PathTracer] build_tlas: instance_count == 0 — TLAS not built, tlas_srv_slot stays UINT32_MAX.");
+        return;
+    }
+    std::println("[PathTracer] build_tlas: building TLAS for {} instance(s).", instance_count);
 
     // Upload instance descriptors to an upload buffer
     uint64_t instance_buf_size = sizeof(D3D12_RAYTRACING_INSTANCE_DESC) * instance_count;
@@ -746,6 +904,8 @@ void PathTracer::build_tlas(DeviceContext& ctx,
     if (m_tlas_srv_slot == UINT32_MAX)
         m_tlas_srv_slot = ctx.allocate_bindless_slot();
 
+    std::println("[PathTracer] build_tlas: TLAS built successfully. tlas_srv_slot = {}.", m_tlas_srv_slot);
+
     D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
     srv_desc.Format                                   = DXGI_FORMAT_UNKNOWN;
     srv_desc.ViewDimension                            = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
@@ -755,6 +915,123 @@ void PathTracer::build_tlas(DeviceContext& ctx,
     D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle = ctx.bindless_heap()->GetCPUDescriptorHandleForHeapStart();
     cpu_handle.ptr += static_cast<SIZE_T>(m_tlas_srv_slot) * ctx.bindless_descriptor_size();
     device->CreateShaderResourceView(nullptr, &srv_desc, cpu_handle);
+}
+
+// ---------------------------------------------------------------------------
+// upload_scene_buffers
+// Builds GPU-side structured buffers for per-instance and per-material data
+// and registers them as bindless SRVs so the path-trace shader can fetch them.
+// ---------------------------------------------------------------------------
+void PathTracer::upload_scene_buffers(DeviceContext& ctx,
+                                       const std::vector<CpuInstanceData>& instances,
+                                       const std::vector<CpuMaterialData>& materials)
+{
+    auto* device = ctx.device();
+
+    // Helper: create an UPLOAD-heap buffer, copy data into it, then copy to a
+    // DEFAULT-heap buffer, register an SRV, and return the slot.
+    auto upload_structured = [&](const void*  data,
+                                  uint32_t     element_count,
+                                  uint32_t     element_stride,
+                                  const wchar_t* name,
+                                  D3D12MA::Allocation*& out_alloc,
+                                  ID3D12Resource*&      out_resource,
+                                  uint32_t&             out_srv_slot) -> bool
+    {
+        if (element_count == 0) return false;
+
+        uint64_t byte_size = static_cast<uint64_t>(element_count) * element_stride;
+
+        // Release previous if any
+        if (out_alloc) { out_alloc->Release(); out_alloc = nullptr; out_resource = nullptr; }
+
+        // Create DEFAULT-heap buffer
+        D3D12MA::ALLOCATION_DESC ad{};
+        ad.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width            = byte_size;
+        bd.Height           = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Flags            = D3D12_RESOURCE_FLAG_NONE;
+
+        throw_if_failed(m_allocator->CreateResource(&ad, &bd,
+                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                         &out_alloc, IID_PPV_ARGS(&out_resource)),
+                        "upload_scene_buffers: create DEFAULT buffer failed");
+        out_resource->SetName(name);
+
+        // Upload via UPLOAD-heap staging
+        D3D12MA::Allocation* stage_alloc = nullptr;
+        ID3D12Resource*      stage_res   = nullptr;
+        void*                stage_ptr   = nullptr;
+        create_upload_buffer(ctx, byte_size, L"MARS::SceneBuffer::Staging",
+                             &stage_alloc, &stage_res, &stage_ptr);
+        memcpy(stage_ptr, data, static_cast<size_t>(byte_size));
+        stage_res->Unmap(0, nullptr);
+
+        // One-shot command list for copy
+        ComPtr<ID3D12CommandAllocator>        copy_alloc;
+        ComPtr<ID3D12GraphicsCommandList>     copy_cmd;
+        throw_if_failed(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                         IID_PPV_ARGS(&copy_alloc)), "CreateCommandAllocator (scene buf)");
+        throw_if_failed(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                         copy_alloc.Get(), nullptr, IID_PPV_ARGS(&copy_cmd)),
+                        "CreateCommandList (scene buf)");
+
+        copy_cmd->CopyBufferRegion(out_resource, 0, stage_res, 0, byte_size);
+
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource   = out_resource;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        copy_cmd->ResourceBarrier(1, &barrier);
+
+        throw_if_failed(copy_cmd->Close(), "CommandList::Close (scene buf)");
+        ID3D12CommandList* lists[] = { copy_cmd.Get() };
+        ctx.direct_queue()->ExecuteCommandLists(1, lists);
+        ctx.flush_gpu();
+
+        stage_alloc->Release();
+
+        // Register SRV
+        if (out_srv_slot == UINT32_MAX)
+            out_srv_slot = ctx.allocate_bindless_slot();
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format                     = DXGI_FORMAT_UNKNOWN;
+        srv.ViewDimension              = D3D12_SRV_DIMENSION_BUFFER;
+        srv.Shader4ComponentMapping    = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Buffer.FirstElement        = 0;
+        srv.Buffer.NumElements         = element_count;
+        srv.Buffer.StructureByteStride = element_stride;
+        srv.Buffer.Flags               = D3D12_BUFFER_SRV_FLAG_NONE;
+
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle =
+            ctx.bindless_heap()->GetCPUDescriptorHandleForHeapStart();
+        cpu_handle.ptr += static_cast<SIZE_T>(out_srv_slot) * ctx.bindless_descriptor_size();
+        device->CreateShaderResourceView(out_resource, &srv, cpu_handle);
+
+        return true;
+    };
+
+    upload_structured(instances.data(),
+                      static_cast<uint32_t>(instances.size()),
+                      static_cast<uint32_t>(sizeof(CpuInstanceData)),
+                      L"MARS::InstanceDataBuffer",
+                      m_instance_data_alloc, m_instance_data_buffer, m_instance_data_srv_slot);
+
+    upload_structured(materials.data(),
+                      static_cast<uint32_t>(materials.size()),
+                      static_cast<uint32_t>(sizeof(CpuMaterialData)),
+                      L"MARS::MaterialDataBuffer",
+                      m_material_data_alloc, m_material_data_buffer, m_material_data_srv_slot);
+
+    std::println("[PathTracer] upload_scene_buffers: instance_srv={} material_srv={}",
+                 m_instance_data_srv_slot, m_material_data_srv_slot);
 }
 
 // ---------------------------------------------------------------------------
@@ -781,8 +1058,8 @@ void PathTracer::update_frame_constants(DeviceContext& ctx,
     fc.output_width          = out.width;
     fc.output_height         = out.height;
     fc.tlas_slot             = m_tlas_srv_slot;
-    fc.material_buffer_slot  = UINT32_MAX; // wired up from ResourceManager in M5+
-    fc.instance_buffer_slot  = UINT32_MAX;
+    fc.material_buffer_slot  = m_material_data_srv_slot;
+    fc.instance_buffer_slot  = m_instance_data_srv_slot;
     fc.output_uav_slot       = out.uav_slot;
 
     memcpy(slot.mapped_ptr, &fc, sizeof(FrameConstants));
@@ -793,10 +1070,32 @@ void PathTracer::update_frame_constants(DeviceContext& ctx,
 // ---------------------------------------------------------------------------
 void PathTracer::trace(ID3D12GraphicsCommandList6* cmd_list, uint32_t output_index)
 {
-    if (!m_initialised || m_tlas_srv_slot == UINT32_MAX) return;
+    if (!m_initialised || m_tlas_srv_slot == UINT32_MAX)
+    {
+        // Log only on the first call so we don't spam every frame.
+        static bool s_logged = false;
+        if (!s_logged)
+        {
+            s_logged = true;
+            std::println("[PathTracer] trace() early-return: initialised={} tlas_srv_slot={}",
+                         m_initialised ? "true" : "false", m_tlas_srv_slot);
+        }
+        return;
+    }
 
     const OutputTexture& out = m_outputs[output_index];
-    if (out.width == 0 || out.height == 0 || out.resource == nullptr) return;
+    if (out.width == 0 || out.height == 0 || out.resource == nullptr)
+    {
+        static bool s_logged_out = false;
+        if (!s_logged_out)
+        {
+            s_logged_out = true;
+            std::println("[PathTracer] trace() early-return: output[{}] not ready ({}x{}, resource={})",
+                         output_index, out.width, out.height,
+                         out.resource ? "valid" : "null");
+        }
+        return;
+    }
 
     // Bind RTPSO
     cmd_list->SetPipelineState1(m_rtpso.Get());
@@ -808,6 +1107,9 @@ void PathTracer::trace(ID3D12GraphicsCommandList6* cmd_list, uint32_t output_ind
     uint32_t slot_idx = output_index * k_frame_count; // simplified; renderer passes correct frame
     cmd_list->SetComputeRootConstantBufferView(0,
         m_frame_cbs[slot_idx].resource->GetGPUVirtualAddress());
+
+    // Bind the bindless heap (root param 1 — covers all SRV/UAV spaces)
+    cmd_list->SetComputeRootDescriptorTable(1, m_bindless_heap_gpu_start);
 
     // Dispatch rays
     D3D12_DISPATCH_RAYS_DESC rays{};
@@ -835,31 +1137,69 @@ void PathTracer::trace(ID3D12GraphicsCommandList6* cmd_list, uint32_t output_ind
 
 // ---------------------------------------------------------------------------
 // copy_to_back_buffer
-// Blits the UAV texture (RGBA16F) into `back_buffer` (must be in COPY_DEST).
-// The UAV is transitioned to COPY_SOURCE and then back to UAV afterward.
+// Tone-maps and blits the RGBA16F path-tracer output into `back_buffer`.
+// `back_buffer` must already be in D3D12_RESOURCE_STATE_RENDER_TARGET.
+// `rtv`               — CPU handle for the back-buffer render target view.
+// `hdr_mode`          — 0 SDR / 1 HDR10 / 2 scRGB.
+// `back_buffer_format`— swap-chain format; selects the correct PSO.
 // ---------------------------------------------------------------------------
 void PathTracer::copy_to_back_buffer(ID3D12GraphicsCommandList6* cmd_list,
                                       uint32_t output_index,
-                                      ID3D12Resource* back_buffer)
+                                      ID3D12Resource* back_buffer,
+                                      D3D12_CPU_DESCRIPTOR_HANDLE rtv,
+                                      uint32_t hdr_mode,
+                                      DXGI_FORMAT back_buffer_format)
 {
     OutputTexture& out = m_outputs[output_index];
     if (!out.resource) return;
 
-    // Transition UAV → COPY_SOURCE
-    D3D12_RESOURCE_BARRIER to_copy = {};
-    to_copy.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    to_copy.Transition.pResource   = out.resource;
-    to_copy.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    to_copy.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    to_copy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    cmd_list->ResourceBarrier(1, &to_copy);
+    (void)back_buffer; // resource identity unused; caller already transitioned it via RTV
+    D3D12_RESOURCE_BARRIER to_srv{};
+    to_srv.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_srv.Transition.pResource   = out.resource;
+    to_srv.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    to_srv.Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    to_srv.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    cmd_list->ResourceBarrier(1, &to_srv);
 
-    // Copy (back_buffer is already in COPY_DEST per the caller contract)
-    cmd_list->CopyResource(back_buffer, out.resource);
+    // Select PSO for the swap-chain format.
+    ID3D12PipelineState* pso = nullptr;
+    switch (back_buffer_format)
+    {
+    case DXGI_FORMAT_R10G10B10A2_UNORM:  pso = m_blit_pso_hdr10.Get(); break;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: pso = m_blit_pso_scrgb.Get(); break;
+    default:                             pso = m_blit_pso_sdr.Get();   break;
+    }
 
-    // Transition COPY_SOURCE → UAV
-    std::swap(to_copy.Transition.StateBefore, to_copy.Transition.StateAfter);
-    cmd_list->ResourceBarrier(1, &to_copy);
+    cmd_list->SetPipelineState(pso);
+    cmd_list->SetGraphicsRootSignature(m_blit_root_sig.Get());
+
+    // Root param 0: two 32-bit constants (src_texture_slot, hdr_mode).
+    uint32_t root_consts[2] = { out.srv_slot, hdr_mode };
+    cmd_list->SetGraphicsRoot32BitConstants(0, 2, root_consts, 0);
+
+    // Root param 1: bindless SRV heap — point at slot 0 (the table covers all slots).
+    // The heap was already bound by the caller (render_frame_path_traced).
+    cmd_list->SetGraphicsRootDescriptorTable(1, m_bindless_heap_gpu_start);
+
+    // Bind RTV; no depth buffer.
+    cmd_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+
+    D3D12_VIEWPORT vp{ 0.f, 0.f,
+        static_cast<float>(out.width), static_cast<float>(out.height),
+        0.f, 1.f };
+    D3D12_RECT scissor{ 0, 0,
+        static_cast<LONG>(out.width), static_cast<LONG>(out.height) };
+    cmd_list->RSSetViewports(1, &vp);
+    cmd_list->RSSetScissorRects(1, &scissor);
+
+    cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cmd_list->DrawInstanced(3, 1, 0, 0);  // full-screen triangle; no vertex buffer
+
+    // Transition PIXEL_SHADER_RESOURCE → UAV (back to default state for next frame).
+    std::swap(to_srv.Transition.StateBefore, to_srv.Transition.StateAfter);
+    cmd_list->ResourceBarrier(1, &to_srv);
 }
 
 } // namespace mars

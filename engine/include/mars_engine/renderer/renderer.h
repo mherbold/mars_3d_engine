@@ -15,6 +15,8 @@
 #include "device_context.h"
 #include "display_manager.h"
 #include "path_tracer.h"
+#include "../asset/resource_manager.h"
+#include "../scene/scene.h"
 
 #include <wrl/client.h>
 #include <array>
@@ -70,10 +72,22 @@ public:
                     const Mat4x4& view_inv,
                     const Mat4x4& proj_inv);
 
+    // Load a .marsscene file and build the DXR acceleration structure.
+    // Must be called after init(). Returns false on parse/load errors.
+    bool load_scene(const std::string& marsscene_path);
+
+    // Rebuild the TLAS from the current scene (e.g. after adding instances).
+    void rebuild_tlas();
+
     // ---- PathTracer access -----------------------------------------------
 
     PathTracer&       path_tracer()       { return m_path_tracer; }
     const PathTracer& path_tracer() const { return m_path_tracer; }
+
+    // ---- Scene / resource access -----------------------------------------
+    Scene&            scene()             { return m_scene; }
+    const Scene&      scene()       const { return m_scene; }
+    ResourceManager&  resource_manager()  { return m_resource_mgr; }
 
     // ---- Accessors ----------------------------------------------------------
     DeviceContext&   device_context()              { return m_device_ctx; }
@@ -97,6 +111,8 @@ private:
     DeviceContext   m_device_ctx;
     DisplayManager  m_display_manager;
     PathTracer      m_path_tracer;
+    ResourceManager m_resource_mgr;
+    Scene           m_scene;
 
     // Per-frame command allocators (one per back buffer).
     std::array<ComPtr<ID3D12CommandAllocator>, k_frame_count>  m_cmd_allocators;

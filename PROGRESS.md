@@ -1,6 +1,6 @@
 # PROGRESS.md — MARS 3D Engine Implementation Progress
 
-Last updated: 2025-07 (M4)
+Last updated: 2025-07 (M5 — tone-map blit fix)
 
 ---
 
@@ -15,8 +15,8 @@ Last updated: 2025-07 (M4)
 ---
 
 ## Current Focus
-> **M4 fully complete** — DXR pipeline implemented. `PathTracer` creates its own D3D12MA allocator, loads `path_trace.dxil` (compiled from `lib_6_3`), builds the RTPSO with a global root signature (bindless CBV/SRV/UAV heap + frame constants CB), writes shader tables (ray-gen, miss, hit-group), builds BLAS/TLAS from scene meshes, allocates per-output RGBA16F UAV textures, and drives `DispatchRays` each frame. Closest-hit shader fetches interpolated vertices via raw byte-address loads, resolves PBR material parameters (base color, normal map, metallic/roughness, emissive) from bindless textures, traces a shadow ray, and evaluates a GGX/Smith/Fresnel BRDF under a hard-coded directional sun light. Miss shader returns a sky gradient. Results are copied to swap-chain back buffers via `copy_to_back_buffer()`. `Renderer` drives `PathTracer` for all outputs; falls back to clear-color present if not initialized.
-> Next step: **Milestone M5** — Scene file parser, static scene rendering.
+> **M5 bug-fix complete** — `CopyResource` format mismatch between the RGBA16F path-tracer UAV and the R8G8B8A8_UNORM swap-chain back buffer has been resolved. `PathTracer::copy_to_back_buffer()` is replaced by a full-screen tone-map blit pipeline (`tone_map_blit_vs.hlsl` + `tone_map_blit_ps.hlsl`) with three PSOs for SDR (Reinhard+sRGB), HDR10 (ACES+PQ), and scRGB (pass-through) swap-chain formats. The output texture now registers both a UAV slot (for ray tracing) and an SRV slot (for the blit PS) in the bindless heap. `renderer.cpp` transitions the back buffer to RENDER_TARGET instead of COPY_DEST and passes the RTV, HdrMode, and format to the updated signature.
+> Next step: **Milestone M6** — DLSS 4 integration (upscale, Multi Frame Generation, Ray Reconstruction).
 
 ---
 
@@ -29,6 +29,7 @@ Last updated: 2025-07 (M4)
 | M2 | Multi-monitor display system | ✅ | See M2 details below |
 | M3 | Asset pipeline: FBX/glTF load + GPU upload | ✅ | See M3 details below |
 | M4 | DXR pipeline: primary rays, basic PBR hit shader | ✅ | See M4 details below |
+| M5 | Scene file parser, static scene rendering | ✅ | See M5 details below |
 
 ---
 
@@ -142,10 +143,10 @@ Last updated: 2025-07 (M4)
 - ✅ `Renderer` drives `PathTracer` for all `DisplayOutput` instances; clear-color fallback if not initialised
 
 ### M5 — Scene File Parser & Static Scene
-- 🔲 `SceneLoader`: parse `.marsscene` JSON
-- 🔲 Instantiate `MeshInstance`, `Light`, `Camera` objects
-- 🔲 Build TLAS from loaded instances
-- 🔲 Render a multi-object static scene
+- ✅ `SceneLoader`: parse `.marsscene` JSON
+- ✅ Instantiate `MeshInstance`, `Light`, `Camera` objects
+- ✅ Build TLAS from loaded instances
+- ✅ Render a multi-object static scene
 
 ### M15 — Debug Overlay *(Developer-Only: ImGui, PIX, Aftermath)*
 - 🔲 ImGui integration (debug builds only, stripped from shipping)
@@ -166,6 +167,29 @@ Last updated: 2025-07 (M4)
 - 🔲 Theme/style sheet system (JSON): colors, spacing, animation curves
 - 🔲 HDR-aware color pipeline for UI (linear → tone map per display)
 - 🔲 Per-monitor DPI scaling support
+
+### M5 — Scene File Parser & Static Scene
+
+### New Files
+| File | Purpose |
+|---|---|
+| `engine/include/mars_engine/scene/scene_types.h` | `LightDesc`, `CameraDesc`, `SkyboxDesc` — JSON-mapped scene metadata types |
+| `engine/include/mars_engine/scene/scene_loader.h` | `SceneLoader::load()` — public API for parsing `.marsscene` files |
+| `engine/src/scene/scene_loader.cpp` | JSON parsing (nlohmann/json): resolves relative paths, loads models, populates lights/cameras/skybox |
+| `engine/include/mars_engine/camera/camera.h` | `Camera` (view/proj matrices, display offsets, prev-frame storage) and `FlyCamera` (WASD + mouse-look) |
+| `engine/src/camera/camera.cpp` | Camera matrix construction (right-handed, D3D12 depth [0,1]), rigid-body / projection inverse |
+| `test_scene.marsscene` | Sample scene file: one directional sun light, one default camera, no mesh instances |
+
+### Updated Files
+| File | Change |
+|---|---|
+| `engine/include/mars_engine/scene/scene.h` | Added `SceneLoader` friend, M5 metadata members (`m_lights`, `m_cameras`, `m_skybox`), accessors, `load_from_file()` |
+| `engine/src/scene/scene.cpp` | `load_from_file()` delegates to `SceneLoader`; `unload()` clears all M5 state |
+| `engine/include/mars_engine/renderer/renderer.h` | Added `load_scene()`, `rebuild_tlas()`, `scene()`, `resource_manager()` accessors; added `ResourceManager` and `Scene` members |
+| `engine/src/renderer/renderer.cpp` | `init_internal()` calls `ResourceManager::init()`; `shutdown()` calls `ResourceManager::shutdown()` and `Scene::unload()`; `load_scene()` builds BLAS/TLAS from loaded instances |
+| `engine/include/mars_engine/mars_engine.h` | Added `scene_types.h` and `scene_loader.h` to public single-include |
+| `engine/CMakeLists.txt` | Added `scene_loader.cpp`, `camera.cpp`, and M5 headers to source/header lists |
+| `test_app/src/main.cpp` | FlyCamera integration: WASD + QE/Space + left-click mouse capture; loads `test_scene.marsscene`; seeds camera from scene `cameras[0]` if present |
 
 ---
 
