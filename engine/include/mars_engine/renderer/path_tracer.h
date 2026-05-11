@@ -140,11 +140,15 @@ public:
                                 uint32_t frame_index,
                                 const Vec3& camera_pos,
                                 const Mat4x4& view_inv,
-                                const Mat4x4& proj_inv);
+                                const Mat4x4& proj_inv,
+                                const Vec3& sun_direction,
+                                const Vec3& sun_color,
+                                float sun_intensity);
 
     // Record DispatchRays into `cmd_list` for the given output.
     void trace(ID3D12GraphicsCommandList6* cmd_list,
-               uint32_t output_index);
+               uint32_t output_index,
+               uint32_t frame_index);
 
     // Blit the UAV for `output_index` into `back_buffer` (which must be in
     // RENDER_TARGET state; caller is responsible for transitions).

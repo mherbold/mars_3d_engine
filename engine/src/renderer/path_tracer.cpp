@@ -1042,7 +1042,10 @@ void PathTracer::update_frame_constants(DeviceContext& ctx,
                                          uint32_t frame_index,
                                          const Vec3& camera_pos,
                                          const Mat4x4& view_inv,
-                                         const Mat4x4& proj_inv)
+                                         const Mat4x4& proj_inv,
+                                         const Vec3& sun_direction,
+                                         const Vec3& sun_color,
+                                         float sun_intensity)
 {
     (void)ctx;
     uint32_t slot_idx = output_index * k_frame_count + (frame_index % k_frame_count);
@@ -1061,14 +1064,18 @@ void PathTracer::update_frame_constants(DeviceContext& ctx,
     fc.material_buffer_slot  = m_material_data_srv_slot;
     fc.instance_buffer_slot  = m_instance_data_srv_slot;
     fc.output_uav_slot       = out.uav_slot;
+    fc.sun_direction         = sun_direction;
+    fc.sun_intensity         = sun_intensity;
+    fc.sun_color             = sun_color;
 
     memcpy(slot.mapped_ptr, &fc, sizeof(FrameConstants));
-}
 
+    }
+
+    // ---------------------------------------------------------------------------
+    // trace
 // ---------------------------------------------------------------------------
-// trace
-// ---------------------------------------------------------------------------
-void PathTracer::trace(ID3D12GraphicsCommandList6* cmd_list, uint32_t output_index)
+void PathTracer::trace(ID3D12GraphicsCommandList6* cmd_list, uint32_t output_index, uint32_t frame_index)
 {
     if (!m_initialised || m_tlas_srv_slot == UINT32_MAX)
     {
@@ -1104,7 +1111,7 @@ void PathTracer::trace(ID3D12GraphicsCommandList6* cmd_list, uint32_t output_ind
     cmd_list->SetComputeRootSignature(m_global_root_sig.Get());
 
     // Set the per-frame CB (root param 0)
-    uint32_t slot_idx = output_index * k_frame_count; // simplified; renderer passes correct frame
+    uint32_t slot_idx = output_index * k_frame_count + (frame_index % k_frame_count);
     cmd_list->SetComputeRootConstantBufferView(0,
         m_frame_cbs[slot_idx].resource->GetGPUVirtualAddress());
 

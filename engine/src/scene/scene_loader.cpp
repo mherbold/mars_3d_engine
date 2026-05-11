@@ -133,7 +133,7 @@ bool SceneLoader::load(const std::string& file_path,
     {
         LightDesc sun;
         sun.type      = LightType::Directional;
-        sun.direction = scene.m_skybox.sun_direction;
+        sun.direction = scene.m_skybox.sun_direction; // NOTE: must point TOWARD the sky (+Y up)
         sun.intensity = scene.m_skybox.sun_intensity;
         sun.color     = { 1.0f, 0.98f, 0.95f };
         sun.name      = "Sun";

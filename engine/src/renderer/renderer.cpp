@@ -236,31 +236,27 @@ bool Renderer::load_scene(const std::string& marsscene_path)
     {
         if (inst.model_index == UINT32_MAX) continue;
 
+        // Skip if this model's BLAS has already been built (shared by multiple instances).
+        if (blas_base_index[inst.model_index] != UINT32_MAX) continue;
+
         const GpuModel& model = m_resource_mgr.model(inst.model_index);
-        std::println("[Renderer]   Instance '{}': model_index={}, mesh_count={}",
-                     inst.name, inst.model_index, model.mesh_buffers.size());
+        std::println("[Renderer]   Building BLAS for model_index={} mesh_count={}",
+                     inst.model_index, model.mesh_buffers.size());
 
         for (uint32_t mi = 0; mi < static_cast<uint32_t>(model.mesh_buffers.size()); ++mi)
         {
-            // Build BLAS once per mesh_buffer (model_index + mesh_index key).
-            uint32_t key_index = inst.model_index * 1024u + mi; // simple unique key
-            if (blas_base_index[inst.model_index] == UINT32_MAX || mi > 0)
-            {
-                std::println("[Renderer]     Building BLAS for model[{}] mesh[{}] ({} verts, {} idx)",
-                             inst.model_index, mi,
-                             model.mesh_buffers[mi].vertex_count(),
-                             model.mesh_buffers[mi].index_count());
+            std::println("[Renderer]     mesh[{}]: {} verts, {} idx",
+                         mi,
+                         model.mesh_buffers[mi].vertex_count(),
+                         model.mesh_buffers[mi].index_count());
 
-                uint32_t blas_idx = m_path_tracer.build_blas(
-                    m_device_ctx, model.mesh_buffers[mi]);
+            uint32_t blas_idx = m_path_tracer.build_blas(
+                m_device_ctx, model.mesh_buffers[mi]);
 
-                std::println("[Renderer]     -> BLAS index {}", blas_idx);
+            std::println("[Renderer]     -> BLAS index {}", blas_idx);
 
-                if (mi == 0)
-                    blas_base_index[inst.model_index] = blas_idx;
-
-                (void)key_index; // used conceptually above
-            }
+            if (mi == 0)
+                blas_base_index[inst.model_index] = blas_idx;
         }
     }
 
@@ -405,13 +401,29 @@ void Renderer::render_frame_path_traced()
 
     for (uint32_t oi = 0; oi < m_display_manager.output_count(); ++oi)
     {
-        // Update per-frame constants
+        // Update per-frame constants — pull sun from the first directional light in the scene
         const CameraState& cam = (oi < m_cameras.size()) ? m_cameras[oi] : m_cameras[0];
+
+        Vec3  sun_dir       = { 0.3f,  0.8f, 0.5f };
+        Vec3  sun_color     = { 1.0f, 0.95f, 0.85f };
+        float sun_intensity = 5.0f;
+        for (const auto& light : m_scene.lights())
+        {
+            if (light.type == LightType::Directional)
+            {
+                sun_dir       = light.direction;
+                sun_color     = light.color;
+                sun_intensity = light.intensity;
+                break;
+            }
+        }
+
         m_path_tracer.update_frame_constants(m_device_ctx, oi, m_frame_index,
-                                             cam.position, cam.view_inv, cam.proj_inv);
+                                             cam.position, cam.view_inv, cam.proj_inv,
+                                             sun_dir, sun_color, sun_intensity);
 
         // Trace rays → UAV
-        m_path_tracer.trace(m_cmd_list.Get(), oi);
+        m_path_tracer.trace(m_cmd_list.Get(), oi, m_frame_index);
 
         // UAV barrier between trace and copy
         D3D12_RESOURCE_BARRIER uav{};

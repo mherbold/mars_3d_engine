@@ -319,9 +319,9 @@ int WINAPI WinMain(
             cam_pos = c.position;
             fov     = c.fov_deg;
         }
-        // yaw=180° faces -Z so the camera looks toward the scene origin from (0,2,5).
-        // pitch=-11° tilts slightly down to match the scene-file look-at target.
-        g_fly_cam.init(cam_pos, 180.0f, -11.0f, fov, aspect, 0.1f, 10000.0f);
+        // yaw=0° → fwd points in +Z; rays fire in -fwd=-Z, toward the scene from (0,1.5,5).
+        // pitch=+11° → fwd.y > 0; rays tilt slightly down to match the scene look-at target.
+        g_fly_cam.init(cam_pos, 0.0f, 11.0f, fov, aspect, 0.1f, 10000.0f);
     }
 
     // ---- Frame timer -------------------------------------------------------

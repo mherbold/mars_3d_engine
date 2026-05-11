@@ -28,7 +28,13 @@ struct FrameConstants
     uint     material_buffer_slot; // bindless SRV slot for GpuMaterialData[]
     uint     instance_buffer_slot; // bindless SRV slot for GpuInstanceData[]
     uint     output_uav_slot;   // bindless UAV slot for the output texture
-    float    _pad[22];          // explicit padding to 256 bytes (matches C++ FrameConstants)
+    uint     _pad_align0;       // \_ 8 bytes of padding to push sun_direction to the next
+    uint     _pad_align1;       // /  16-byte register boundary (arrays would each use 16 bytes)
+    float3   sun_direction;     // world-space direction TOWARD the sun
+    float    sun_intensity;
+    float3   sun_color;         // linear RGB
+    float    _pad0;
+    float    _pad[12];          // explicit padding to 256 bytes (matches C++ FrameConstants)
 };
 
 ConstantBuffer<FrameConstants> g_Frame : register(b0, space0);
@@ -51,7 +57,7 @@ struct PrimaryPayload
 
 struct ShadowPayload
 {
-    bool occluded;
+    uint occluded; // 1 = occluded, 0 = unoccluded (bool is unreliable in DXR payloads)
 };
 
 // ---------------------------------------------------------------------------
@@ -285,7 +291,7 @@ void Miss(inout PrimaryPayload payload)
 [shader("miss")]
 void ShadowMiss(inout ShadowPayload payload)
 {
-    payload.occluded = false;
+    payload.occluded = 0u;
 }
 
 // ---------------------------------------------------------------------------
@@ -324,13 +330,12 @@ void ClosestHit(inout PrimaryPayload payload, in BuiltInTriangleIntersectionAttr
     if (dot(N, V) < 0.0f)
         N = -N;   // flip for double-sided surfaces
 
-    // Hard-coded single directional light (sun) — will be replaced in M5+ by scene lights
-    float3 sunDir      = normalize(float3(0.4f, 1.0f, 0.3f));
-    float3 sunRadiance = float3(5.0f, 4.8f, 4.5f);  // warm white, ~5 klux in linear
+    float3 sunDir      = normalize(g_Frame.sun_direction);
+    float3 sunRadiance = g_Frame.sun_color * g_Frame.sun_intensity;
 
     // Shadow ray
     ShadowPayload shadowPayload;
-    shadowPayload.occluded = true;
+    shadowPayload.occluded = 1u;
 
     RayDesc shadowRay;
     shadowRay.Origin    = worldPos + N * 1e-3f;
@@ -348,7 +353,7 @@ void ClosestHit(inout PrimaryPayload payload, in BuiltInTriangleIntersectionAttr
              shadowPayload);
 
     float3 directLight = float3(0, 0, 0);
-    if (!shadowPayload.occluded)
+    if (shadowPayload.occluded == 0u)
         directLight = EvaluatePBR(baseColor, metallic, roughness, N, V, sunDir) * sunRadiance;
 
     // Simple ambient (will be replaced by path-traced GI in M7/M8)
