@@ -27,14 +27,19 @@ struct FrameConstants
     uint     tlas_slot;         // bindless SRV slot of the TLAS
     uint     material_buffer_slot; // bindless SRV slot for GpuMaterialData[]
     uint     instance_buffer_slot; // bindless SRV slot for GpuInstanceData[]
-    uint     output_uav_slot;   // bindless UAV slot for the output texture
-    uint     _pad_align0;       // \_ 8 bytes of padding to push sun_direction to the next
-    uint     _pad_align1;       // /  16-byte register boundary (arrays would each use 16 bytes)
-    float3   sun_direction;     // world-space direction TOWARD the sun
+    uint     output_uav_slot;         // bindless UAV slot for the output texture   (offset 164)
+    uint     motion_vector_uav_slot;  // bindless UAV slot for the motion vector UAV (offset 168)
+    uint     depth_uav_slot;          // bindless UAV slot for the linear depth UAV  (offset 172)
+    // register 11 — padding to push sun_direction to offset 192
+    uint     _pad_align0;             // offset 176
+    uint     _pad_align1;             // offset 180
+    uint     _pad_align2;             // offset 184
+    uint     _pad_align3;             // offset 188
+    float3   sun_direction;           // offset 192 — register 12
     float    sun_intensity;
-    float3   sun_color;         // linear RGB
+    float3   sun_color;               // offset 208 — register 13
     float    _pad0;
-    float    _pad[12];          // explicit padding to 256 bytes (matches C++ FrameConstants)
+    float4x4 prev_view_proj;          // offset 224 — registers 14..17
 };
 
 ConstantBuffer<FrameConstants> g_Frame : register(b0, space0);
@@ -44,6 +49,12 @@ RaytracingAccelerationStructure g_TLAS[] : register(t0, space4);
 
 // Output UAV — RGBA16F (scRGB linear, HDR-ready)
 RWTexture2D<float4> g_OutputUAV[] : register(u0, space1);
+
+// Motion vector UAV — R16G16B16A16_FLOAT (XY = screen-space pixels delta)
+RWTexture2D<float4> g_MotionVectorUAV[] : register(u0, space2);
+
+// Linear depth UAV — R32_FLOAT
+RWTexture2D<float>  g_LinearDepthUAV[]  : register(u0, space3);
 
 // ---------------------------------------------------------------------------
 // Payload structures
@@ -193,6 +204,40 @@ void RayGen()
              payload);
 
     g_OutputUAV[g_Frame.output_uav_slot][launchIdx] = float4(payload.radiance, 1.0f);
+
+    // ---- Motion vectors and linear depth ------------------------------------
+    if (g_Frame.motion_vector_uav_slot != 0xFFFFFFFF)
+    {
+        float2 motionVec = float2(0.0f, 0.0f);
+        float  linearDepth = 1e6f;
+
+        if (!payload.missed && payload.hit_t > 0.0f)
+        {
+            // Reconstruct world-space hit position
+            float3 worldHit = ray.Origin + ray.Direction * payload.hit_t;
+            linearDepth = payload.hit_t;
+
+            // Re-project to previous clip space
+            float4 prevClip = mul(g_Frame.prev_view_proj, float4(worldHit, 1.0f));
+            prevClip.xyz /= prevClip.w;
+            // Convert NDC [-1,1] to screen UV [0,1] (flip Y for D3D)
+            float2 prevUV = float2(prevClip.x * 0.5f + 0.5f,
+                                   -prevClip.y * 0.5f + 0.5f);
+            float2 prevPixel = prevUV * float2(g_Frame.output_width, g_Frame.output_height);
+
+            // Motion vector = current pixel − previous pixel (screen-space pixels)
+            motionVec = float2(launchIdx) - prevPixel;
+        }
+
+        g_MotionVectorUAV[g_Frame.motion_vector_uav_slot][launchIdx] =
+            float4(motionVec, 0.0f, 0.0f);
+    }
+
+    if (g_Frame.depth_uav_slot != 0xFFFFFFFF)
+    {
+        float d = payload.missed ? 1e6f : max(payload.hit_t, 0.0f);
+        g_LinearDepthUAV[g_Frame.depth_uav_slot][launchIdx] = d;
+    }
 }
 
 // ---------------------------------------------------------------------------

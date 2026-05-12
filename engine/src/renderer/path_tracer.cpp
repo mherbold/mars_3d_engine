@@ -372,6 +372,8 @@ void PathTracer::create_rtpso(DeviceContext& ctx)
         // UAV spaces:
         //   space0 — g_RWBuffers[]         (u0, space0)
         //   space1 — g_OutputUAV[]         (u0, space1)
+        //   space2 — g_MotionVectorUAV[]   (u0, space2)
+        //   space3 — g_LinearDepthUAV[]    (u0, space3)
         static constexpr UINT k_unbounded = UINT_MAX;
         static constexpr D3D12_DESCRIPTOR_RANGE_FLAGS k_volatile_flags =
             D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE |
@@ -382,7 +384,7 @@ void PathTracer::create_rtpso(DeviceContext& ctx)
         // offsetInDescriptorsFromTableStart = 0 explicitly; using the default
         // D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND after an unbounded (UINT_MAX) range
         // causes an arithmetic overflow and E_INVALIDARG during serialization.
-        CD3DX12_DESCRIPTOR_RANGE1 ranges[7]{};
+        CD3DX12_DESCRIPTOR_RANGE1 ranges[9]{};
         // SRV space0 – g_Textures[]
         ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, k_unbounded, 0, 0, k_volatile_flags, 0);
         // SRV space1 – g_Buffers[]
@@ -397,8 +399,12 @@ void PathTracer::create_rtpso(DeviceContext& ctx)
         ranges[5].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, k_unbounded, 0, 0, k_volatile_flags, 0);
         // UAV space1 – g_OutputUAV[]
         ranges[6].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, k_unbounded, 0, 1, k_volatile_flags, 0);
+        // UAV space2 – g_MotionVectorUAV[]
+        ranges[7].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, k_unbounded, 0, 2, k_volatile_flags, 0);
+        // UAV space3 – g_LinearDepthUAV[]
+        ranges[8].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, k_unbounded, 0, 3, k_volatile_flags, 0);
 
-        params[1].InitAsDescriptorTable(7, ranges, D3D12_SHADER_VISIBILITY_ALL);
+        params[1].InitAsDescriptorTable(9, ranges, D3D12_SHADER_VISIBILITY_ALL);
 
         // Static sampler s0: linear wrap
         CD3DX12_STATIC_SAMPLER_DESC sampler(0,
@@ -558,29 +564,61 @@ void PathTracer::create_shader_tables(DeviceContext& ctx)
 // ---------------------------------------------------------------------------
 // create_output_textures
 // Allocates one RGBA16F DEFAULT-heap UAV texture per output.
+// Also primes motion vector and depth texture placeholders.
 // ---------------------------------------------------------------------------
 void PathTracer::create_output_textures(DeviceContext& ctx)
 {
     m_outputs.resize(m_output_count);
+    m_mv_outputs.resize(m_output_count);
+    m_depth_outputs.resize(m_output_count);
+    m_denoised_outputs.resize(m_output_count);
+    m_albedo_outputs.resize(m_output_count);
+    m_specular_albedo_outputs.resize(m_output_count);
+    m_normals_aov_outputs.resize(m_output_count);
+    m_roughness_aov_outputs.resize(m_output_count);
 
     for (uint32_t i = 0; i < m_output_count; ++i)
     {
         // Placeholder — actual textures are created/re-created in resize_output().
-        // We set width/height to 0 so the first resize_output call always creates them.
-        m_outputs[i].width  = 0;
-        m_outputs[i].height = 0;
+        m_outputs[i].width                   = 0;
+        m_outputs[i].height                  = 0;
+        m_mv_outputs[i].width                = 0;
+        m_mv_outputs[i].height               = 0;
+        m_depth_outputs[i].width             = 0;
+        m_depth_outputs[i].height            = 0;
+        m_denoised_outputs[i].width          = 0;
+        m_denoised_outputs[i].height         = 0;
+        m_albedo_outputs[i].width            = 0;
+        m_albedo_outputs[i].height           = 0;
+        m_specular_albedo_outputs[i].width   = 0;
+        m_specular_albedo_outputs[i].height  = 0;
+        m_normals_aov_outputs[i].width       = 0;
+        m_normals_aov_outputs[i].height      = 0;
+        m_roughness_aov_outputs[i].width     = 0;
+        m_roughness_aov_outputs[i].height    = 0;
     }
     (void)ctx;
 }
 
 void PathTracer::release_output_textures()
 {
-    for (auto& out : m_outputs)
+    auto release_vec = [](std::vector<OutputTexture>& v)
     {
-        if (out.alloc) { out.alloc->Release(); out.alloc = nullptr; out.resource = nullptr; }
-        out.uav_slot = UINT32_MAX;
-        out.srv_slot = UINT32_MAX;
-    }
+        for (auto& out : v)
+        {
+            if (out.alloc) { out.alloc->Release(); out.alloc = nullptr; out.resource = nullptr; }
+            out.uav_slot = UINT32_MAX;
+            out.srv_slot = UINT32_MAX;
+        }
+    };
+    release_vec(m_outputs);
+    release_vec(m_mv_outputs);
+    release_vec(m_depth_outputs);
+    release_vec(m_denoised_outputs);
+    release_vec(m_albedo_outputs);
+    release_vec(m_specular_albedo_outputs);
+    release_vec(m_normals_aov_outputs);
+    release_vec(m_roughness_aov_outputs);
 }
 
 // ---------------------------------------------------------------------------
@@ -671,6 +709,156 @@ void PathTracer::resize_output(DeviceContext& ctx,
     D3D12_CPU_DESCRIPTOR_HANDLE srv_handle = ctx.bindless_heap()->GetCPUDescriptorHandleForHeapStart();
     srv_handle.ptr += static_cast<SIZE_T>(out.srv_slot) * ctx.bindless_descriptor_size();
     device->CreateShaderResourceView(out.resource, &srv_desc, srv_handle);
+
+    // ---- Motion vector texture (R16G16B16A16_FLOAT) -------------------------
+    {
+        OutputTexture& mv = m_mv_outputs[output_index];
+        if (mv.alloc) { mv.alloc->Release(); mv.alloc = nullptr; mv.resource = nullptr; }
+        mv.width  = new_width;
+        mv.height = new_height;
+
+        D3D12_RESOURCE_DESC mv_desc = tex_desc;
+        mv_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+
+        throw_if_failed(
+            m_allocator->CreateResource(
+                &alloc_desc, &mv_desc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                nullptr,
+                &mv.alloc,
+                IID_PPV_ARGS(&mv.resource)),
+            "PathTracer: create motion vector UAV texture failed");
+        mv.resource->SetName(
+            std::wstring(L"MARS::PathTracer::MotionVectorUAV[" +
+                         std::to_wstring(output_index) + L"]").c_str());
+
+        mv.uav_slot = ctx.allocate_bindless_slot();
+        D3D12_UNORDERED_ACCESS_VIEW_DESC mv_uav_desc{};
+        mv_uav_desc.Format        = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        mv_uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        D3D12_CPU_DESCRIPTOR_HANDLE mv_cpu = ctx.bindless_heap()->GetCPUDescriptorHandleForHeapStart();
+        mv_cpu.ptr += static_cast<SIZE_T>(mv.uav_slot) * ctx.bindless_descriptor_size();
+        device->CreateUnorderedAccessView(mv.resource, nullptr, &mv_uav_desc, mv_cpu);
+    }
+
+    // ---- Linear depth texture (R32_FLOAT) -----------------------------------
+    {
+        OutputTexture& d = m_depth_outputs[output_index];
+        if (d.alloc) { d.alloc->Release(); d.alloc = nullptr; d.resource = nullptr; }
+        d.width  = new_width;
+        d.height = new_height;
+
+        D3D12_RESOURCE_DESC d_desc = tex_desc;
+        d_desc.Format = DXGI_FORMAT_R32_FLOAT;
+
+        throw_if_failed(
+            m_allocator->CreateResource(
+                &alloc_desc, &d_desc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                nullptr,
+                &d.alloc,
+                IID_PPV_ARGS(&d.resource)),
+            "PathTracer: create depth UAV texture failed");
+        d.resource->SetName(
+            std::wstring(L"MARS::PathTracer::LinearDepthUAV[" +
+                         std::to_wstring(output_index) + L"]").c_str());
+
+        d.uav_slot = ctx.allocate_bindless_slot();
+        D3D12_UNORDERED_ACCESS_VIEW_DESC d_uav_desc{};
+        d_uav_desc.Format        = DXGI_FORMAT_R32_FLOAT;
+        d_uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        D3D12_CPU_DESCRIPTOR_HANDLE d_cpu = ctx.bindless_heap()->GetCPUDescriptorHandleForHeapStart();
+        d_cpu.ptr += static_cast<SIZE_T>(d.uav_slot) * ctx.bindless_descriptor_size();
+        device->CreateUnorderedAccessView(d.resource, nullptr, &d_uav_desc, d_cpu);
+    }
+
+    // ---- Denoised output texture (RGBA16F) — separate from m_outputs -------
+    // DLSS-RR reads from m_outputs (noisy) and writes to m_denoised_outputs.
+    {
+        OutputTexture& dn = m_denoised_outputs[output_index];
+        if (dn.alloc) { dn.alloc->Release(); dn.alloc = nullptr; dn.resource = nullptr; }
+        dn.width  = new_width;
+        dn.height = new_height;
+
+        D3D12_RESOURCE_DESC dn_desc = tex_desc; // RGBA16F, UAV flag
+
+        // Create in COMMON state so Streamline can issue valid legacy ResourceBarrier
+        // transitions from COMMON on every frame. After each slEvaluateFeature call the
+        // renderer issues an Enhanced Barrier to bring the resource back from
+        // D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS to D3D12_BARRIER_LAYOUT_COMMON, which
+        // re-enables legacy barrier compatibility for the next frame.
+        throw_if_failed(
+            m_allocator->CreateResource(
+                &alloc_desc, &dn_desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                nullptr,
+                &dn.alloc,
+                IID_PPV_ARGS(&dn.resource)),
+            "PathTracer: create denoised output UAV texture failed");
+        dn.resource->SetName(
+            std::wstring(L"MARS::PathTracer::DenoisedOutputUAV[" +
+                         std::to_wstring(output_index) + L"]").c_str());
+
+        dn.uav_slot = ctx.allocate_bindless_slot();
+        D3D12_UNORDERED_ACCESS_VIEW_DESC dn_uav_desc{};
+        dn_uav_desc.Format        = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        dn_uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        D3D12_CPU_DESCRIPTOR_HANDLE dn_cpu = ctx.bindless_heap()->GetCPUDescriptorHandleForHeapStart();
+        dn_cpu.ptr += static_cast<SIZE_T>(dn.uav_slot) * ctx.bindless_descriptor_size();
+        device->CreateUnorderedAccessView(dn.resource, nullptr, &dn_uav_desc, dn_cpu);
+
+        // SRV so copy_to_back_buffer can read the denoised result
+        dn.srv_slot = ctx.allocate_bindless_slot();
+        D3D12_SHADER_RESOURCE_VIEW_DESC dn_srv_desc{};
+        dn_srv_desc.Format                        = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        dn_srv_desc.ViewDimension                 = D3D12_SRV_DIMENSION_TEXTURE2D;
+        dn_srv_desc.Shader4ComponentMapping       = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        dn_srv_desc.Texture2D.MipLevels           = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE dn_srv_handle = ctx.bindless_heap()->GetCPUDescriptorHandleForHeapStart();
+        dn_srv_handle.ptr += static_cast<SIZE_T>(dn.srv_slot) * ctx.bindless_descriptor_size();
+        device->CreateShaderResourceView(dn.resource, &dn_srv_desc, dn_srv_handle);
+    }
+
+    // ---- AOV textures for DLSS-RR tagging -----------------------------------
+    // Albedo, SpecularAlbedo, Normals, Roughness — all RGBA16F UAVs at render res,
+    // created in UAV state. Written black until M7/M8 G-buffer shaders are added.
+    // Renderer transitions these UAV → COMMON before tag_resources and back to UAV
+    // after slEvaluateFeature, mirroring the noisy_color / mvec / depth pattern.
+    struct AovEntry { std::vector<OutputTexture>& vec; const wchar_t* name; };
+    AovEntry aov_entries[] =
+    {
+        { m_albedo_outputs,           L"MARS::PathTracer::AlbedoAOV["          },
+        { m_specular_albedo_outputs,  L"MARS::PathTracer::SpecularAlbedoAOV["  },
+        { m_normals_aov_outputs,      L"MARS::PathTracer::NormalsAOV["         },
+        { m_roughness_aov_outputs,    L"MARS::PathTracer::RoughnessAOV["       },
+    };
+    for (auto& entry : aov_entries)
+    {
+        OutputTexture& aov = entry.vec[output_index];
+        if (aov.alloc) { aov.alloc->Release(); aov.alloc = nullptr; aov.resource = nullptr; }
+        aov.width  = new_width;
+        aov.height = new_height;
+
+        D3D12_RESOURCE_DESC aov_desc = tex_desc; // inherits RGBA16F and UAV flag
+        throw_if_failed(
+            m_allocator->CreateResource(
+                &alloc_desc, &aov_desc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                nullptr,
+                &aov.alloc,
+                IID_PPV_ARGS(&aov.resource)),
+            "PathTracer: create AOV UAV texture failed");
+        aov.resource->SetName(
+            std::wstring(entry.name + std::to_wstring(output_index) + L"]").c_str());
+
+        aov.uav_slot = ctx.allocate_bindless_slot();
+        D3D12_UNORDERED_ACCESS_VIEW_DESC aov_uav_desc{};
+        aov_uav_desc.Format        = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        aov_uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        D3D12_CPU_DESCRIPTOR_HANDLE aov_cpu = ctx.bindless_heap()->GetCPUDescriptorHandleForHeapStart();
+        aov_cpu.ptr += static_cast<SIZE_T>(aov.uav_slot) * ctx.bindless_descriptor_size();
+        device->CreateUnorderedAccessView(aov.resource, nullptr, &aov_uav_desc, aov_cpu);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1045,37 +1233,44 @@ void PathTracer::update_frame_constants(DeviceContext& ctx,
                                          const Mat4x4& proj_inv,
                                          const Vec3& sun_direction,
                                          const Vec3& sun_color,
-                                         float sun_intensity)
+                                         float sun_intensity,
+                                         const Mat4x4& prev_view_proj)
 {
     (void)ctx;
     uint32_t slot_idx = output_index * k_frame_count + (frame_index % k_frame_count);
     FrameCBSlot& slot = m_frame_cbs[slot_idx];
 
-    const OutputTexture& out = m_outputs[output_index];
+    const OutputTexture& out    = m_outputs[output_index];
+    const OutputTexture& mv_out = m_mv_outputs[output_index];
+    const OutputTexture& d_out  = m_depth_outputs[output_index];
 
     FrameConstants fc{};
-    fc.view_inv              = view_inv;
-    fc.proj_inv              = proj_inv;
-    fc.camera_pos            = camera_pos;
-    fc.frame_index           = frame_index;
-    fc.output_width          = out.width;
-    fc.output_height         = out.height;
-    fc.tlas_slot             = m_tlas_srv_slot;
-    fc.material_buffer_slot  = m_material_data_srv_slot;
-    fc.instance_buffer_slot  = m_instance_data_srv_slot;
-    fc.output_uav_slot       = out.uav_slot;
-    fc.sun_direction         = sun_direction;
-    fc.sun_intensity         = sun_intensity;
-    fc.sun_color             = sun_color;
+    fc.view_inv                 = view_inv;
+    fc.proj_inv                 = proj_inv;
+    fc.camera_pos               = camera_pos;
+    fc.frame_index              = frame_index;
+    fc.output_width             = out.width;
+    fc.output_height            = out.height;
+    fc.tlas_slot                = m_tlas_srv_slot;
+    fc.material_buffer_slot     = m_material_data_srv_slot;
+    fc.instance_buffer_slot     = m_instance_data_srv_slot;
+    fc.output_uav_slot          = out.uav_slot;
+    fc.motion_vector_uav_slot   = mv_out.uav_slot;
+    fc.depth_uav_slot           = d_out.uav_slot;
+    fc.sun_direction            = sun_direction;
+    fc.sun_intensity            = sun_intensity;
+    fc.sun_color                = sun_color;
+    fc.prev_view_proj           = prev_view_proj;
 
     memcpy(slot.mapped_ptr, &fc, sizeof(FrameConstants));
+}
 
-    }
-
-    // ---------------------------------------------------------------------------
-    // trace
 // ---------------------------------------------------------------------------
-void PathTracer::trace(ID3D12GraphicsCommandList6* cmd_list, uint32_t output_index, uint32_t frame_index)
+// trace
+// ---------------------------------------------------------------------------
+void PathTracer::trace(ID3D12GraphicsCommandList6* cmd_list,
+                       uint32_t output_index,
+                       uint32_t frame_index)
 {
     if (!m_initialised || m_tlas_srv_slot == UINT32_MAX)
     {
@@ -1155,20 +1350,36 @@ void PathTracer::copy_to_back_buffer(ID3D12GraphicsCommandList6* cmd_list,
                                       ID3D12Resource* back_buffer,
                                       D3D12_CPU_DESCRIPTOR_HANDLE rtv,
                                       uint32_t hdr_mode,
-                                      DXGI_FORMAT back_buffer_format)
+                                      DXGI_FORMAT back_buffer_format,
+                                      bool use_denoised)
 {
-    OutputTexture& out = m_outputs[output_index];
-    if (!out.resource) return;
+    // When the denoiser has run, blit from the denoised output; otherwise from
+    // the raw path-tracer UAV (no denoiser or denoiser not initialised).
+    OutputTexture& raw_out = m_outputs[output_index];
+    OutputTexture& dn_out  = m_denoised_outputs[output_index];
+    OutputTexture& src_out = (use_denoised && dn_out.resource) ? dn_out : raw_out;
+
+    if (!src_out.resource) return;
 
     (void)back_buffer; // resource identity unused; caller already transitioned it via RTV
+
+    // Streamline (DLSS-RR) transitions the denoised output via the Enhanced Barrier
+    // API internally. Issuing a legacy ResourceBarrier transition on a resource that
+    // was last touched by an Enhanced Barrier causes RESOURCE_BARRIER_INVALID_COMBINATION
+    // (#526) and crashes ExecuteCommandLists. Skip the legacy barriers when blitting
+    // from the Streamline-owned denoised output; the resource is already in a readable
+    // state after slEvaluateFeature returns.
     D3D12_RESOURCE_BARRIER to_srv{};
-    to_srv.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    to_srv.Transition.pResource   = out.resource;
-    to_srv.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    to_srv.Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
-                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    to_srv.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    cmd_list->ResourceBarrier(1, &to_srv);
+    if (!use_denoised)
+    {
+        to_srv.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        to_srv.Transition.pResource   = src_out.resource;
+        to_srv.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        to_srv.Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        to_srv.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmd_list->ResourceBarrier(1, &to_srv);
+    }
 
     // Select PSO for the swap-chain format.
     ID3D12PipelineState* pso = nullptr;
@@ -1183,7 +1394,7 @@ void PathTracer::copy_to_back_buffer(ID3D12GraphicsCommandList6* cmd_list,
     cmd_list->SetGraphicsRootSignature(m_blit_root_sig.Get());
 
     // Root param 0: two 32-bit constants (src_texture_slot, hdr_mode).
-    uint32_t root_consts[2] = { out.srv_slot, hdr_mode };
+    uint32_t root_consts[2] = { src_out.srv_slot, hdr_mode };
     cmd_list->SetGraphicsRoot32BitConstants(0, 2, root_consts, 0);
 
     // Root param 1: bindless SRV heap — point at slot 0 (the table covers all slots).
@@ -1194,19 +1405,81 @@ void PathTracer::copy_to_back_buffer(ID3D12GraphicsCommandList6* cmd_list,
     cmd_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
 
     D3D12_VIEWPORT vp{ 0.f, 0.f,
-        static_cast<float>(out.width), static_cast<float>(out.height),
+        static_cast<float>(src_out.width), static_cast<float>(src_out.height),
         0.f, 1.f };
     D3D12_RECT scissor{ 0, 0,
-        static_cast<LONG>(out.width), static_cast<LONG>(out.height) };
+        static_cast<LONG>(src_out.width), static_cast<LONG>(src_out.height) };
     cmd_list->RSSetViewports(1, &vp);
     cmd_list->RSSetScissorRects(1, &scissor);
 
     cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     cmd_list->DrawInstanced(3, 1, 0, 0);  // full-screen triangle; no vertex buffer
 
-    // Transition PIXEL_SHADER_RESOURCE → UAV (back to default state for next frame).
-    std::swap(to_srv.Transition.StateBefore, to_srv.Transition.StateAfter);
-    cmd_list->ResourceBarrier(1, &to_srv);
+    // Restore UAV state for the next frame — only for resources not managed by Streamline.
+    if (!use_denoised)
+    {
+        std::swap(to_srv.Transition.StateBefore, to_srv.Transition.StateAfter);
+        cmd_list->ResourceBarrier(1, &to_srv);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Accessors
+// ---------------------------------------------------------------------------
+ID3D12Resource* PathTracer::output_resource(uint32_t output_index) const
+{
+    if (output_index < m_outputs.size())
+        return m_outputs[output_index].resource;
+    return nullptr;
+}
+
+ID3D12Resource* PathTracer::motion_vector_resource(uint32_t output_index) const
+{
+    if (output_index < m_mv_outputs.size())
+        return m_mv_outputs[output_index].resource;
+    return nullptr;
+}
+
+ID3D12Resource* PathTracer::depth_resource(uint32_t output_index) const
+{
+    if (output_index < m_depth_outputs.size())
+        return m_depth_outputs[output_index].resource;
+    return nullptr;
+}
+
+ID3D12Resource* PathTracer::denoised_output_resource(uint32_t output_index) const
+{
+    if (output_index < m_denoised_outputs.size())
+        return m_denoised_outputs[output_index].resource;
+    return nullptr;
+}
+
+ID3D12Resource* PathTracer::albedo_resource(uint32_t output_index) const
+{
+    if (output_index < m_albedo_outputs.size())
+        return m_albedo_outputs[output_index].resource;
+    return nullptr;
+}
+
+ID3D12Resource* PathTracer::specular_albedo_resource(uint32_t output_index) const
+{
+    if (output_index < m_specular_albedo_outputs.size())
+        return m_specular_albedo_outputs[output_index].resource;
+    return nullptr;
+}
+
+ID3D12Resource* PathTracer::normals_aov_resource(uint32_t output_index) const
+{
+    if (output_index < m_normals_aov_outputs.size())
+        return m_normals_aov_outputs[output_index].resource;
+    return nullptr;
+}
+
+ID3D12Resource* PathTracer::roughness_aov_resource(uint32_t output_index) const
+{
+    if (output_index < m_roughness_aov_outputs.size())
+        return m_roughness_aov_outputs[output_index].resource;
+    return nullptr;
 }
 
 } // namespace mars

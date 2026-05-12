@@ -15,6 +15,7 @@
 #include "device_context.h"
 #include "display_manager.h"
 #include "path_tracer.h"
+#include "denoiser.h"
 #include "../asset/resource_manager.h"
 #include "../scene/scene.h"
 
@@ -84,6 +85,11 @@ public:
     PathTracer&       path_tracer()       { return m_path_tracer; }
     const PathTracer& path_tracer() const { return m_path_tracer; }
 
+    // ---- Denoiser (DLSS 4) access ----------------------------------------
+
+    Denoiser&         denoiser()          { return m_denoiser; }
+    const Denoiser&   denoiser()    const { return m_denoiser; }
+
     // ---- Scene / resource access -----------------------------------------
     Scene&            scene()             { return m_scene; }
     const Scene&      scene()       const { return m_scene; }
@@ -111,6 +117,7 @@ private:
     DeviceContext   m_device_ctx;
     DisplayManager  m_display_manager;
     PathTracer      m_path_tracer;
+    Denoiser        m_denoiser;
     ResourceManager m_resource_mgr;
     Scene           m_scene;
 
@@ -127,14 +134,23 @@ private:
     // Per-output camera state (updated via set_camera()).
     struct CameraState
     {
-        Vec3    position  = {};
-        Mat4x4  view_inv  = Mat4x4::identity();
-        Mat4x4  proj_inv  = Mat4x4::identity();
+        Vec3    position     = {};
+        Mat4x4  view_inv     = Mat4x4::identity();
+        Mat4x4  proj_inv     = Mat4x4::identity();
+        // Previous-frame view * proj (for motion vector / DLSS reprojection).
+        Mat4x4  prev_view_proj = Mat4x4::identity();
     };
     std::vector<CameraState> m_cameras;
 
     uint32_t m_frame_index = 0;  // monotonically increasing (for temporal jitter)
     bool     m_initialised = false;
+
+    // Per-output flag: true when slEvaluateFeature (DLSS-RR) left DenoisedOutputUAV
+    // in legacy D3D12_RESOURCE_STATE_UNORDERED_ACCESS (Streamline always issues a
+    // COMMON→UAV barrier before writing, regardless of whether slEvaluateFeature
+    // ultimately succeeds). Must be cleaned up with a UAV→COMMON barrier on the
+    // following frame if slEvaluateFeature failed (rr_evaluated==false).
+    std::vector<bool> m_denoised_in_uav_state;
 };
 
 } // namespace mars

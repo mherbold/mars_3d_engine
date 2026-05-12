@@ -143,7 +143,8 @@ public:
                                 const Mat4x4& proj_inv,
                                 const Vec3& sun_direction,
                                 const Vec3& sun_color,
-                                float sun_intensity);
+                                float sun_intensity,
+                                const Mat4x4& prev_view_proj = Mat4x4::identity());
 
     // Record DispatchRays into `cmd_list` for the given output.
     void trace(ID3D12GraphicsCommandList6* cmd_list,
@@ -160,7 +161,8 @@ public:
                              ID3D12Resource* back_buffer,
                              D3D12_CPU_DESCRIPTOR_HANDLE rtv,
                              uint32_t hdr_mode,
-                             DXGI_FORMAT back_buffer_format);
+                             DXGI_FORMAT back_buffer_format,
+                             bool use_denoised = false);
 
     // Resize the UAV texture for a given output (e.g. on WM_SIZE).
     void resize_output(DeviceContext& ctx,
@@ -170,6 +172,32 @@ public:
     // ---- Accessors ----------------------------------------------------------
     bool     is_initialised() const { return m_initialised; }
     uint32_t tlas_srv_slot()  const { return m_tlas_srv_slot; }
+
+    // Returns the underlying D3D12 resource for the RGBA16F path-tracer UAV
+    // for a given output (used by Denoiser for resource tagging).
+    ID3D12Resource* output_resource(uint32_t output_index) const;
+
+    // Returns the R16G16B16A16_FLOAT motion vector UAV resource for a given
+    // output (used by Denoiser for resource tagging).
+    ID3D12Resource* motion_vector_resource(uint32_t output_index) const;
+
+    // Returns the R32F linear depth UAV resource for a given output.
+    ID3D12Resource* depth_resource(uint32_t output_index) const;
+
+    // Returns the RGBA16F denoised-output UAV resource for a given output.
+    // This is a separate texture from output_resource(); it is used as the
+    // write-back destination for DLSS-RR so that the noisy path-tracer UAV
+    // and the denoised result never alias the same resource.
+    ID3D12Resource* denoised_output_resource(uint32_t output_index) const;
+
+    // Returns dedicated AOV UAV resources for DLSS-RR tagging.
+    // These are separate textures; they start as black and will be written
+    // by G-buffer shaders in M7/M8. DLSS-RR accepts the tags immediately,
+    // which eliminates the kBufferTypeAlbedo missing-tag errors.
+    ID3D12Resource* albedo_resource(uint32_t output_index)          const;
+    ID3D12Resource* specular_albedo_resource(uint32_t output_index) const;
+    ID3D12Resource* normals_aov_resource(uint32_t output_index)     const;
+    ID3D12Resource* roughness_aov_resource(uint32_t output_index)   const;
 
 private:
     // --- Helpers -------------------------------------------------------------
@@ -247,6 +275,26 @@ private:
         uint32_t             height   = 0;
     };
     std::vector<OutputTexture> m_outputs;
+
+    // --- Per-output motion vector textures (R16G16B16A16_FLOAT) -------------
+    std::vector<OutputTexture> m_mv_outputs;
+
+    // --- Per-output linear depth textures (R32_FLOAT) -----------------------
+    std::vector<OutputTexture> m_depth_outputs;
+
+    // --- Per-output denoised output textures (RGBA16F) ----------------------
+    // Separate from m_outputs so that DLSS-RR can read from m_outputs (noisy)
+    // and write to m_denoised_outputs without aliasing.
+    std::vector<OutputTexture> m_denoised_outputs;
+
+    // --- Per-output AOV textures for DLSS-RR tagging ----------------------
+    // Allocated at render resolution in UAV state. Black until M7/M8 G-buffer
+    // shaders write to them. Satisfy kBufferTypeAlbedo / kBufferTypeSpecularAlbedo
+    // / kBufferTypeNormals / kBufferTypeRoughness tags required by DLSS-RR.
+    std::vector<OutputTexture> m_albedo_outputs;
+    std::vector<OutputTexture> m_specular_albedo_outputs;
+    std::vector<OutputTexture> m_normals_aov_outputs;
+    std::vector<OutputTexture> m_roughness_aov_outputs;
 
     // --- Per-frame constant buffer ring --------------------------------------
     // One upload buffer per output × k_frame_count slots.

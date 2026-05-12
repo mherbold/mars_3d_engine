@@ -73,6 +73,14 @@ public:
     IDXGIFactory6*       dxgi_factory()   const { return m_dxgi_factory.Get(); }
     IDXGIAdapter1*       adapter()        const { return m_adapter.Get(); }
 
+    // Returns the LUID of the selected adapter (used by Streamline feature checks).
+    LUID adapter_luid() const
+    {
+        DXGI_ADAPTER_DESC1 desc{};
+        if (m_adapter) m_adapter->GetDesc1(&desc);
+        return desc.AdapterLuid;
+    }
+
     ID3D12CommandQueue*  direct_queue()   const { return m_direct_queue.Get(); }
     ID3D12CommandQueue*  compute_queue()  const { return m_compute_queue.Get(); }
     ID3D12CommandQueue*  copy_queue()     const { return m_copy_queue.Get(); }

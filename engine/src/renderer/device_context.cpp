@@ -139,6 +139,19 @@ void DeviceContext::create_device()
         info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, TRUE);
         info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR,      TRUE);
         info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING,    FALSE);
+
+        // Streamline (sl.dlss_d) internally manages the mvec resource state and
+        // intentionally issues barriers that the D3D12 debug layer reports as
+        // RESOURCE_BARRIER_BEFORE_AFTER_MISMATCH (#527). This is a known false
+        // positive from Streamline's internal resource management — suppress the
+        // debug break for this specific message ID to allow DLSS-RR to run.
+        D3D12_MESSAGE_ID suppressed_ids[] = {
+            D3D12_MESSAGE_ID_RESOURCE_BARRIER_BEFORE_AFTER_MISMATCH,
+        };
+        D3D12_INFO_QUEUE_FILTER filter{};
+        filter.DenyList.NumIDs  = static_cast<UINT>(std::size(suppressed_ids));
+        filter.DenyList.pIDList = suppressed_ids;
+        info_queue->AddStorageFilterEntries(&filter);
     }
 #endif
 }

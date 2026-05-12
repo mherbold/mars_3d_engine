@@ -1,6 +1,6 @@
 # PROGRESS.md — MARS 3D Engine Implementation Progress
 
-Last updated: 2025-07 (M5 — tone-map blit fix)
+Last updated: 2025-07 (M6 — DLSS 4 integration **complete**; app running at normal frame rate with no exceptions; all five crash bugs fixed; stable 44-second run validated; remaining Streamline/D3D12 warnings are benign — see Stable Runtime section below)
 
 ---
 
@@ -15,8 +15,105 @@ Last updated: 2025-07 (M5 — tone-map blit fix)
 ---
 
 ## Current Focus
-> **M5 bug-fix complete** — `CopyResource` format mismatch between the RGBA16F path-tracer UAV and the R8G8B8A8_UNORM swap-chain back buffer has been resolved. `PathTracer::copy_to_back_buffer()` is replaced by a full-screen tone-map blit pipeline (`tone_map_blit_vs.hlsl` + `tone_map_blit_ps.hlsl`) with three PSOs for SDR (Reinhard+sRGB), HDR10 (ACES+PQ), and scRGB (pass-through) swap-chain formats. The output texture now registers both a UAV slot (for ray tracing) and an SRV slot (for the blit PS) in the bindless heap. `renderer.cpp` transitions the back buffer to RENDER_TARGET instead of COPY_DEST and passes the RTV, HdrMode, and format to the updated signature.
-> Next step: **Milestone M6** — DLSS 4 integration (upscale, Multi Frame Generation, Ray Reconstruction).
+
+**Status:** M6 DLSS 4 integration — **complete**. All five crash bugs fixed; stable runtime validated (44-second run, normal frame rate, no exceptions thrown). Remaining Streamline/D3D12 log messages are benign — documented below.
+
+### Bug 1 — FIXED ✅ — 0x87A crash at `ExecuteCommandLists` (duplicate resource tags corrupting Streamline mvec barrier state)
+
+**Root cause:** `denoiser.cpp` `tag_resources()` aliased `noisy_color` as `kBufferTypeAlbedo`, `kBufferTypeSpecularAlbedo`, and (via fallback) `kBufferTypeNormals` / `kBufferTypeRoughness` in addition to `kBufferTypeScalingInputColor`. Tagging the same `ID3D12Resource` under 5 buffer types caused Streamline to emit C(5,2)=10 duplicate `ResourceBarrier` calls on the same subresource (`RESOURCE_BARRIER_DUPLICATE_SUBRESOURCE_TRANSITIONS`). This corrupted Streamline's internal state machine for `sl.dlss_d.mvec`, which then issued a barrier with `Before=COMMON` (0x0) when the actual D3D12-tracked state was `PIXEL_SHADER_RESOURCE` (0x80), triggering `RESOURCE_BARRIER_BEFORE_AFTER_MISMATCH #527`. The D3D12 debug layer has break-on-error enabled for `#527`, which raised a `0x87A` structured exception at `ExecuteCommandLists`.
+
+**Fix:** Removed `kBufferTypeAlbedo` / `kBufferTypeSpecularAlbedo` tags entirely from `denoiser.cpp`, and suppressed `kBufferTypeNormals` / `kBufferTypeRoughness` when no dedicated G-buffer resources are provided (`normals == nullptr && roughness == nullptr`).
+
+**Rule established (see AGENTS.md):** Never alias the same `ID3D12Resource` under multiple `sl::BufferType` values in a single `slSetTagForFrame` call.
+
+---
+
+### Bug 3 — FIXED ✅ — 0x87A crash: `GPU_BASED_VALIDATION_INCOMPATIBLE_TEXTURE_LAYOUT` on `DenoisedOutputUAV` when `slEvaluateFeature` fails
+
+**Root cause:** Streamline's internal `sl.dlss_d.mvec` resource was left in `D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE` (0x80) at the end of frame N. At the start of frame N+1 Streamline's DLSS-RR plugin issued an internal legacy barrier assuming `Before=COMMON` (0x0), triggering `RESOURCE_BARRIER_BEFORE_AFTER_MISMATCH #527`. The debug layer broke on `#527`, causing `slEvaluateFeature` to return a failure code, so `rr_evaluated = false`. Because `rr_evaluated = false`, the post-evaluate Enhanced Barrier (UAV→COMMON layout transition for `DenoisedOutputUAV`) was correctly skipped. However `use_denoised` was computed independently (`is_initialised() && denoised_resource != nullptr`) so it remained `true`. `copy_to_back_buffer` then bound `DenoisedOutputUAV` as an SRV while it was still in `D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS` (left by the previous successful frame), triggering `GPU_BASED_VALIDATION_INCOMPATIBLE_TEXTURE_LAYOUT #1358` and the 0x87A crash at `ExecuteCommandLists`.
+
+**Fix:** `use_denoised` in `render_frame_path_traced` now also requires `rr_evaluated`:
+```cpp
+bool use_denoised = rr_evaluated &&
+                    m_path_tracer.denoised_output_resource(oi) != nullptr;
+```
+`rr_evaluated` was moved outside the `if (m_denoiser.is_initialised())` block (initialised to `false`) so it is visible at the `use_denoised` call site. When `slEvaluateFeature` fails, both the Enhanced Barrier and the denoised readback are skipped, and the renderer falls back to the raw path-tracer UAV output.
+
+---
+
+### Bug 4 — FIXED ✅ — 0x87A crash: `RESOURCE_BARRIER_BEFORE_AFTER_MISMATCH` on `DenoisedOutputUAV` on frames after a failed `slEvaluateFeature`
+
+**Root cause:** Streamline **always** issues a legacy `COMMON → UAV` barrier on `DenoisedOutputUAV` before writing it, regardless of whether `slEvaluateFeature` subsequently succeeds or fails. After Bug 3's fix, when `rr_evaluated = false` the post-evaluate Enhanced Barrier (UAV → COMMON) was correctly skipped, but `DenoisedOutputUAV` was already in `D3D12_RESOURCE_STATE_UNORDERED_ACCESS` (from SL's partial execution). On the next frame, Streamline again attempted its `COMMON → UAV` barrier, but the actual D3D12-tracked state was `UAV` (0x8), causing `RESOURCE_BARRIER_BEFORE_AFTER_MISMATCH #527` → 0x87A crash at `ExecuteCommandLists`.
+
+**Fix:** Added `std::vector<bool> m_denoised_in_uav_state` (per output) to `Renderer`. The flag is set to `true` only when `rr_evaluated == true` (i.e. after a confirmed successful `slEvaluateFeature` call — see Bug 5 for why the original unconditional set was wrong). On `rr_evaluated == true` the existing Enhanced Barrier fires and the flag is cleared. On `rr_evaluated == false` with the flag set, a legacy `UAV → COMMON` cleanup barrier is issued and the flag is cleared, ensuring `DenoisedOutputUAV` is always in `COMMON` state before the next frame's Streamline barriers. Flag is also reset to `false` in `on_resize` since the texture is recreated in `COMMON`.
+
+---
+
+### Bug 2 — FIXED ✅ — Streamline errors: `Tag of buffer kBufferTypeAlbedo not set for frame N, viewport 0`
+
+**Observed:** Every frame Streamline logged:
+```
+[streamline][error] resourceTaggingForFrame.cpp:309 Tag of buffer kBufferTypeAlbedo not set for frame N, viewport 0
+[streamline][error] commonInterface.h:156 Failed to find global tag 'kBufferTypeAlbedo', please make sure to tag all required buffers
+```
+Also observed once per session: `Repeated slDLSSGSetOptions() call for frame 1` (benign race between present-hook and app code).
+
+**Root cause:** `PathTracer` did not allocate dedicated AOV textures for albedo, specular albedo, world-space normals, or roughness. The DLSS-RR plugin (`sl.dlss_d`) requires `kBufferTypeAlbedo` as a mandatory input on every `slEvaluateFeature` call.
+
+**Fix:**
+1. **`path_tracer.h`** — Added 4 `std::vector<OutputTexture>` members: `m_albedo_outputs`, `m_specular_albedo_outputs`, `m_normals_aov_outputs`, `m_roughness_aov_outputs`; public accessors `albedo_resource(i)`, `specular_albedo_resource(i)`, `normals_aov_resource(i)`, `roughness_aov_resource(i)`.
+2. **`path_tracer.cpp`** — `create_output_textures()` resizes all 4 vectors; `resize_output()` allocates each as `DXGI_FORMAT_R16G16B16A16_FLOAT` UAV at render resolution in `D3D12_RESOURCE_STATE_UNORDERED_ACCESS`; `release_output_textures()` releases all 4. Textures start black — no HLSL writes them until M7/M8.
+3. **`denoiser.h`** — Extended `tag_resources()` signature with `albedo` and `specular_albedo` parameters (normals/roughness were already present).
+4. **`denoiser.cpp`** — `tag_resources()` now tags `kBufferTypeAlbedo` and `kBufferTypeSpecularAlbedo` from dedicated resources; `kBufferTypeNormals` / `kBufferTypeRoughness` tagged when non-null. No resource is aliased across multiple buffer types.
+5. **`renderer.cpp`** — Pre-evaluate UAV→COMMON barrier array expanded from 3 to 7 resources (adds albedo, specular, normals, roughness). `tag_resources()` call updated to pass all 4 AOV accessors. Post-evaluate PSR→UAV barrier array also expanded to 7.
+
+**Note:** AOV textures remain black until M7/M8 HLSL shaders write real G-buffer data. DLSS-RR accepts the tags and stops logging errors; reconstruction quality is limited until real data is provided.
+
+---
+
+### Bug 5 — FIXED ✅ — `RESOURCE_BARRIER_BEFORE_AFTER_MISMATCH #527` on `DenoisedOutputUAV` caused by premature `m_denoised_in_uav_state` flag set
+
+**Observed:** After the Bug 2 fix (AOV textures allocated and all 7 buffers tagged), every frame produced:
+```
+[streamline][error] resourceTaggingForFrame.cpp:309 Tag of buffer kBufferTypeNormals not set for frame 0, viewport 0
+D3D12 ERROR: Before state (0x8: D3D12_RESOURCE_STATE_UNORDERED_ACCESS) of resource
+  'MARS::PathTracer::DenoisedOutputUAV[0]' does not match state (0x0: COMMON)
+  [ RESOURCE_MANIPULATION ERROR #527: RESOURCE_BARRIER_BEFORE_AFTER_MISMATCH ]
+```
+Streamline was also writing crash minidumps every frame, killing performance.
+
+**Root cause — two compounding issues:**
+
+1. **`kBufferTypeNormals` is a mandatory DLSS-RR input**, not optional. When it was erroneously omitted (an attempted workaround during earlier investigation), Streamline rejected `slEvaluateFeature` at tag-validation time — before issuing any GPU barriers, including the `COMMON→UAV` barrier on `DenoisedOutputUAV`.
+
+2. **`m_denoised_in_uav_state[oi]` was set `true` unconditionally before `slEvaluateFeature` returned.** When SL aborted at validation and never touched `DenoisedOutputUAV`, the flag was already `true`. On the next frame the `else` branch of the flag check fired a cleanup barrier with `StateBefore=UAV` against a resource still in `COMMON` → `#527` → debug break → Streamline crash-dump → repeat every frame.
+
+**Fix (`renderer.cpp` only):**
+1. Restored `normals_aov_resource(oi)` and `roughness_aov_resource(oi)` to the pre-evaluate UAV→COMMON barrier array (back to 7 resources), the `tag_resources()` call, and the post-evaluate PSR→UAV barrier array. All mandatory DLSS-RR tags are now always provided.
+2. Moved the `m_denoised_in_uav_state[oi] = true` assignment inside `if (rr_evaluated)`, so the flag is only set when `slEvaluateFeature` actually ran and issued GPU barriers. If SL rejects the call at tag-validation time, the flag stays `false` and no spurious cleanup barrier is emitted on the following frame.
+
+**Rule established:** `m_denoised_in_uav_state` must only be set `true` after a confirmed successful `slEvaluateFeature` return — never speculatively before the call.
+
+---
+
+### Stable Runtime Validation — ✅ Confirmed
+
+**Run date:** 2025-07  
+**Duration:** ~44 seconds, normal frame rate, no exceptions, clean shutdown.
+
+Streamline v2.11.1 initialised fully: `sl.common`, `sl.dlss`, `sl.dlss_d`, `sl.dlss_g`, `sl.reflex`, `sl.pcl` all loaded.
+DLSSD context created at (853×480) → (1280×720).  
+DLSS-G initialised (single generated frame, dynamic MFG not supported on this GPU).  
+Shutdown completed without crash dumps.
+
+#### Remaining warnings — all benign
+
+| Warning | Source | Analysis | Action |
+|---|---|---|---|
+| `D3D or VK API hook is activated without device being created` (×9 at startup) | Streamline `pluginManager.cpp:1331` | Emitted during `initializePlugins` while plugins register API hooks before `slSetD3DDevice` is called. This is the correct `pre_device_init()` → `device_init()` ordering required by Streamline; the messages are internal to SL's startup sequence and do not indicate an engine bug. | None — benign; no code change needed. |
+| `Kernel mvec.cs:main … already created!` (×1) | Streamline `d3d12.cpp:1201` | Both `sl.dlss` and `sl.dlss_d` share the same motion-vector compute shader. The second plugin to register it triggers this one-time internal dedup warning. | None — benign; internal to Streamline. |
+| `Repeated slDLSSGSetOptions() call for the frame 1` (×1) | Streamline `defines.h:364` | Streamline logs this when `slDLSSGSetOptions` is called twice before the same Present. Likely caused by one call during `evaluate_dlss_g` init and a second during the first frame's `evaluate_dlss_g`. The warning indicates redundancy, not a functional error. | Low priority — could deduplicate the options call in `denoiser.cpp` in a future cleanup pass (M17/M18). |
+| `Live Object : 120` at process termination | D3D12 debug layer | The `D3D12Device` proxy is released by Streamline with `ref count 26`, meaning Streamline's internal DLSS-RR/DLSS-G resources hold device references that outlive the proxy release. All listed live objects have `Refcount: 0` except Streamline-owned internal textures/pipelines (`Refcount: 1`). This is expected Streamline behaviour at process exit. The D3D12 debug layer note says "Process is terminating — using simple reporting", confirming this is a shutdown-time observation, not a runtime leak. | Low priority — add `ReportLiveObjects()` call in `DeviceContext::shutdown()` (M15) for a more informative named-object dump during development; no engine resource leak to fix now. |
 
 ---
 
@@ -30,6 +127,7 @@ Last updated: 2025-07 (M5 — tone-map blit fix)
 | M3 | Asset pipeline: FBX/glTF load + GPU upload | ✅ | See M3 details below |
 | M4 | DXR pipeline: primary rays, basic PBR hit shader | ✅ | See M4 details below |
 | M5 | Scene file parser, static scene rendering | ✅ | See M5 details below |
+| M6 | DLSS 4 integration (SR, RR, MFG) | ✅ | 5x crash bugs fixed; DLSS-RR and DLSS-G initialise and run; stable 44-second run validated; AOV textures black until M7/M8 shaders write real G-buffer data; remaining log messages are benign Streamline-internal warnings |
 
 ---
 

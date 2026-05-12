@@ -228,6 +228,13 @@ engine/shaders/
 | UI composite | **Game UI (`UIRenderer`)** composited over path-traced frame via rasterization (all builds); **ImGui** additionally composited in dev/debug builds only |
 | Frame generation | DLSS 4 Multi Frame Generation — operates on the fully composited output image; up to 3 additional generated frames (4× total, RTX 50 series); 1 additional frame (2× total, RTX 40 series); runs immediately before Present |
 
+### Albedo AOV / Normals AOV / Roughness AOV (TODO)
+Streamline / DLSS Ray Reconstruction requires dedicated AOV buffers tagged each frame: `kBufferTypeAlbedo`, `kBufferTypeSpecularAlbedo`, `kBufferTypeNormals`, and `kBufferTypeRoughness`. Currently the noisy color buffer is reused as a placeholder for all of these to satisfy the Streamline tag requirement. Proper AOVs should be:
+1. Added as new per-output UAVs in `PathTracer` (alongside `m_outputs`, `m_mv_outputs`, `m_depth_outputs`).
+2. Written by the closest-hit shader at the primary hit: diffuse base color (no lighting) → albedo UAV; specular/metallic color → specular albedo UAV; world-space geometric normal → normals UAV; perceptual roughness → roughness UAV (R8_UNORM).
+3. Exposed via new accessors: `PathTracer::albedo_resource()`, `PathTracer::specular_albedo_resource()`, `PathTracer::normals_resource()`, `PathTracer::roughness_resource()`.
+4. Passed as dedicated parameters to `Denoiser::tag_resources` (the `normals` and `roughness` parameters already exist but are currently `nullptr`) and tagged with their correct `sl::BufferType` values instead of aliasing the noisy color buffer.
+
 ---
 
 ## 7. Scene Management & File Format

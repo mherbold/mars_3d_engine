@@ -65,6 +65,9 @@ void Renderer::init_internal(const std::vector<DisplayConfig>& configs,
 {
     if (m_initialised) return;
 
+    // Streamline must intercept DXGI/D3D12 creation — init before the device.
+    Denoiser::pre_device_init();
+
     m_device_ctx.init();
     m_display_manager.init(m_device_ctx, configs, hwnds);
     m_resource_mgr.init(m_device_ctx);
@@ -88,8 +91,17 @@ void Renderer::init_internal(const std::vector<DisplayConfig>& configs,
         }
     }
 
+    // Initialise Denoiser (DLSS 4) — after path tracer so resources are known.
+    m_denoiser.init(m_device_ctx, output_count);
+    for (uint32_t i = 0; i < output_count; ++i)
+    {
+        DisplayOutput& disp = m_display_manager.output(i);
+        m_denoiser.resize_output(i, disp.width(), disp.height());
+    }
+
     // Initialise per-output camera state list
     m_cameras.resize(output_count);
+    m_denoised_in_uav_state.assign(output_count, false);
 
     m_initialised = true;
 }
@@ -106,6 +118,7 @@ void Renderer::shutdown()
         wait_for_frame(i);
 
     m_path_tracer.shutdown();
+    m_denoiser.shutdown();
     m_scene.unload();
     m_resource_mgr.shutdown();
     release_frame_resources();
@@ -186,6 +199,11 @@ void Renderer::on_resize(uint32_t output_index, uint32_t width, uint32_t height)
     m_display_manager.resize(output_index, width, height);
     if (m_path_tracer.is_initialised())
         m_path_tracer.resize_output(m_device_ctx, output_index, width, height);
+    if (m_denoiser.is_initialised())
+        m_denoiser.resize_output(output_index, width, height);
+    // DenoisedOutputUAV is recreated in COMMON state on resize.
+    if (output_index < m_denoised_in_uav_state.size())
+        m_denoised_in_uav_state[output_index] = false;
 }
 
 void Renderer::on_resize(uint32_t width, uint32_t height)
@@ -204,7 +222,20 @@ void Renderer::set_camera(uint32_t output_index,
     if (output_index >= m_cameras.size())
         m_cameras.resize(output_index + 1);
 
-    m_cameras[output_index] = { position, view_inv, proj_inv };
+    CameraState& cam = m_cameras[output_index];
+
+    // Compute current-frame view-projection from the previous frame's stored inverses
+    // (which are still the last committed values) so prev_view_proj stays one frame behind.
+    if (cam.view_inv.m[0][0] != 0.0f || cam.view_inv.m[1][1] != 0.0f) // not fresh default
+    {
+        Mat4x4 prev_view = cam.view_inv.inverse();
+        Mat4x4 prev_proj = cam.proj_inv.inverse();
+        cam.prev_view_proj = prev_view * prev_proj;
+    }
+
+    cam.position = position;
+    cam.view_inv = view_inv;
+    cam.proj_inv = proj_inv;
 }
 
 // ---------------------------------------------------------------------------
@@ -420,16 +451,211 @@ void Renderer::render_frame_path_traced()
 
         m_path_tracer.update_frame_constants(m_device_ctx, oi, m_frame_index,
                                              cam.position, cam.view_inv, cam.proj_inv,
-                                             sun_dir, sun_color, sun_intensity);
+                                             sun_dir, sun_color, sun_intensity,
+                                             cam.prev_view_proj);
 
         // Trace rays → UAV
         m_path_tracer.trace(m_cmd_list.Get(), oi, m_frame_index);
 
-        // UAV barrier between trace and copy
+        // UAV barrier between trace and DLSS / copy
         D3D12_RESOURCE_BARRIER uav{};
         uav.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         uav.UAV.pResource = nullptr; // all UAVs
         m_cmd_list->ResourceBarrier(1, &uav);
+
+        // DLSS resource tagging + evaluation (no-op if DLSS is not supported/init'd).
+        bool rr_evaluated = false;
+        if (m_denoiser.is_initialised())
+        {
+            DisplayOutput& disp = m_display_manager.output(oi);
+            uint32_t rw = disp.width(), rh = disp.height();
+            uint32_t dw = disp.width(), dh = disp.height();
+            m_denoiser.get_render_resolution(oi, rw, rh);
+
+            // Streamline's DLSS-D internally issues legacy ResourceBarriers on the
+            // noisy color, motion vector, and depth resources, assuming they are in
+            // D3D12_RESOURCE_STATE_COMMON. The path tracer writes them as UAVs via
+            // DispatchRays, leaving them in D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+            // (legacy-tracked). Use a plain legacy transition barrier (UAV → COMMON)
+            // rather than an Enhanced Barrier: Enhanced Barriers are only valid on
+            // legacy-tracked resources when the layout is already COMMON, so issuing
+            // an Enhanced Barrier with LayoutBefore=UNORDERED_ACCESS on a resource
+            // that has never been touched by the Enhanced Barrier API causes
+            // BARRIER_INTEROP_INVALID_LAYOUT (#1350) at ExecuteCommandLists.
+            {
+                ID3D12Resource* pt_resources[] = {
+                    m_path_tracer.output_resource(oi),
+                    m_path_tracer.motion_vector_resource(oi),
+                    m_path_tracer.depth_resource(oi),
+                    m_path_tracer.albedo_resource(oi),
+                    m_path_tracer.specular_albedo_resource(oi),
+                    m_path_tracer.normals_aov_resource(oi),
+                    m_path_tracer.roughness_aov_resource(oi),
+                };
+
+                D3D12_RESOURCE_BARRIER to_common[7]{};
+                uint32_t barrier_count = 0;
+                for (ID3D12Resource* res : pt_resources)
+                {
+                    if (!res) continue;
+                    D3D12_RESOURCE_BARRIER& b    = to_common[barrier_count++];
+                    b.Type                       = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    b.Flags                      = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+                    b.Transition.pResource       = res;
+                    b.Transition.StateBefore     = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                    b.Transition.StateAfter      = D3D12_RESOURCE_STATE_COMMON;
+                    b.Transition.Subresource     = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                }
+                if (barrier_count > 0)
+                    m_cmd_list->ResourceBarrier(barrier_count, to_common);
+            }
+
+            m_denoiser.tag_resources(
+                m_cmd_list.Get(), oi, m_frame_index,
+                m_path_tracer.output_resource(oi),           // noisy color IN
+                m_path_tracer.motion_vector_resource(oi),
+                m_path_tracer.depth_resource(oi),
+                m_path_tracer.albedo_resource(oi),           // albedo AOV (dedicated, not aliased)
+                m_path_tracer.specular_albedo_resource(oi),  // specular albedo AOV
+                m_path_tracer.normals_aov_resource(oi),      // normals AOV (black placeholder until M7/M8)
+                m_path_tracer.roughness_aov_resource(oi),    // roughness AOV (black placeholder until M7/M8)
+                m_path_tracer.denoised_output_resource(oi),  // denoised color OUT
+                rw, rh, dw, dh);
+
+            // DLSS-RR denoises and upscales in a single pass.
+            // DLSS-SR is mutually exclusive with DLSS-RR: both features share the
+            // same internal Streamline motion-vector buffer (sl.dlss.mvec), and
+            // chaining them in the same command list causes a
+            // RESOURCE_BARRIER_BEFORE_AFTER_MISMATCH at ExecuteCommandLists.
+            // Only run SR when RR is not active.
+            Mat4x4 view = cam.view_inv.inverse();
+            Mat4x4 proj = cam.proj_inv.inverse();
+            rr_evaluated = m_denoiser.evaluate_dlss_rr(
+                                        m_cmd_list.Get(), oi, m_frame_index,
+                                        view, cam.view_inv, proj,
+                                        0.0f, 0.0f, rw, rh, dw, dh);
+            if (!m_denoiser.dlss_rr_supported())
+            {
+                m_denoiser.evaluate_dlss_sr(m_cmd_list.Get(), oi, m_frame_index,
+                                            0.0f, 0.0f, rw, rh, dw, dh);
+            }
+
+            // Streamline always issues a COMMON→UAV barrier on DenoisedOutputUAV
+            // before writing, regardless of whether slEvaluateFeature ultimately
+            // succeeds. Track this so we can clean up on the following frame if
+            // the call failed.
+            // IMPORTANT: only set this flag when slEvaluateFeature actually ran —
+            // i.e. when SL passed tag validation and issued GPU barriers. If SL
+            // rejected the call at tag-validation time (e.g. a required buffer
+            // tag was missing), it never touched DenoisedOutputUAV and the flag
+            // must stay false to avoid a spurious UAV→COMMON cleanup barrier on
+            // the next frame that would trigger RESOURCE_BARRIER_BEFORE_AFTER_MISMATCH.
+            if (rr_evaluated)
+            {
+                if (oi < m_denoised_in_uav_state.size())
+                    m_denoised_in_uav_state[oi] = true;
+            }
+
+            // After slEvaluateFeature (DLSS-RR), DenoisedOutputUAV is left in
+            // D3D12_RESOURCE_STATE_UNORDERED_ACCESS (Streamline transitions it from
+            // COMMON to UAV before writing via legacy ResourceBarrier). Transition it
+            // back to COMMON so copy_to_back_buffer can bind it as an SRV.
+            // IMPORTANT: only emit this barrier when slEvaluateFeature actually ran.
+            // If it was skipped, DenoisedOutputUAV was never touched and remains in
+            // COMMON — issuing a UAV→COMMON barrier on a COMMON resource causes
+            // RESOURCE_BARRIER_BEFORE_AFTER_MISMATCH #527.
+            if (rr_evaluated)
+            {
+                ID3D12Resource* denoised_res = m_path_tracer.denoised_output_resource(oi);
+                if (denoised_res)
+                {
+                    // Streamline writes to DenoisedOutputUAV using legacy ResourceBarriers
+                    // (COMMON → UAV → write), so the Enhanced Barrier layout remains COMMON
+                    // throughout. Issue a legacy UAV → COMMON transition here so that
+                    // copy_to_back_buffer can read it as an SRV on the same command list.
+                    // A legacy transition to/from COMMON is always valid when the Enhanced
+                    // layout is COMMON, which it is because Streamline never used an Enhanced
+                    // Barrier on this resource.
+                    D3D12_RESOURCE_BARRIER dn_to_common{};
+                    dn_to_common.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    dn_to_common.Flags                  = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+                    dn_to_common.Transition.pResource   = denoised_res;
+                    dn_to_common.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                    dn_to_common.Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
+                    dn_to_common.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                    m_cmd_list->ResourceBarrier(1, &dn_to_common);
+
+                    if (oi < m_denoised_in_uav_state.size())
+                        m_denoised_in_uav_state[oi] = false;
+                }
+            }
+            else
+            {
+                // slEvaluateFeature failed this frame, but Streamline may have already
+                // issued a COMMON→UAV legacy barrier on DenoisedOutputUAV before failing.
+                // If the flag is set from a previous successful or partial frame, issue
+                // a legacy UAV→COMMON cleanup barrier so the next frame sees COMMON.
+                ID3D12Resource* denoised_res = m_path_tracer.denoised_output_resource(oi);
+                if (denoised_res &&
+                    oi < m_denoised_in_uav_state.size() &&
+                    m_denoised_in_uav_state[oi])
+                {
+                    D3D12_RESOURCE_BARRIER cleanup{};
+                    cleanup.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    cleanup.Flags                  = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+                    cleanup.Transition.pResource   = denoised_res;
+                    cleanup.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                    cleanup.Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
+                    cleanup.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                    m_cmd_list->ResourceBarrier(1, &cleanup);
+                    m_denoised_in_uav_state[oi] = false;
+                }
+            }
+
+            // Transition the three path-tracer input resources back to UAV so the
+            // next frame's DispatchRays can write to them. These are legacy-tracked
+            // resources and must stay in UAV state between frames.
+            //
+            // After slEvaluateFeature (DLSS-RR), Streamline reads these resources as
+            // shader inputs (SRV) and leaves them in D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.
+            // StateBefore must therefore be PIXEL_SHADER_RESOURCE, not COMMON.
+            // Using COMMON here causes RESOURCE_BARRIER_BEFORE_AFTER_MISMATCH #527
+            // because the D3D12 runtime's tracked state is 0x80, not 0x0.
+            {
+                ID3D12Resource* pt_resources[] = {
+                    m_path_tracer.output_resource(oi),
+                    m_path_tracer.motion_vector_resource(oi),
+                    m_path_tracer.depth_resource(oi),
+                    m_path_tracer.albedo_resource(oi),
+                    m_path_tracer.specular_albedo_resource(oi),
+                    m_path_tracer.normals_aov_resource(oi),
+                    m_path_tracer.roughness_aov_resource(oi),
+                };
+
+                D3D12_RESOURCE_BARRIER to_uav[7]{};
+                uint32_t barrier_count = 0;
+                for (ID3D12Resource* res : pt_resources)
+                {
+                    if (!res) continue;
+                    D3D12_RESOURCE_BARRIER& b    = to_uav[barrier_count++];
+                    b.Type                       = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    b.Flags                      = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+                    b.Transition.pResource       = res;
+                    b.Transition.StateBefore     = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                    b.Transition.StateAfter      = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                    b.Transition.Subresource     = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                }
+                if (barrier_count > 0)
+                    m_cmd_list->ResourceBarrier(barrier_count, to_uav);
+            }
+        }
+
+        // Re-bind the bindless heap — Streamline (DLSS) may have replaced it
+        // with its own internal heap during denoiser evaluation.
+        {
+            ID3D12DescriptorHeap* bindless_heaps[] = { m_device_ctx.bindless_heap() };
+            m_cmd_list->SetDescriptorHeaps(1, bindless_heaps);
+        }
 
         // Transition back buffer: PRESENT → RENDER_TARGET
         DisplayOutput& display_out = m_display_manager.output(oi);
@@ -437,12 +663,24 @@ void Renderer::render_frame_path_traced()
                        D3D12_RESOURCE_STATE_PRESENT,
                        D3D12_RESOURCE_STATE_RENDER_TARGET);
 
-        // Blit UAV → back buffer with tone-mapping
+        // Blit to back buffer with tone-mapping.
+        // When the denoiser is active, read from the denoised output texture;
+        // otherwise read directly from the raw path-tracer UAV.
+        // IMPORTANT: only read DenoisedOutputUAV when slEvaluateFeature actually ran
+        // this frame. If it was skipped — e.g. because Streamline's internal
+        // sl.dlss_d.mvec barrier mismatch caused the call to fail — the post-evaluate
+        // Enhanced Barrier (UAV→COMMON layout) was also skipped, leaving
+        // DenoisedOutputUAV in D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS. Binding it as an
+        // SRV in that layout triggers GPU_BASED_VALIDATION_INCOMPATIBLE_TEXTURE_LAYOUT
+        // #1358 and crashes ExecuteCommandLists with 0x87A.
+        bool use_denoised = rr_evaluated &&
+                            m_path_tracer.denoised_output_resource(oi) != nullptr;
         m_path_tracer.copy_to_back_buffer(m_cmd_list.Get(), oi,
                                            display_out.current_back_buffer(),
                                            display_out.current_rtv(),
                                            static_cast<uint32_t>(display_out.hdr_mode()),
-                                           display_out.back_buffer_format());
+                                           display_out.back_buffer_format(),
+                                           use_denoised);
 
         // Transition back buffer: RENDER_TARGET → PRESENT
         display_out.transition(m_cmd_list.Get(),
@@ -454,6 +692,17 @@ void Renderer::render_frame_path_traced()
 
     ID3D12CommandList* lists[] = { m_cmd_list.Get() };
     m_device_ctx.direct_queue()->ExecuteCommandLists(1, lists);
+
+    // DLSS-G Multi Frame Generation runs after command list execution, before Present.
+    // The engine command list is already closed and submitted at this point.
+    // DLSS-G works by hooking Present via Streamline's interposer and does not
+    // require the engine's command list — pass nullptr for the command buffer.
+    if (m_denoiser.is_initialised() && m_denoiser.dlss_g_supported())
+    {
+        // Each output gets its own MFG invocation.
+        for (uint32_t oi = 0; oi < m_display_manager.output_count(); ++oi)
+            m_denoiser.evaluate_dlss_g(nullptr, oi, m_frame_index);
+    }
 
     for (uint32_t oi = 0; oi < m_display_manager.output_count(); ++oi)
         m_display_manager.output(oi).present(true);
