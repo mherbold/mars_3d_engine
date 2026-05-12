@@ -374,6 +374,10 @@ void PathTracer::create_rtpso(DeviceContext& ctx)
         //   space1 — g_OutputUAV[]         (u0, space1)
         //   space2 — g_MotionVectorUAV[]   (u0, space2)
         //   space3 — g_LinearDepthUAV[]    (u0, space3)
+        //   space5 — g_AlbedoUAV[]         (u0, space5)  [M7]
+        //   space6 — g_SpecularAlbedoUAV[] (u0, space6)  [M7]
+        //   space7 — g_NormalsUAV[]        (u0, space7)  [M7]
+        //   space8 — g_RoughnessUAV[]      (u0, space8)  [M7]
         static constexpr UINT k_unbounded = UINT_MAX;
         static constexpr D3D12_DESCRIPTOR_RANGE_FLAGS k_volatile_flags =
             D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE |
@@ -384,7 +388,7 @@ void PathTracer::create_rtpso(DeviceContext& ctx)
         // offsetInDescriptorsFromTableStart = 0 explicitly; using the default
         // D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND after an unbounded (UINT_MAX) range
         // causes an arithmetic overflow and E_INVALIDARG during serialization.
-        CD3DX12_DESCRIPTOR_RANGE1 ranges[9]{};
+        CD3DX12_DESCRIPTOR_RANGE1 ranges[13]{};
         // SRV space0 – g_Textures[]
         ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, k_unbounded, 0, 0, k_volatile_flags, 0);
         // SRV space1 – g_Buffers[]
@@ -403,8 +407,16 @@ void PathTracer::create_rtpso(DeviceContext& ctx)
         ranges[7].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, k_unbounded, 0, 2, k_volatile_flags, 0);
         // UAV space3 – g_LinearDepthUAV[]
         ranges[8].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, k_unbounded, 0, 3, k_volatile_flags, 0);
+        // UAV space5 – g_AlbedoUAV[]         [M7]
+        ranges[9].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, k_unbounded, 0, 5, k_volatile_flags, 0);
+        // UAV space6 – g_SpecularAlbedoUAV[] [M7]
+        ranges[10].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, k_unbounded, 0, 6, k_volatile_flags, 0);
+        // UAV space7 – g_NormalsUAV[]        [M7]
+        ranges[11].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, k_unbounded, 0, 7, k_volatile_flags, 0);
+        // UAV space8 – g_RoughnessUAV[]      [M7]
+        ranges[12].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, k_unbounded, 0, 8, k_volatile_flags, 0);
 
-        params[1].InitAsDescriptorTable(9, ranges, D3D12_SHADER_VISIBILITY_ALL);
+        params[1].InitAsDescriptorTable(13, ranges, D3D12_SHADER_VISIBILITY_ALL);
 
         // Static sampler s0: linear wrap
         CD3DX12_STATIC_SAMPLER_DESC sampler(0,
@@ -1257,6 +1269,10 @@ void PathTracer::update_frame_constants(DeviceContext& ctx,
     fc.output_uav_slot          = out.uav_slot;
     fc.motion_vector_uav_slot   = mv_out.uav_slot;
     fc.depth_uav_slot           = d_out.uav_slot;
+    fc.albedo_uav_slot          = m_albedo_outputs[output_index].uav_slot;
+    fc.specular_albedo_uav_slot = m_specular_albedo_outputs[output_index].uav_slot;
+    fc.normals_uav_slot         = m_normals_aov_outputs[output_index].uav_slot;
+    fc.roughness_uav_slot       = m_roughness_aov_outputs[output_index].uav_slot;
     fc.sun_direction            = sun_direction;
     fc.sun_intensity            = sun_intensity;
     fc.sun_color                = sun_color;

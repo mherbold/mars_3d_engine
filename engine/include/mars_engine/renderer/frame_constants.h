@@ -33,7 +33,8 @@ namespace mars
 //   offset 192 : sun_direction (12) + sun_intensity (4)
 //   offset 208 : sun_color (12) + _pad0 (4)
 //   offset 224 : prev_view_proj (64)
-//   offset 288 : _pad[56] — 56 bytes padding to reach 512
+//   offset 288 : albedo_uav_slot (4) + specular_albedo_uav_slot (4) + normals_uav_slot (4) + roughness_uav_slot (4)
+//   offset 304 : _pad[52] — 208 bytes padding to reach 512 (was 56 floats / 224 bytes before M7 AOV slots were added)
 //   total = 512 bytes
 struct FrameConstants
 {
@@ -65,7 +66,13 @@ struct FrameConstants
     // previous-frame view-projection matrix (for motion vector computation in the shader)
     Mat4x4   prev_view_proj;                        //  64 bytes  (offset 224)
 
-    float    _pad[56]             = {};             //  56 bytes  (offset 288) — pad to 512
+    // AOV UAV slots for DLSS-RR G-buffer tagging (added M7)
+    uint32_t albedo_uav_slot          = UINT32_MAX; //   4 bytes  (offset 288)
+    uint32_t specular_albedo_uav_slot = UINT32_MAX; //   4 bytes  (offset 292)
+    uint32_t normals_uav_slot         = UINT32_MAX; //   4 bytes  (offset 296)
+    uint32_t roughness_uav_slot       = UINT32_MAX; //   4 bytes  (offset 300)
+
+    float    _pad[52]             = {};             //  208 bytes  (offset 304) — pad to 512
 };
 
 static_assert(sizeof(FrameConstants) % 256 == 0,

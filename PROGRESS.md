@@ -1,6 +1,6 @@
 # PROGRESS.md — MARS 3D Engine Implementation Progress
 
-Last updated: 2025-07 (M6 — DLSS 4 integration **complete**; app running at normal frame rate with no exceptions; all five crash bugs fixed; stable 44-second run validated; remaining Streamline/D3D12 warnings are benign — see Stable Runtime section below)
+Last updated: 2025-07 (M7 — ReSTIR DI + real G-buffer AOV writes **complete**; ClosestHit now writes real albedo/specular/normals/roughness AOVs and evaluates direct lighting via RIS reservoir + shadow ray; DXC lib_6_3 compile verified clean)
 
 ---
 
@@ -128,6 +128,7 @@ Shutdown completed without crash dumps.
 | M4 | DXR pipeline: primary rays, basic PBR hit shader | ✅ | See M4 details below |
 | M5 | Scene file parser, static scene rendering | ✅ | See M5 details below |
 | M6 | DLSS 4 integration (SR, RR, MFG) | ✅ | 5x crash bugs fixed; DLSS-RR and DLSS-G initialise and run; stable 44-second run validated; AOV textures black until M7/M8 shaders write real G-buffer data; remaining log messages are benign Streamline-internal warnings |
+| M7 | ReSTIR DI + real G-buffer AOV writes | ✅ | FrameConstants extended with 4 AOV UAV slots; path_tracer.cpp root signature expanded (spaces 5–8); AOV textures allocated and filled each frame; ClosestHit writes real diffuse albedo / specular F0 / world normals / roughness to DLSS-RR G-buffer; ReSTIR DI direct lighting via RIS + shadow ray replaces the old flat NdotL; restir_di.hlsli contains shared reservoir math; DXR-dependent helpers (RIS_GenerateCandidates, ReservoirShade + shadow TraceRay) live in path_trace.hlsl; verified: dxc -T lib_6_3 compiles with -WX clean |
 
 ---
 

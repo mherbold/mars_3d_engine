@@ -30,6 +30,7 @@ set(HLSLI_HEADERS
     "${CMAKE_CURRENT_SOURCE_DIR}/material/material_data.hlsli"
     "${CMAKE_CURRENT_SOURCE_DIR}/sky/physical_sky.hlsli"
     "${CMAKE_CURRENT_SOURCE_DIR}/sky/hdri_sky.hlsli"
+    "${CMAKE_CURRENT_SOURCE_DIR}/gi/restir_di.hlsli"
 )
 
 # ---------------------------------------------------------------------------
@@ -77,6 +78,7 @@ source_group("Shaders\\\\sky"       FILES
 )
 source_group("Shaders\\\\gi"        FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/gi/restir_di.hlsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/gi/restir_di.hlsli"
     "${CMAKE_CURRENT_SOURCE_DIR}/gi/restir_gi.hlsl"
 )
 source_group("Shaders\\\\post"      FILES

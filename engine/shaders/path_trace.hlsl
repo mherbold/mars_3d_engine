@@ -12,6 +12,7 @@
 #include "common/random.hlsli"
 #include "material/material_data.hlsli"
 #include "material/pbr_brdf.hlsli"
+#include "gi/restir_di.hlsli"
 
 // ---------------------------------------------------------------------------
 // Per-frame constant buffer (bound at b0, space0)
@@ -40,6 +41,11 @@ struct FrameConstants
     float3   sun_color;               // offset 208 — register 13
     float    _pad0;
     float4x4 prev_view_proj;          // offset 224 — registers 14..17
+    // AOV UAV slots for G-buffer writes (added M7) — offset 288, registers 18..18
+    uint     albedo_uav_slot;
+    uint     specular_albedo_uav_slot;
+    uint     normals_uav_slot;
+    uint     roughness_uav_slot;
 };
 
 ConstantBuffer<FrameConstants> g_Frame : register(b0, space0);
@@ -56,6 +62,12 @@ RWTexture2D<float4> g_MotionVectorUAV[] : register(u0, space2);
 // Linear depth UAV — R32_FLOAT
 RWTexture2D<float>  g_LinearDepthUAV[]  : register(u0, space3);
 
+// AOV UAVs for DLSS-RR G-buffer tagging (M7)
+RWTexture2D<float4> g_AlbedoUAV[]         : register(u0, space5);
+RWTexture2D<float4> g_SpecularAlbedoUAV[] : register(u0, space6);
+RWTexture2D<float4> g_NormalsUAV[]        : register(u0, space7);
+RWTexture2D<float>  g_RoughnessUAV[]      : register(u0, space8);
+
 // ---------------------------------------------------------------------------
 // Payload structures
 // ---------------------------------------------------------------------------
@@ -70,6 +82,65 @@ struct ShadowPayload
 {
     uint occluded; // 1 = occluded, 0 = unoccluded (bool is unreliable in DXR payloads)
 };
+
+// ---------------------------------------------------------------------------
+// ReSTIR DI — DXR-dependent functions
+// These require ShadowPayload, TraceRay, and EvaluatePBR to be in scope, so
+// they live here rather than in restir_di.hlsli.
+// ---------------------------------------------------------------------------
+
+// RIS initial candidate generation.
+// For the single directional sun light in M7, all candidates are identical.
+// The structure is already correct for extending to area/emissive lights (M8+).
+Reservoir RIS_GenerateCandidates(
+    float3 baseColor, float metallic, float roughness,
+    float3 N, float3 V,
+    DirectionalLight light,
+    inout uint rng)
+{
+    static const uint k_candidates = 8u;
+    Reservoir r = ReservoirInit();
+
+    [unroll]
+    for (uint i = 0u; i < k_candidates; ++i)
+    {
+        float3 L     = light.direction;
+        float  NdotL = saturate(dot(N, L));
+
+        // Source PDF q(x): uniform over the single light = 1.0
+        float  q        = 1.0f;
+        float3 brdf_val = EvaluatePBR(baseColor, metallic, roughness, N, V, L);
+        float  p_hat    = PdfHat(brdf_val / max(NdotL, 1e-4f), NdotL, light.radiance);
+        float  w        = p_hat / max(q, 1e-6f);
+        ReservoirUpdate(r, L, light.radiance, w, rng);
+    }
+
+    // Finalise with p_hat at the selected sample
+    float  NdotL_sel = saturate(dot(N, r.y_direction));
+    float3 brdf_sel  = EvaluatePBR(baseColor, metallic, roughness, N, V, r.y_direction);
+    float  p_hat_sel = PdfHat(brdf_sel / max(NdotL_sel, 1e-4f), NdotL_sel, r.y_radiance);
+    ReservoirFinalize(r, p_hat_sel);
+    return r;
+}
+
+// Compute the shaded direct-lighting contribution given a pre-tested visibility.
+// The caller shoots the shadow ray and passes `visible` (true = unoccluded).
+float3 ReservoirShade(
+    float3 N, float3 V,
+    float3 baseColor, float metallic, float roughness,
+    Reservoir r,
+    bool visible)
+{
+    if (!visible || r.W <= 0.0f || r.M == 0u)
+        return float3(0, 0, 0);
+
+    float NdotL = saturate(dot(N, r.y_direction));
+    if (NdotL <= 0.0f)
+        return float3(0, 0, 0);
+
+    float3 brdf = EvaluatePBR(baseColor, metallic, roughness, N, V, r.y_direction);
+    return brdf * r.y_radiance * r.W;
+}
 
 // ---------------------------------------------------------------------------
 // Vertex fetch helper — reads vertex data from the bindless vertex buffer.
@@ -195,11 +266,11 @@ void RayGen()
     payload.missed   = false;
 
     TraceRay(g_TLAS[g_Frame.tlas_slot],
-             0,              // RAY_FLAG_NONE
-             0xFF,           // instance mask
-             0,              // hit group index
-             1,              // contribution to hit group index
-             0,              // miss shader index
+             0u,             // RAY_FLAG_NONE
+             0xFFu,          // instance mask
+             0u,             // hit group index
+             1u,             // contribution to hit group index
+             0u,             // miss shader index
              ray,
              payload);
 
@@ -375,33 +446,66 @@ void ClosestHit(inout PrimaryPayload payload, in BuiltInTriangleIntersectionAttr
     if (dot(N, V) < 0.0f)
         N = -N;   // flip for double-sided surfaces
 
-    float3 sunDir      = normalize(g_Frame.sun_direction);
-    float3 sunRadiance = g_Frame.sun_color * g_Frame.sun_intensity;
+    uint2 pixelIdx = DispatchRaysIndex().xy;
 
-    // Shadow ray
+    // ---- Write G-buffer AOV textures (DLSS-RR mandatory inputs) ----------------
+    if (g_Frame.albedo_uav_slot != 0xFFFFFFFF)
+    {
+        // Diffuse base color with metallic masking: metals have no diffuse albedo.
+        float3 diffuseAlbedo = baseColor * (1.0f - metallic);
+        g_AlbedoUAV[g_Frame.albedo_uav_slot][pixelIdx] = float4(diffuseAlbedo, 1.0f);
+    }
+
+    if (g_Frame.specular_albedo_uav_slot != 0xFFFFFFFF)
+    {
+        // Specular F0: dielectrics use 0.04, metals use baseColor.
+        float3 F0 = lerp(float3(0.04f, 0.04f, 0.04f), baseColor, metallic);
+        g_SpecularAlbedoUAV[g_Frame.specular_albedo_uav_slot][pixelIdx] = float4(F0, 1.0f);
+    }
+
+    if (g_Frame.normals_uav_slot != 0xFFFFFFFF)
+    {
+        // Encode world-space shading normal into [0,1] range: n * 0.5 + 0.5
+        float3 nEnc = N * 0.5f + 0.5f;
+        g_NormalsUAV[g_Frame.normals_uav_slot][pixelIdx] = float4(nEnc, 1.0f);
+    }
+
+    if (g_Frame.roughness_uav_slot != 0xFFFFFFFF)
+    {
+        g_RoughnessUAV[g_Frame.roughness_uav_slot][pixelIdx] = roughness;
+    }
+
+    // ---- ReSTIR DI — direct illumination via RIS + visibility ----------------
+    uint rng = PcgSeed(pixelIdx, g_Frame.frame_index);
+
+    DirectionalLight sun;
+    sun.direction = normalize(g_Frame.sun_direction);
+    sun.radiance  = g_Frame.sun_color * g_Frame.sun_intensity;
+
+    Reservoir res = RIS_GenerateCandidates(baseColor, metallic, roughness, N, V, sun, rng);
+
+    // Shadow ray for the selected reservoir sample
     ShadowPayload shadowPayload;
     shadowPayload.occluded = 1u;
 
     RayDesc shadowRay;
     shadowRay.Origin    = worldPos + N * 1e-3f;
-    shadowRay.Direction = sunDir;
+    shadowRay.Direction = res.y_direction;
     shadowRay.TMin      = 1e-4f;
     shadowRay.TMax      = 1e6f;
 
     TraceRay(g_TLAS[g_Frame.tlas_slot],
-             0x4 | 0x8, // RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER
-             0xFF,
-             0,
-             1,
-             1,   // ShadowMiss index
+             0x4u | 0x8u, // RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER
+             0xFFu,
+             0u, 1u,
+             1u,  // ShadowMiss index
              shadowRay,
              shadowPayload);
 
-    float3 directLight = float3(0, 0, 0);
-    if (shadowPayload.occluded == 0u)
-        directLight = EvaluatePBR(baseColor, metallic, roughness, N, V, sunDir) * sunRadiance;
+    bool visible   = (shadowPayload.occluded == 0u);
+    float3 directLight = ReservoirShade(N, V, baseColor, metallic, roughness, res, visible);
 
-    // Simple ambient (will be replaced by path-traced GI in M7/M8)
+    // Simple ambient (will be replaced by path-traced GI in M8)
     float3 ambient = baseColor * 0.02f;
 
     payload.radiance = directLight + ambient + emissive;
