@@ -133,7 +133,7 @@ MarsEngine::Shutdown()
 | Descriptor heaps | CBV/SRV/UAV bindless heap (1M slots), RTV heap, Sampler heap |
 | Memory | D3D12MA (D3D12 Memory Allocator by AMD/GPUOpen) |
 | Swap chain | `IDXGISwapChain4` — **HDR10 / scRGB fully supported**; `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020` (PQ) or `_G10_NONE_P709` (scRGB linear) activated when available; graceful SDR fallback via ACES tone-map; tearing support via `DXGI_PRESENT_ALLOW_TEARING` |
-| Synchronization | `ID3D12Fence` per queue; frame-in-flight ring (3 frames) |
+| Synchronization | `ID3D12Fence` per queue; frame-in-flight ring (2 frames — double-buffered; keeps input latency minimal before DLSS MFG adds its own) |
 | GPU debug | NVIDIA Aftermath SDK for GPU crash dumps |
 | PIX integration | WinPixEventRuntime for GPU captures |
 
