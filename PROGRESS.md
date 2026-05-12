@@ -163,20 +163,7 @@ Shutdown completed without crash dumps.
 |---|---|---|
 | **FreeType + HarfBuzz font integration** | Currently `HB_HAVE_FREETYPE=OFF`; enable once FreeType is wired via `CMAKE_PREFIX_PATH` | M16 |
 | **msdfgen with font input** | Currently `MSDFGEN_CORE_ONLY=ON`; enable `msdfgen-ext` once FreeType is wired | M16 |
-| M5 | Scene file parser, static scene rendering | 🔲 | |
-| M6 | DLSS 4 integration (upscale, Multi Frame Generation, Ray Reconstruction) | 🔲 | Requires DLSS SDK NDA access |
-| M7 | ReSTIR DI — direct lighting + ray-traced shadows | 🔲 | |
-| M8 | ReSTIR GI — multi-bounce global illumination | 🔲 | |
-| M9 | Animation system + skeletal mesh rendering | 🔲 | |
-| M10 | Ecosystem / vegetation + wind | 🔲 | |
-| M11 | Particle system | 🔲 | |
-| M12 | Weather system (rain, clouds, fog) | 🔲 | |
-| M13 | Decal system (tire tracks, skid marks) | 🔲 | |
-| M14 | Crowd rendering | 🔲 | |
-| M15 | Debug overlay, PIX, Aftermath, profiling *(dev-only)* | 🔲 | |
-| M16 | Game UI system: MSDF fonts, widget tree, HUD | 🔲 | |
-| M17 | Test app polish | 🔲 | |
-| M18 | Performance tuning, peak-brightness calibration, HDR display polish | 🔲 | HDR support is cross-cutting from M1; M18 is final calibration only |
+| **WinPixEventRuntime** | NuGet package not yet wired into CMake | M15 |
 
 ---
 
@@ -246,48 +233,40 @@ Shutdown completed without crash dumps.
 - ✅ Build TLAS from loaded instances
 - ✅ Render a multi-object static scene
 
-### M15 — Debug Overlay *(Developer-Only: ImGui, PIX, Aftermath)*
-- 🔲 ImGui integration (debug builds only, stripped from shipping)
-- 🔲 Per-pass GPU timer panels
-- 🔲 WinPixEventRuntime GPU event markers
-- 🔲 NVIDIA Aftermath crash dump integration
-- 🔲 `--renderdoc` flag + `renderdoc.dll` injection support
+### M6 — DLSS 4 Integration (SR, RR, MFG)
+- ✅ Streamline SDK v2.11.1 integrated; all `sl.*` / `nvngx_*` DLLs deployed
+- ✅ DLSS 4 Super Resolution (SR) initialised and running
+- ✅ DLSS 4 Ray Reconstruction (RR) initialised and running
+- ✅ DLSS 4 Multi Frame Generation (MFG / DLSS-G) initialised and running
+- ✅ AOV textures allocated in `PathTracer` (albedo, specular albedo, normals, roughness) — values black until M7/M8 shaders write real G-buffer data
+- ✅ All mandatory Streamline buffer tags provided each frame (`kBufferTypeAlbedo`, `kBufferTypeSpecularAlbedo`, `kBufferTypeNormals`, `kBufferTypeRoughness`, `kBufferTypeScalingInputColor`, `kBufferTypeMotionVectors`, `kBufferTypeDepth`)
+- ✅ Five crash bugs fixed; stable 44-second run validated — see *Current Focus* above for full investigation
 
-### M16 — Game UI System
-- 🔲 `UISystem` class: widget tree, per-frame dirty tracking
-- 🔲 `UIRenderer`: upload geometry, rasterization pass, composite onto path-traced frame
-- 🔲 MSDF font atlas pipeline: msdfgen offline tool → BC4 atlas + JSON metrics
-- 🔲 HarfBuzz integration: Unicode shaping, OpenType features, RTL/BiDi
-- 🔲 MSDF text shader (HLSL): correct alpha reconstruction, sub-pixel fringe
-- 🔲 Core widgets: `Label`, `Image`, `Button`, `ProgressBar`, `Gauge`
-- 🔲 Advanced widgets: `Label` multi-line, `Minimap` (secondary low-res ray-gen dispatch into UAV texture), `Leaderboard`, `Notification`, `Screen`
-- 🔲 `.marsui` JSON screen file parser and hot-reload
-- 🔲 Theme/style sheet system (JSON): colors, spacing, animation curves
-- 🔲 HDR-aware color pipeline for UI (linear → tone map per display)
-- 🔲 Per-monitor DPI scaling support
+---
 
-### M5 — Scene File Parser & Static Scene
+## M3 — Completed Work
 
 ### New Files
 | File | Purpose |
 |---|---|
-| `engine/include/mars_engine/scene/scene_types.h` | `LightDesc`, `CameraDesc`, `SkyboxDesc` — JSON-mapped scene metadata types |
-| `engine/include/mars_engine/scene/scene_loader.h` | `SceneLoader::load()` — public API for parsing `.marsscene` files |
-| `engine/src/scene/scene_loader.cpp` | JSON parsing (nlohmann/json): resolves relative paths, loads models, populates lights/cameras/skybox |
-| `engine/include/mars_engine/camera/camera.h` | `Camera` (view/proj matrices, display offsets, prev-frame storage) and `FlyCamera` (WASD + mouse-look) |
-| `engine/src/camera/camera.cpp` | Camera matrix construction (right-handed, D3D12 depth [0,1]), rigid-body / projection inverse |
-| `test_scene.marsscene` | Sample scene file: one directional sun light, one default camera, no mesh instances |
+| `engine/include/mars_engine/math/math_types.h` | `Vec2`, `Vec3`, `Vec4`, `Mat4x4`, `Quaternion`, `Transform`, `AABB` — inline math types |
+| `engine/include/mars_engine/asset/asset_types.h` | CPU-side: `Vertex`, `MeshData`, `MaterialData`, `ModelAsset`, `TextureRef` |
+| `engine/include/mars_engine/asset/asset_importer.h` | `AssetImporter` — Assimp-based FBX/glTF/OBJ loader |
+| `engine/src/asset/asset_importer.cpp` | Implementation: scene-graph traversal, mesh/material extraction |
+| `engine/include/mars_engine/asset/gpu_mesh_buffer.h` | `GpuMeshBuffer` — D3D12 VB/IB + bindless SRV |
+| `engine/src/asset/gpu_mesh_buffer.cpp` | Upload via Copy queue, D3D12MA DEFAULT-heap allocation |
+| `engine/include/mars_engine/asset/texture_loader.h` | `GpuTexture`, `TextureLoader` — DirectXTex loader |
+| `engine/src/asset/texture_loader.cpp` | DDS/PNG/EXR/HDR load, mip generation, bindless SRV registration |
+| `engine/include/mars_engine/asset/resource_manager.h` | `ResourceManager`, `GpuModel` — owns allocator + asset caches |
+| `engine/src/asset/resource_manager.cpp` | D3D12MA allocator init, `load_model()` / `load_texture()` |
 
 ### Updated Files
 | File | Change |
 |---|---|
-| `engine/include/mars_engine/scene/scene.h` | Added `SceneLoader` friend, M5 metadata members (`m_lights`, `m_cameras`, `m_skybox`), accessors, `load_from_file()` |
-| `engine/src/scene/scene.cpp` | `load_from_file()` delegates to `SceneLoader`; `unload()` clears all M5 state |
-| `engine/include/mars_engine/renderer/renderer.h` | Added `load_scene()`, `rebuild_tlas()`, `scene()`, `resource_manager()` accessors; added `ResourceManager` and `Scene` members |
-| `engine/src/renderer/renderer.cpp` | `init_internal()` calls `ResourceManager::init()`; `shutdown()` calls `ResourceManager::shutdown()` and `Scene::unload()`; `load_scene()` builds BLAS/TLAS from loaded instances |
-| `engine/include/mars_engine/mars_engine.h` | Added `scene_types.h` and `scene_loader.h` to public single-include |
-| `engine/CMakeLists.txt` | Added `scene_loader.cpp`, `camera.cpp`, and M5 headers to source/header lists |
-| `test_app/src/main.cpp` | FlyCamera integration: WASD + QE/Space + left-click mouse capture; loads `test_scene.marsscene`; seeds camera from scene `cameras[0]` if present |
+| `engine/include/mars_engine/scene/scene.h` | `Scene` now holds `SceneModelInstance` list; `add_model()` wired to `ResourceManager` |
+| `engine/src/scene/scene.cpp` | Scene load/unload/add_model implemented |
+| `engine/include/mars_engine/mars_engine.h` | Added all new asset headers to public single-include |
+| `engine/CMakeLists.txt` | Added asset source files, D3D12MA private include path |
 
 ---
 
@@ -319,29 +298,135 @@ Shutdown completed without crash dumps.
 
 ---
 
-## M3 — Completed Work
+## M5 — Completed Work
 
 ### New Files
 | File | Purpose |
 |---|---|
-| `engine/include/mars_engine/math/math_types.h` | `Vec2`, `Vec3`, `Vec4`, `Mat4x4`, `Quaternion`, `Transform`, `AABB` — inline math types |
-| `engine/include/mars_engine/asset/asset_types.h` | CPU-side: `Vertex`, `MeshData`, `MaterialData`, `ModelAsset`, `TextureRef` |
-| `engine/include/mars_engine/asset/asset_importer.h` | `AssetImporter` — Assimp-based FBX/glTF/OBJ loader |
-| `engine/src/asset/asset_importer.cpp` | Implementation: scene-graph traversal, mesh/material extraction |
-| `engine/include/mars_engine/asset/gpu_mesh_buffer.h` | `GpuMeshBuffer` — D3D12 VB/IB + bindless SRV |
-| `engine/src/asset/gpu_mesh_buffer.cpp` | Upload via Copy queue, D3D12MA DEFAULT-heap allocation |
-| `engine/include/mars_engine/asset/texture_loader.h` | `GpuTexture`, `TextureLoader` — DirectXTex loader |
-| `engine/src/asset/texture_loader.cpp` | DDS/PNG/EXR/HDR load, mip generation, bindless SRV registration |
-| `engine/include/mars_engine/asset/resource_manager.h` | `ResourceManager`, `GpuModel` — owns allocator + asset caches |
-| `engine/src/asset/resource_manager.cpp` | D3D12MA allocator init, `load_model()` / `load_texture()` |
+| `engine/include/mars_engine/scene/scene_types.h` | `LightDesc`, `CameraDesc`, `SkyboxDesc` — JSON-mapped scene metadata types |
+| `engine/include/mars_engine/scene/scene_loader.h` | `SceneLoader::load()` — public API for parsing `.marsscene` files |
+| `engine/src/scene/scene_loader.cpp` | JSON parsing (nlohmann/json): resolves relative paths, loads models, populates lights/cameras/skybox |
+| `engine/include/mars_engine/camera/camera.h` | `Camera` (view/proj matrices, display offsets, prev-frame storage) and `FlyCamera` (WASD + mouse-look) |
+| `engine/src/camera/camera.cpp` | Camera matrix construction (right-handed, D3D12 depth [0,1]), rigid-body / projection inverse |
+| `test_scene.marsscene` | Sample scene file: one directional sun light, one default camera, no mesh instances |
 
 ### Updated Files
 | File | Change |
 |---|---|
-| `engine/include/mars_engine/scene/scene.h` | `Scene` now holds `SceneModelInstance` list; `add_model()` wired to `ResourceManager` |
-| `engine/src/scene/scene.cpp` | Scene load/unload/add_model implemented |
-| `engine/include/mars_engine/mars_engine.h` | Added all new asset headers to public single-include |
-| `engine/CMakeLists.txt` | Added asset source files, D3D12MA private include path |
+| `engine/include/mars_engine/scene/scene.h` | Added `SceneLoader` friend, M5 metadata members (`m_lights`, `m_cameras`, `m_skybox`), accessors, `load_from_file()` |
+| `engine/src/scene/scene.cpp` | `load_from_file()` delegates to `SceneLoader`; `unload()` clears all M5 state |
+| `engine/include/mars_engine/renderer/renderer.h` | Added `load_scene()`, `rebuild_tlas()`, `scene()`, `resource_manager()` accessors; added `ResourceManager` and `Scene` members |
+| `engine/src/renderer/renderer.cpp` | `init_internal()` calls `ResourceManager::init()`; `shutdown()` calls `ResourceManager::shutdown()` and `Scene::unload()`; `load_scene()` builds BLAS/TLAS from loaded instances |
+| `engine/include/mars_engine/mars_engine.h` | Added `scene_types.h` and `scene_loader.h` to public single-include |
+| `engine/CMakeLists.txt` | Added `scene_loader.cpp`, `camera.cpp`, and M5 headers to source/header lists |
+| `test_app/src/main.cpp` | FlyCamera integration: WASD + QE/Space + left-click mouse capture; loads `test_scene.marsscene`; seeds camera from scene `cameras[0]` if present |
+
+---
+
+## Future Milestone Checklists
+
+### M7 — ReSTIR DI (Direct Lighting + Ray-Traced Shadows)
+- 🔲 ReSTIR DI reservoir data structures (structured buffer, per-pixel reservoir)
+- 🔲 Initial candidate sampling (light importance sampling)
+- 🔲 Temporal reuse pass
+- 🔲 Spatial reuse pass
+- 🔲 Visibility ray for selected reservoir sample (shadow ray)
+- 🔲 Write real sun/directional light data to `kBufferTypeNormals` / AOV textures in HLSL
+
+### M8 — ReSTIR GI (Multi-Bounce Global Illumination)
+- 🔲 Secondary ray dispatch (multi-bounce path tracing)
+- 🔲 ReSTIR GI reservoir structures and temporal reuse
+- 🔲 Spatial reuse pass for GI reservoirs
+- 🔲 Write real G-buffer AOV data (albedo, specular albedo, roughness) in closest-hit HLSL
+
+### M9 — Animation System + Skeletal Mesh Rendering
+- 🔲 CPU clip evaluation → bone palette
+- 🔲 GPU skinning compute shader (bone palette → skinned vertex buffer)
+- 🔲 BLAS refit for skinned meshes each frame
+- 🔲 1D / 2D blend trees; cross-fade between clips
+- 🔲 FABRIK IK solver for foot placement
+- 🔲 Rigid node animation (wheels, doors, flags)
+- 🔲 Compute cloth simulation for waving flags (spring lattice, wind vector)
+
+### M10 — Procedural Ecosystem / Vegetation + Wind
+- 🔲 GPU-driven instance placement compute shader (reads density map)
+- 🔲 GPU-driven LOD selection compute pass (projected solid angle → BLAS index)
+- 🔲 Impostor billboard pre-bake and ray-traversal sampling
+- 🔲 Wind compute shader: Bezier trunk/branch bend → vertex position write-back
+- 🔲 Per-frame TLAS update for dynamic vegetation instances
+- 🔲 GPU frustum culling prepass (no Hi-Z / no rasterized depth)
+
+### M11 — Particle System
+- 🔲 GPU compute particle simulation (Append/Consume buffers, up to 1M particles)
+- 🔲 Emitter types: point, box, sphere, mesh-surface, trail
+- 🔲 Ray-traced volumetric particles (smoke, fire) as procedural TLAS geometry
+- 🔲 Oriented procedural primitives for sparks / rain streaks in TLAS
+- 🔲 NEE / shadow rays from particle hit shaders
+
+### M12 — Weather System
+- 🔲 GPU rain particle streaks
+- 🔲 Animated rain-drop ripple normal maps sampled at ray hit time
+- 🔲 Puddle procedural normal maps + near-zero-roughness PBR wet geometry
+- 🔲 Volumetric clouds (ray-marched density field, Schneider 2015+)
+- 🔲 Heterogeneous exponential height fog + volumetric light shafts (in-scattering)
+- 🔲 PBR dry↔wet material blend driven by weather intensity float
+- 🔲 Snow particles + compute-written surface coverage map
+- 🔲 Global wind vector integration (drives vegetation, flags, particle drift)
+
+### M13 — Decal System (Tire Tracks / Skid Marks)
+- 🔲 World-space decal buffer (position, orientation, extents, material)
+- 🔲 CPU-built spatial hash / BVH uploaded to GPU structured buffer
+- 🔲 Closest-hit shader decal query and material blend
+- 🔲 Ring buffer of N slots; oldest-evict on overflow
+- 🔲 Tire track emission from vehicle physics (slip angle threshold)
+- 🔲 Skid mark: roughness reduction + albedo darkening
+
+### M14 — Crowd Rendering
+- 🔲 CPU boid simulation (nearby agents); scripted paths (distant)
+- 🔲 Agent positions uploaded via Copy queue to GPU structured buffer
+- 🔲 GPU compute: per-instance TLAS transform write + crowd TLAS registration
+- 🔲 Per-instance bone palette in structured buffer; GPU skinning compute
+- 🔲 Animation Texture Baking (ATB) with blended clip playback
+- 🔲 GPU-driven LOD selection (projected solid angle → BLAS/LOD index)
+- 🔲 Distant crowd impostors as pre-baked multi-angle radiance cards in TLAS
+
+### M15 — Debug Overlay *(Developer-Only: ImGui, PIX, Aftermath)*
+- 🔲 ImGui integration (debug builds only, stripped from shipping)
+- 🔲 Per-pass GPU timer panels
+- 🔲 WinPixEventRuntime GPU event markers
+- 🔲 NVIDIA Aftermath crash dump integration (`ReportLiveObjects()` in `DeviceContext::shutdown()`)
+- 🔲 `--renderdoc` flag + `renderdoc.dll` injection support
+- 🔲 Add WinPixEventRuntime via NuGet; wire into CMake
+
+### M16 — Game UI System
+- 🔲 `UISystem` class: widget tree, per-frame dirty tracking
+- 🔲 `UIRenderer`: upload geometry, rasterization pass, composite onto path-traced frame
+- 🔲 Enable FreeType via `CMAKE_PREFIX_PATH`; enable `HB_HAVE_FREETYPE=ON`
+- 🔲 Enable `msdfgen-ext` (disable `MSDFGEN_CORE_ONLY`)
+- 🔲 MSDF font atlas pipeline: msdfgen offline tool → BC7 atlas + JSON metrics
+- 🔲 HarfBuzz integration: Unicode shaping, OpenType features, RTL/BiDi
+- 🔲 MSDF text shader (HLSL): correct alpha reconstruction, sub-pixel fringe correction (SDR only)
+- 🔲 Core widgets: `Label`, `Image`, `Button`, `ProgressBar`, `Gauge`
+- 🔲 Advanced widgets: `Minimap` (secondary low-res ray-gen dispatch into UAV), `Leaderboard`, `Notification`, `Screen`
+- 🔲 `.marsui` JSON screen file parser and hot-reload
+- 🔲 Theme/style sheet system (JSON): colors, spacing, animation curves
+- 🔲 HDR-aware UI color pipeline (linear → tone map per display)
+- 🔲 Per-monitor DPI scaling support
+
+### M17 — Test App Polish
+- 🔲 Hot-reload: `R` key reloads current scene without restart
+- 🔲 Screenshot: `F12` saves HDR EXR to working directory
+- 🔲 Gamepad support (XInput): analog steering, trigger accelerate/brake
+- 🔲 Orbit camera (`F` toggle between free-fly and locked orbit)
+- 🔲 Dev panel toggle with `~` key (ImGui, dev builds only)
+
+### M18 — Performance Tuning, HDR Calibration, Shipping Polish
+- 🔲 Per-display peak-brightness calibration (nits target)
+- 🔲 ACES tone-map tuning for HDR10 / scRGB / SDR paths
+- 🔲 `Repeated slDLSSGSetOptions()` call deduplication in `denoiser.cpp`
+- 🔲 `ReportLiveObjects()` cleanup audit at process exit
+- 🔲 FSR 4 / FSR 3 AMD fallback integration (GPUOpen FidelityFX SDK)
+- 🔲 Final GPU timer profiling pass; pipeline bottleneck resolution
 
 ---
 

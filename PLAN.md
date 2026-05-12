@@ -228,12 +228,16 @@ engine/shaders/
 | UI composite | **Game UI (`UIRenderer`)** composited over path-traced frame via rasterization (all builds); **ImGui** additionally composited in dev/debug builds only |
 | Frame generation | DLSS 4 Multi Frame Generation — operates on the fully composited output image; up to 3 additional generated frames (4× total, RTX 50 series); 1 additional frame (2× total, RTX 40 series); runs immediately before Present |
 
-### Albedo AOV / Normals AOV / Roughness AOV (TODO)
-Streamline / DLSS Ray Reconstruction requires dedicated AOV buffers tagged each frame: `kBufferTypeAlbedo`, `kBufferTypeSpecularAlbedo`, `kBufferTypeNormals`, and `kBufferTypeRoughness`. Currently the noisy color buffer is reused as a placeholder for all of these to satisfy the Streamline tag requirement. Proper AOVs should be:
-1. Added as new per-output UAVs in `PathTracer` (alongside `m_outputs`, `m_mv_outputs`, `m_depth_outputs`).
-2. Written by the closest-hit shader at the primary hit: diffuse base color (no lighting) → albedo UAV; specular/metallic color → specular albedo UAV; world-space geometric normal → normals UAV; perceptual roughness → roughness UAV (R8_UNORM).
-3. Exposed via new accessors: `PathTracer::albedo_resource()`, `PathTracer::specular_albedo_resource()`, `PathTracer::normals_resource()`, `PathTracer::roughness_resource()`.
-4. Passed as dedicated parameters to `Denoiser::tag_resources` (the `normals` and `roughness` parameters already exist but are currently `nullptr`) and tagged with their correct `sl::BufferType` values instead of aliasing the noisy color buffer.
+### Albedo AOV / Normals AOV / Roughness AOV
+Dedicated AOV UAV textures are allocated in `PathTracer` as of M6 (alongside `m_outputs`, `m_mv_outputs`, `m_depth_outputs`). All four buffers are tagged each frame in `Denoiser::tag_resources()`:
+- `kBufferTypeAlbedo` / `kBufferTypeSpecularAlbedo` → `m_albedo_outputs` / `m_specular_albedo_outputs`
+- `kBufferTypeNormals` / `kBufferTypeRoughness` → `m_normals_aov_outputs` / `m_roughness_aov_outputs`
+
+AOV textures are currently black (no HLSL writes them yet). Real G-buffer data will be written by the closest-hit shader in M7/M8:
+1. Diffuse base color (no lighting) → albedo UAV
+2. Specular/metallic color → specular albedo UAV
+3. World-space geometric normal → normals UAV
+4. Perceptual roughness → roughness UAV (R8_UNORM)
 
 ---
 
@@ -558,8 +562,8 @@ WinMain
 | **M2** | Multi-monitor display system | ✅ Complete |
 | **M3** | Asset pipeline: load FBX/glTF, upload to GPU | ✅ Complete |
 | **M4** | DXR pipeline: primary rays, basic PBR hit shader | ✅ Complete |
-| **M5** | Scene file parser, static scene rendering | 🔲 Not started |
-| **M6** | DLSS 4 integration (upscale, Multi Frame Generation, Ray Reconstruction) | 🔲 Not started |
+| **M5** | Scene file parser, static scene rendering | ✅ Complete |
+| **M6** | DLSS 4 integration (upscale, Multi Frame Generation, Ray Reconstruction) | ✅ Complete |
 | **M7** | ReSTIR DI — direct lighting with ray-traced shadows | 🔲 Not started |
 | **M8** | ReSTIR GI — multi-bounce global illumination | 🔲 Not started |
 | **M9** | Animation system + skeletal mesh rendering | 🔲 Not started |

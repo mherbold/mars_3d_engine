@@ -1,7 +1,13 @@
 # Copilot Instructions
 
 ## Session Initialization
-- At the start of every conversation, including crash debugging sessions triggered via `Debug with Copilot`, always read the following files from the workspace root before doing anything else:
+- At the start of every conversation, including crash debugging sessions triggered via `Analyze with Copilot`, always read the following files from the workspace root before doing anything else:
+  - `PLAN.md`
+  - `PROGRESS.md`
+  - `AGENTS.md`
+
+## Session Progress
+- During each conversation, including crash debugging sessions triggered via `Analyze with Copilot`, always update the following files from the workspace root:
   - `PLAN.md`
   - `PROGRESS.md`
   - `AGENTS.md`
