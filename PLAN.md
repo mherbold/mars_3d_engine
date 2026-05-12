@@ -28,7 +28,6 @@
 18. [Debug & Profiling Overlay (Developer-Only)](#18-debug--profiling-overlay-developer-only)
 19. [Game UI System](#19-game-ui-system)
 20. [Test Application](#20-test-application)
-21. [Milestone Roadmap](#21-milestone-roadmap)
 
 ---
 
@@ -233,9 +232,9 @@ Dedicated AOV UAV textures are allocated in `PathTracer` as of M6 (alongside `m_
 - `kBufferTypeAlbedo` / `kBufferTypeSpecularAlbedo` → `m_albedo_outputs` / `m_specular_albedo_outputs`
 - `kBufferTypeNormals` / `kBufferTypeRoughness` → `m_normals_aov_outputs` / `m_roughness_aov_outputs`
 
-AOV textures are currently black (no HLSL writes them yet). Real G-buffer data will be written by the closest-hit shader in M7/M8:
+As of M7, the closest-hit shader writes real G-buffer data each frame:
 1. Diffuse base color (no lighting) → albedo UAV
-2. Specular/metallic color → specular albedo UAV
+2. Specular/metallic color (F0) → specular albedo UAV
 3. World-space geometric normal → normals UAV
 4. Perceptual roughness → roughness UAV (R8_UNORM)
 
@@ -552,29 +551,3 @@ WinMain
 ```
 
 ---
-
-## 21. Milestone Roadmap
-
-| Milestone | Description | Status |
-|---|---|---|
-| **M0** | Repo scaffold, CMake, third-party deps | ✅ Complete |
-| **M1** | D3D12 device init, swap chain, clear-color present | ✅ Complete |
-| **M2** | Multi-monitor display system | ✅ Complete |
-| **M3** | Asset pipeline: load FBX/glTF, upload to GPU | ✅ Complete |
-| **M4** | DXR pipeline: primary rays, basic PBR hit shader | ✅ Complete |
-| **M5** | Scene file parser, static scene rendering | ✅ Complete |
-| **M6** | DLSS 4 integration (upscale, Multi Frame Generation, Ray Reconstruction) | ✅ Complete |
-| **M7** | ReSTIR DI — direct lighting with ray-traced shadows | 🔲 Not started |
-| **M8** | ReSTIR GI — multi-bounce global illumination | 🔲 Not started |
-| **M9** | Animation system + skeletal mesh rendering | 🔲 Not started |
-| **M10** | Ecosystem / vegetation + wind | 🔲 Not started |
-| **M11** | Particle system | 🔲 Not started |
-| **M12** | Weather system (rain, clouds, fog) | 🔲 Not started |
-| **M13** | Decal system (tire tracks, skid marks) | 🔲 Not started |
-| **M14** | Crowd rendering | 🔲 Not started |
-| **M15** | Debug overlay (dev-only: ImGui, PIX, Aftermath) | 🔲 Not started |
-| **M16** | Game UI system: MSDF fonts, widget tree, HUD | 🔲 Not started |
-| **M17** | Test app polish: hot reload, screenshots, gamepad | 🔲 Not started |
-| **M18** | Performance tuning, peak-brightness calibration, HDR display polish | 🔲 Not started |
-
-> **Note:** HDR swap chain support is a cross-cutting requirement implemented from **M1** onward — every `DisplayOutput` created in M1+ must support HDR10/scRGB with SDR fallback. M18 covers final calibration, per-display nit targets, and shipping-quality tone-map tuning.
