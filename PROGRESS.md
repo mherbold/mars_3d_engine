@@ -40,8 +40,9 @@ Multi-bounce GI implemented — `gi_bounce_count` in `FrameConstants` controls b
 | M14 | Crowd rendering | 🔲 Not started |
 | M15 | Debug overlay (dev-only: ImGui, PIX, Aftermath) | 🔲 Not started |
 | M16 | Game UI system: MSDF fonts, widget tree, HUD | 🔲 Not started |
-| M17 | Test app polish: hot reload, screenshots, gamepad | 🔲 Not started |
-| M18 | Performance tuning, peak-brightness calibration, HDR display polish | 🔲 Not started |
+| M17 | Displacement mapping: offline bake pipeline + NVIDIA DMM path | 🔲 Not started |
+| M18 | Test app polish: hot reload, screenshots, gamepad | 🔲 Not started |
+| M19 | Performance tuning, peak-brightness calibration, HDR display polish | 🔲 Not started |
 
 ---
 
@@ -222,14 +223,22 @@ Multi-bounce GI implemented — `gi_bounce_count` in `FrameConstants` controls b
 - 🔲 HDR-aware UI color pipeline (linear → tone map per display)
 - 🔲 Per-monitor DPI scaling support
 
-### M17 — Test App Polish
+### M17 — Displacement Mapping
+- 🔲 `DisplacementBaker` class: CPU mesh subdivision + height-map displacement along normals + MikkTSpace normal/tangent recompute
+- 🔲 Content-hash sidecar cache (`.displaced.bin`): skip bake on cache hit; re-bake only when source mesh or height map changes
+- 🔲 `AssetImporter` integration: detect `height_map` field in material descriptor, invoke `DisplacementBaker` before GPU upload
+- 🔲 PBR material descriptor extended: `height_map`, `displacement_scale`, `tessellation_factor` fields
+- 🔲 `.marsscene` schema updated to support new displacement material fields
+- 🔲 NVIDIA DMM detection + enhancement path *(deferred until baseline offline bake is validated)*
+
+### M18 — Test App Polish
 - 🔲 Hot-reload: `R` key reloads current scene without restart
 - 🔲 Screenshot: `F12` saves HDR EXR to working directory
 - 🔲 Gamepad support (XInput): analog steering, trigger accelerate/brake
 - 🔲 Orbit camera (`F` toggle between free-fly and locked orbit)
 - 🔲 Dev panel toggle with `~` key (ImGui, dev builds only)
 
-### M18 — Performance Tuning, HDR Calibration, Shipping Polish
+### M19 — Performance Tuning, HDR Calibration, Shipping Polish
 - 🔲 Per-display peak-brightness calibration (nits target)
 - 🔲 ACES tone-map tuning for HDR10 / scRGB / SDR paths
 - 🔲 `Repeated slDLSSGSetOptions()` call deduplication in `denoiser.cpp`

@@ -27,7 +27,8 @@
 17. [Reflection System](#17-reflection-system)
 18. [Debug & Profiling Overlay (Developer-Only)](#18-debug--profiling-overlay-developer-only)
 19. [Game UI System](#19-game-ui-system)
-20. [Test Application](#20-test-application)
+20. [Displacement Mapping](#20-displacement-mapping)
+21. [Test Application](#21-test-application)
 
 ---
 
@@ -533,7 +534,81 @@ engine/ui/
 
 ---
 
-## 20. Test Application (`mars_test_app`)
+## 20. Displacement Mapping
+
+### Overview
+Displacement mapping adds sub-millimeter surface detail (tire treads, track kerbs, cobblestones, terrain micro-detail) without authoring high-poly meshes. In a pure path-tracing engine, displaced geometry must exist as real triangles in the BLAS — there is no rasterization tessellation stage to exploit.
+
+### Strategy
+
+| Tier | Hardware | Approach | Runtime Cost |
+|---|---|---|---|
+| **Baseline** | All hardware (AMD RDNA 3/4 + NVIDIA RTX) | Offline bake: displace mesh vertices at asset import time using the height map, write a new pre-displaced mesh into the BLAS | Zero — treated as normal static geometry |
+| **Enhancement** | NVIDIA RTX 30/40/50 only | NVIDIA Displacement Micro-Maps (DMM) via `NV_displacement_micromap` DXR extension | Near-zero runtime; hardware-accelerated micro-triangle traversal |
+
+The **offline bake** is the cross-platform foundation and is sufficient for all static displaced geometry (track surfaces, terrain, kerbs, walls). The NVIDIA DMM path is an optional enhancement for maximum quality and performance on RTX hardware.
+
+### Offline Bake Pipeline (Baseline — All Hardware)
+
+```
+.marsscene model entry
+  → AssetImporter::import_mesh()          ← Assimp loads base mesh + height map path
+  → DisplacementBaker::bake()             ← CPU: subdivide + displace vertices along normals
+      ├── Subdivide mesh to target density (configurable tessellation factor per material)
+      ├── Sample height map (bicubic) at each new vertex UV
+      ├── Displace vertex position along interpolated normal by height × displacement_scale
+      └── Recompute normals + tangents (MikkTSpace) on displaced mesh
+  → GpuMeshBuffer (displaced mesh)        ← uploaded and registered in bindless heap as normal
+  → BLAS built from displaced GpuMeshBuffer
+```
+
+No runtime cost after import. Displaced meshes are cached to disk (`.displaced.bin` sidecar files) so baking only re-runs when the source mesh or height map changes (content hash check).
+
+### NVIDIA DMM Enhancement Path (RTX 30/40/50 Only)
+
+- Detected at runtime via `D3D12_FEATURE_DATA_D3D12_OPTIONS` + NVIDIA extension query
+- If available: `DisplacementBaker` emits an OMM/DMM micro-mesh structure instead of a fully-expanded triangle mesh; handed to the BLAS builder as `D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE` with the NV micro-map extension
+- Falls back transparently to the baseline baked mesh if DMM is not available
+
+### Material System Integration
+
+Height maps are a new optional entry in the PBR material descriptor:
+
+```json
+{
+  "material": {
+    "base_color":    "textures/track_albedo.dds",
+    "normal_map":    "textures/track_normal.dds",
+    "roughness_map": "textures/track_roughness.dds",
+    "height_map":    "textures/track_height.dds",
+    "displacement_scale": 0.05,
+    "tessellation_factor": 8
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `height_map` | string (path) | Greyscale R8 or R16 texture; mid-grey (0.5) = no displacement |
+| `displacement_scale` | float (metres) | Max displacement distance along surface normal |
+| `tessellation_factor` | int | Subdivision multiplier applied before baking (1 = no subdivision, 8 = 8× linear) |
+
+### Scope
+- Targets **static geometry only** (track surfaces, terrain, buildings, kerbs)
+- Dynamic/skinned meshes are excluded — BLAS refit on a heavily subdivided displaced mesh would be prohibitively expensive
+- Wind-deformed vegetation uses per-vertex bend (§10), not displacement
+
+### Key Tasks
+- [ ] `DisplacementBaker` class: CPU subdivide + normal-displaced vertex generation + MikkTSpace normal/tangent recompute
+- [ ] Height map cache: content-hash `.displaced.bin` sidecar; skip bake on cache hit
+- [ ] `AssetImporter` integration: detect `height_map` field in material, invoke `DisplacementBaker` before GPU upload
+- [ ] Material descriptor extended: `height_map`, `displacement_scale`, `tessellation_factor` fields
+- [ ] `.marsscene` schema updated to support the new material fields
+- [ ] NVIDIA DMM detection + enhancement path *(deferred until baseline is validated)*
+
+---
+
+## 21. Test Application (`mars_test_app`)
 
 ### Purpose
 A minimal Win32 host application to exercise the engine during development.
