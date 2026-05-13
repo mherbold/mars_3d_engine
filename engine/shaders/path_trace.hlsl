@@ -47,9 +47,9 @@ struct FrameConstants
     uint     specular_albedo_uav_slot;
     uint     normals_uav_slot;
     uint     roughness_uav_slot;
-    // ReSTIR GI (M8) — offset 304, registers 19..19
+    // GI bounce control (M8+) — offset 304, registers 19..19
     uint     gi_reservoir_uav_slot;   // bindless UAV slot for GIReservoir structured buffer
-    uint     gi_enabled;              // 1 = trace secondary GI ray in ClosestHit
+    uint     gi_bounce_count;         // 0=off, 1=single-bounce, 2=two-bounce, …
     // padding — offset 312, registers 20..20
     uint     _pad_gi0;
     uint     _pad_gi1;
@@ -88,9 +88,10 @@ struct PrimaryPayload
 {
     float3 radiance;
     float  hit_t;
-    uint   missed;      // 1 = missed, 0 = hit (bool unreliable in DXR payloads)
-    uint   depth;       // 0 = primary ray, 1 = secondary GI ray (no further recursion)
-    float3 sec_normal;  // world-space shading normal at the secondary hit (depth-1 only)
+    uint   missed;       // 1 = missed, 0 = hit (bool unreliable in DXR payloads)
+    uint   depth;        // 0 = primary, 1+ = GI bounce index
+    float3 throughput;   // accumulated path throughput (product of BRDF/pdf weights so far)
+    float3 sec_normal;   // world-space shading normal at this hit (used by the calling bounce)
 };
 
 struct ShadowPayload
@@ -280,6 +281,7 @@ void RayGen()
     payload.hit_t      = -1.0f;
     payload.missed     = 0u;
     payload.depth      = 0u;
+    payload.throughput = float3(1, 1, 1);
     payload.sec_normal = float3(0, 1, 0);
 
     TraceRay(g_TLAS[g_Frame.tlas_slot],
@@ -424,7 +426,8 @@ void Miss(inout PrimaryPayload payload)
                  : onGrid  ? float3(0.0f, 0.0f, 0.0f)
                  : faceColor;
 
-    payload.radiance = color;
+    // At GI depth > 0 the sky radiance must be weighted by the accumulated throughput.
+    payload.radiance = (payload.depth > 0u) ? color * payload.throughput : color;
     payload.hit_t    = -1.0f;
     payload.missed   = 1u;
 }
@@ -551,20 +554,43 @@ void ClosestHit(inout PrimaryPayload payload, in BuiltInTriangleIntersectionAttr
     }
     float3 directLight = ReservoirShade(N, V, baseColor, metallic, roughness, res, visible);
 
-    // ---- GI — single-bounce BRDF-importance-sampled Monte Carlo ----------------
-    // For diffuse surfaces: cosine-hemisphere sampling (pdf = NdotL/PI).
-    // For specular/metallic surfaces: GGX VNDF sampling so that mirror-like and
-    // glossy reflections are captured correctly.
-    // We select between the two lobes probabilistically (MIS one-sample model):
-    //   p_spec = luminance of the Fresnel-weighted specular albedo / total albedo
-    //   p_diff = 1 - p_spec
-    // The chosen direction is traced and the estimator weight is BRDF / pdf.
-    // DLSS-RR temporally accumulates the noisy 1-spp result.
+    // ---- GI — multi-bounce BRDF-importance-sampled Monte Carlo ----------------
+    // Supports 1..N bounces controlled by g_Frame.gi_bounce_count.
+    // Each bounce:
+    //   1. Sample a direction from the BRDF lobe (specular GGX VNDF or diffuse cosine-hemisphere).
+    //   2. Accumulate throughput weight: throughput *= BRDF(x,wo,wi) / pdf
+    //   3. Trace a secondary ray and recurse (payload.depth increments).
+    //   4. Russian Roulette at depth >= 1: terminate with probability 1 - max_component(throughput).
+    //
+    // AOV G-buffer writes and shadow rays only happen at depth 0.
+    // At depth >= 1 we use unshadowed direct lighting to stay within the recursion budget.
+    //
+    // The incoming payload.throughput carries the accumulated weight from all prior bounces.
+    // This hit's radiance contribution is scaled by that throughput before being returned.
 
     float3 giContrib = float3(0, 0, 0);
 
-    if (g_Frame.gi_enabled != 0u && payload.depth == 0u)
+    if (g_Frame.gi_bounce_count > 0u && payload.depth < g_Frame.gi_bounce_count)
     {
+        // --- Russian Roulette (skip on first GI bounce to preserve energy) -------
+        float rrSurvive = 1.0f;
+        if (payload.depth >= 1u)
+        {
+            float maxThroughput = max(payload.throughput.r,
+                                  max(payload.throughput.g, payload.throughput.b));
+            rrSurvive = saturate(maxThroughput);
+            float rrRand = PcgRand(rng);
+            if (rrRand >= rrSurvive)
+            {
+                // Path terminated — no GI contribution from this bounce onward.
+                payload.radiance   = (directLight + emissive) * payload.throughput;
+                payload.hit_t      = RayTCurrent();
+                payload.missed     = 0u;
+                payload.sec_normal = N;
+                return;
+            }
+        }
+
         // --- Decide which lobe to sample -----------------------------------
         float3 F0      = lerp(float3(0.04f, 0.04f, 0.04f), baseColor, metallic);
         float  NdotV_g = saturate(dot(N, V));
@@ -585,7 +611,6 @@ void ClosestHit(inout PrimaryPayload payload, in BuiltInTriangleIntersectionAttr
         if (u0 < p_spec)
         {
             // --- Specular lobe: GGX VNDF importance sampling ---------------
-            // Transform V into the tangent-space frame (T, B, N).
             float3 T = normalize(worldTangent);
             float3 B = normalize(worldBitangent);
             float3 V_local = float3(dot(V, T), dot(V, B), dot(V, N));
@@ -595,18 +620,16 @@ void ClosestHit(inout PrimaryPayload payload, in BuiltInTriangleIntersectionAttr
 
             secDir = reflect(-V, H_world);
 
-            // GGX VNDF pdf for the sampled half-vector, converted to solid-angle pdf for L.
-            // pdf_L = D_visible(H) / (4 * dot(V, H))
-            float NdotH = saturate(dot(N, H_world));
-            float VdotH = saturate(dot(V, H_world));
-            float alpha = roughness * roughness;
-            float alpha2 = alpha * alpha;
-            float denom  = NdotH * NdotH * (alpha2 - 1.0f) + 1.0f;
-            float D      = alpha2 / (PI * denom * denom);
+            float NdotH   = saturate(dot(N, H_world));
+            float VdotH   = saturate(dot(V, H_world));
+            float alpha   = roughness * roughness;
+            float alpha2  = alpha * alpha;
+            float denom   = NdotH * NdotH * (alpha2 - 1.0f) + 1.0f;
+            float D       = alpha2 / (PI * denom * denom);
             float NdotV_l = saturate(dot(N, V));
             float lambdaV = NdotV_l + sqrt(alpha2 + (1.0f - alpha2) * NdotV_l * NdotV_l);
-            float G1V    = 2.0f * NdotV_l / max(lambdaV, 1e-6f);
-            float D_vis  = D * G1V / max(2.0f * NdotV_l, 1e-6f);
+            float G1V     = 2.0f * NdotV_l / max(lambdaV, 1e-6f);
+            float D_vis   = D * G1V / max(2.0f * NdotV_l, 1e-6f);
             pdf = p_spec * D_vis / max(4.0f * VdotH, 1e-6f);
         }
         else
@@ -621,6 +644,11 @@ void ClosestHit(inout PrimaryPayload payload, in BuiltInTriangleIntersectionAttr
 
         if (pdf > 1e-6f && NdotL_sec > 0.0f)
         {
+            // Compute BRDF weight for this bounce and accumulate into throughput.
+            float3 brdfVal     = EvaluatePBR(baseColor, metallic, roughness, N, V, secDir);
+            // EvaluatePBR already multiplies by NdotL, so weight = brdf / pdf.
+            float3 bounceWeight = brdfVal / (pdf * rrSurvive);
+
             RayDesc secRay;
             secRay.Origin    = worldPos + N * 1e-3f;
             secRay.Direction = secDir;
@@ -631,7 +659,8 @@ void ClosestHit(inout PrimaryPayload payload, in BuiltInTriangleIntersectionAttr
             secPayload.radiance   = float3(0, 0, 0);
             secPayload.hit_t      = -1.0f;
             secPayload.missed     = 0u;
-            secPayload.depth      = 1u;
+            secPayload.depth      = payload.depth + 1u;
+            secPayload.throughput = payload.throughput * bounceWeight;
             secPayload.sec_normal = float3(0, 1, 0);
 
             TraceRay(g_TLAS[g_Frame.tlas_slot],
@@ -639,16 +668,22 @@ void ClosestHit(inout PrimaryPayload payload, in BuiltInTriangleIntersectionAttr
                      0u,
                      secRay, secPayload);
 
-            float3 Lo      = secPayload.radiance;
-            float3 brdfVal = EvaluatePBR(baseColor, metallic, roughness, N, V, secDir);
-            // Estimator: BRDF(x,wi,wo) * Li / pdf  — EvaluatePBR includes NdotL
-            giContrib = (brdfVal / pdf) * Lo;
+            // The secondary hit already scaled its radiance by its own throughput.
+            // We add it directly — the current bounce's bounceWeight is folded into
+            // secPayload.throughput, so no extra multiply here.
+            giContrib = secPayload.radiance;
         }
     }
 
-    payload.radiance   = directLight + giContrib + emissive;
+    // At GI depth > 0 the radiance returned to the parent bounce is the local
+    // direct lighting scaled by the accumulated throughput. The parent accumulates
+    // that as its giContrib (which is already weighted by prior throughput).
+    float3 localRadiance = directLight + giContrib + emissive;
+    if (payload.depth > 0u)
+        localRadiance *= payload.throughput;
+
+    payload.radiance   = localRadiance;
     payload.hit_t      = RayTCurrent();
     payload.missed     = 0u;
-    payload.sec_normal = N;  // depth-1 callers use this as the secondary hit normal for GI reservoirs
+    payload.sec_normal = N;
 }
-

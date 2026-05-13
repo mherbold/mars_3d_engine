@@ -208,8 +208,9 @@ public:
     // Element count = output_width * output_height * 2 (two ping-pong layers).
     ID3D12Resource* gi_reservoir_resource(uint32_t output_index) const;
 
-    // Enable or disable secondary GI ray tracing (default: enabled).
-    void set_gi_enabled(bool enabled) { m_gi_enabled = enabled; }
+    // Set the number of GI bounces (0 = off, 1 = single bounce, 2 = two bounces, …).
+    // Default is 1. Set to 2 for richer color bleeding and inter-reflection.
+    void set_gi_bounce_count(uint32_t count) { m_gi_bounce_count = count; }
 
 private:
     // --- Helpers -------------------------------------------------------------
@@ -310,7 +311,7 @@ private:
 
     // --- Per-output GI reservoir structured buffers (M8) --------------------
     // Element count = width * height * 2  (ping-pong layers 0 and 1).
-    // Written by path_trace.hlsl ClosestHit when gi_enabled = 1.
+    // Written by path_trace.hlsl ClosestHit when gi_bounce_count > 0.
     struct GIBuffer
     {
         D3D12MA::Allocation* alloc    = nullptr;
@@ -321,7 +322,7 @@ private:
     };
     std::vector<GIBuffer> m_gi_reservoir_buffers;
 
-    bool m_gi_enabled = true;  // passed to FrameConstants::gi_enabled each frame
+    uint32_t m_gi_bounce_count = 1;  // passed to FrameConstants::gi_bounce_count each frame
 
     // --- Per-frame constant buffer ring --------------------------------------
     // One upload buffer per output × k_frame_count slots.

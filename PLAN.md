@@ -204,7 +204,7 @@ engine/shaders/
 | Feature | Algorithm |
 |---|---|
 | Direct lighting | ReSTIR DI (Spatiotemporal Reservoir Resampling) |
-| Global illumination | ReSTIR GI |
+| Global illumination | BRDF-importance-sampled MC path tracing with configurable bounce depth (`gi_bounce_count`); Russian Roulette termination; DLSS-RR denoise |
 | Sky model | Hillaire 2020 Physically-Based Atmospheric Scattering |
 | BRDF | Disney Principled PBR / GGX + Smith |
 | Anti-aliasing / upscale | DLSS 4 Super Resolution — Transformer model (RTX 40/50 series); FSR 4 / FSR 3 as AMD fallback |
@@ -408,7 +408,7 @@ Meshes are stored as interleaved vertex buffers (position | normal | tangent | u
 | Area lights | Direct area-light sampling via NEE (surface-area sampling) + MIS weighting with BRDF lobe; handled naturally by the path tracer — no LTC approximation needed |
 | Emissive surfaces | Sampled as lights via power-proportional selection |
 | Sky / IBL | Importance-sampled HDRI or physical sky |
-| Global illumination | ReSTIR GI (multi-bounce path tracing) |
+| Global illumination | BRDF-importance-sampled MC path tracing (`gi_bounce_count`=1 default, 2 for richer inter-reflection; reservoir reuse deferred) |
 | Shadow bias | Ray offset along geometric normal (no shadow maps) |
 
 All shadows are ray-traced — no shadow maps, no cascades, no baked lightmaps.

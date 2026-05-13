@@ -34,7 +34,7 @@ namespace mars
 //   offset 208 : sun_color (12) + _pad0 (4)
 //   offset 224 : prev_view_proj (64)
 //   offset 288 : albedo_uav_slot (4) + specular_albedo_uav_slot (4) + normals_uav_slot (4) + roughness_uav_slot (4)
-//   offset 304 : gi_reservoir_uav_slot (4) + gi_enabled (4)
+//   offset 304 : gi_reservoir_uav_slot (4) + gi_bounce_count (4)
 //   offset 312 : _pad_gi0 (4) + _pad_gi1 (4)  — align to 16-byte boundary
 //   offset 320 : view_proj (64)
 //   offset 384 : _pad[32] — 128 bytes padding to reach 512
@@ -75,9 +75,9 @@ struct FrameConstants
     uint32_t normals_uav_slot         = UINT32_MAX; //   4 bytes  (offset 296)
     uint32_t roughness_uav_slot       = UINT32_MAX; //   4 bytes  (offset 300)
 
-    // ReSTIR GI (M8)
+    // GI bounce control (M8+)
     uint32_t gi_reservoir_uav_slot    = UINT32_MAX; //   4 bytes  (offset 304) — structured buffer UAV
-    uint32_t gi_enabled               = 0;          //   4 bytes  (offset 308) — 1 = trace secondary rays
+    uint32_t gi_bounce_count          = 1;          //   4 bytes  (offset 308) — 0=off, 1=single-bounce, 2=two-bounce, …
 
     uint32_t _pad_gi0             = 0;             //   4 bytes  (offset 312) — align view_proj to 16-byte boundary
     uint32_t _pad_gi1             = 0;             //   4 bytes  (offset 316)

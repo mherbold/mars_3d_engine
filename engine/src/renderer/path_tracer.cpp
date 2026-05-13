@@ -487,15 +487,15 @@ void PathTracer::create_rtpso(DeviceContext& ctx)
     hg->SetHitGroupExport(L"HitGroup_Primary");
     hg->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
 
-    // Shader config: payload = float3 radiance + float hit_t + uint missed + uint depth + float3 sec_normal
+    // Shader config: payload = float3 radiance + float hit_t + uint missed + uint depth + float3 throughput + float3 sec_normal
     auto* shader_cfg = so_desc.CreateSubobject<CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT>();
     shader_cfg->Config(
-        sizeof(float) * 4 + sizeof(uint32_t) * 2 + sizeof(float) * 3, // payload size (36 bytes)
+        sizeof(float) * 4 + sizeof(uint32_t) * 2 + sizeof(float) * 6, // payload size (48 bytes)
         sizeof(float) * 2);                   // attribute size (barycentrics)
 
-    // Pipeline config: max recursion depth 2 (primary + shadow)
+    // Pipeline config: max recursion depth 3 (primary + up to 2 GI bounces; shadow is a separate non-recursive dispatch)
     auto* pipe_cfg = so_desc.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG_SUBOBJECT>();
-    pipe_cfg->Config(2);
+    pipe_cfg->Config(3);
 
     // Global root signature
     auto* grs = so_desc.CreateSubobject<CD3DX12_GLOBAL_ROOT_SIGNATURE_SUBOBJECT>();
@@ -1353,7 +1353,7 @@ void PathTracer::update_frame_constants(DeviceContext& ctx,
     fc.gi_reservoir_uav_slot    = (output_index < m_gi_reservoir_buffers.size())
                                       ? m_gi_reservoir_buffers[output_index].uav_slot
                                       : UINT32_MAX;
-    fc.gi_enabled               = m_gi_enabled ? 1u : 0u;
+    fc.gi_bounce_count          = m_gi_bounce_count;
     fc.sun_direction            = sun_direction;
     fc.sun_intensity            = sun_intensity;
     fc.sun_color                = sun_color;

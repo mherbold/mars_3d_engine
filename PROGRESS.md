@@ -3,7 +3,7 @@
 ---
 
 ## Current Focus
-DLSS-RR temporal stability fully resolved — motion vectors, depth buffer, and scaling are all correct. Camera strafing, tilting, and zooming now produce clean reprojection with no ghost trails, no bleed artifacts, and correct motion speed. Ready to continue with M9 (Animation System).
+Multi-bounce GI implemented — `gi_bounce_count` in `FrameConstants` controls bounce depth (0=off, 1=single-bounce, 2=two-bounce). RTPSO max recursion raised to 3; payload carries accumulated throughput; Russian Roulette terminates paths at depth >= 1. `PathTracer::set_gi_bounce_count()` is the public toggle. Default is 1 (same behaviour as before). Ready to validate and then continue with M9 (Animation System).
 
 ---
 
@@ -31,7 +31,7 @@ DLSS-RR temporal stability fully resolved — motion vectors, depth buffer, and 
 | M5 | Scene file parser, static scene rendering | ✅ | `SceneLoader` populates `Scene` with `SceneModelInstance`, `LightDesc`, `CameraDesc`, and `SkyboxDesc`. `FlyCamera` (WASD + mouse-look) lives in `camera.h` alongside `Camera`; it is the camera used by `test_app`. `Camera::advance_frame()` saves previous-frame matrices and applies Halton jitter for DLSS temporal accumulation. |
 | M6 | DLSS 4 integration (SR, RR, MFG) | ✅ | DLSS-RR temporal stability fully resolved post-M8: depth buffer corrected to NDC projected depth; motion vectors corrected to NDC space with proper sign, Y-flip, and scale; `cameraMotionIncluded = eTrue`; `clipToPrevClip` set to identity when MVs carry full camera motion. See Notes in AGENTS.md. |
 | M7 | ReSTIR DI + real G-buffer AOV writes | ✅ | FrameConstants extended with 4 AOV UAV slots; path_tracer.cpp root signature expanded (spaces 5–8); AOV textures allocated and filled each frame; ClosestHit writes real diffuse albedo / specular F0 / world normals / roughness to DLSS-RR G-buffer; ReSTIR DI direct lighting via RIS + shadow ray replaces the old flat NdotL; restir_di.hlsli contains shared reservoir math; DXR-dependent helpers (RIS_GenerateCandidates, ReservoirShade + shadow TraceRay) live in path_trace.hlsl; verified: dxc -T lib_6_3 compiles with -WX clean |
-| M8 | ReSTIR GI — multi-bounce global illumination | ✅ | GI implemented as single-bounce cosine-hemisphere MC estimator; reservoir-based temporal/spatial reuse was removed after debugging revealed multiple compounding bugs — see Notes. DLSS-RR denoises the 1-spp indirect signal. |
+| M8 | ReSTIR GI — multi-bounce global illumination | ✅ | GI implemented as BRDF-importance-sampled MC estimator with configurable bounce depth (`gi_bounce_count`; 0=off, 1=single, 2=two-bounce). Russian Roulette path termination at depth >= 1. RTPSO max recursion = 3. Reservoir-based temporal/spatial reuse removed after debugging — see Notes. DLSS-RR denoises the noisy indirect signal. |
 | M9 | Animation system + skeletal mesh rendering | 🔲 Not started |
 | M10 | Ecosystem / vegetation + wind | 🔲 Not started |
 | M11 | Particle system | 🔲 Not started |
@@ -140,6 +140,13 @@ DLSS-RR temporal stability fully resolved — motion vectors, depth buffer, and 
 - ✅ Spatial reuse pass: 4 jittered-offset neighbors from previous-frame layer merged, guarded by normal-similarity threshold (cos > 0.9)
 - ✅ Multi-bounce GI radiance (`giContrib`) composited into final `payload.radiance` alongside direct light and emissive
 - ✅ Reservoir temporal/spatial reuse removed; replaced with correct single-bounce MC estimator after reuse bugs caused brightness explosion and black indirect lighting
+- ✅ Multi-bounce path tracing: `gi_bounce_count` in `FrameConstants` (0=off, 1=single, 2=two-bounce, N=N-bounce)
+- ✅ `PrimaryPayload` extended with `throughput` field (accumulated BRDF/pdf weight across bounces)
+- ✅ Russian Roulette path termination at depth >= 1 (luminance of throughput as survival probability)
+- ✅ RTPSO max recursion depth raised from 2 to 3 (supports primary + 2 GI bounces)
+- ✅ Shadow rays remain depth-0 only; AOV G-buffer writes remain depth-0 only
+- ✅ Miss shader scales sky radiance by accumulated throughput at depth > 0
+- ✅ `PathTracer::set_gi_bounce_count(uint32_t)` public API; default = 1 (backward-compatible)
 
 ### M9 — Animation System + Skeletal Mesh Rendering
 - 🔲 CPU clip evaluation → bone palette
@@ -301,6 +308,7 @@ DLSS-RR temporal stability fully resolved — motion vectors, depth buffer, and 
 | **DLSS-RR temporal artifacts (ghosting, shimmer, blurring, trails) almost always have multiple compounding root causes.** The stable fix required aligning all of the following simultaneously: NDC depth (not ray distance), correct `proj * view` matrix order, proper previous-frame seeding, NDC motion vectors, Y-axis sign flip, `mvecScale = {0.5, 0.5}`, `cameraMotionIncluded = eTrue`, and identity `clipToPrevClip`. Fixing one in isolation often appeared to improve one artifact while creating a new one. Treat them as a single coherent contract, not independent knobs. |
 | **For DLSS-RR sky / background motion vectors, project a far-plane point (not `ray.Direction`).** Reconstruct a world-space far-plane point from the camera for each sky pixel: `worldPos = cameraPos + rayDir * far_plane_distance`. Project that through both `view_proj` and `prev_view_proj` to get a finite, well-scaled sky motion vector. Using raw `ray.Direction` or a constant produces incorrect sky reprojection during camera rotation or zoom. |
 | **ReSTIR GI reuse should only be introduced on top of a confirmed, stable single-bounce MC baseline.** When reservoir reuse caused brightness explosions and black indirect lighting simultaneously, the safest resolution was to revert to the plain MC estimator and validate it in isolation before re-introducing any temporal state. The single-bounce estimator (`giContrib = brdf * Lo * pi / pdf`) is the correct starting point for all future reuse work. |
+| **Multi-bounce GI uses a throughput-accumulating payload, not per-bounce re-entry into the full ClosestHit logic.** `PrimaryPayload.throughput` carries the accumulated `BRDF/pdf` product. Each hit fires a secondary ray with `depth+1` and `throughput *= bounceWeight`. At depth >= 1, Russian Roulette (survival = `max_component(throughput)`) terminates paths stochastically. Shadow rays and AOV G-buffer writes remain depth-0 only. Miss shader scales sky radiance by `payload.throughput` at depth > 0. RTPSO max recursion is 3. The public toggle is `PathTracer::set_gi_bounce_count(uint32_t)` (0=off, 1=single-bounce default, 2=two-bounce). |
 | **Reflections (specular indirect) do not require a separate render pass or a dedicated milestone.** They emerge naturally from the single-bounce indirect path when the secondary-ray direction is sampled from the BRDF lobe (GGX VNDF for specular, cosine hemisphere for diffuse) rather than from a fixed cosine-hemisphere sampler. The key fix was switching the indirect sampler to BRDF importance sampling in `pbr_brdf.hlsli`. |
 
 ---
