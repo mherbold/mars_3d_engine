@@ -83,21 +83,25 @@ void Renderer::init_internal(const std::vector<DisplayConfig>& configs,
                            primary.width(), primary.height(),
                            output_count);
 
-        // Prime resize for all outputs
+        }
+
+        // Initialise Denoiser (DLSS 4) — after path tracer so resources are known.
+        // Denoiser must be initialised first so it can compute the DLSS render resolution.
+        // The path tracer is then resized to that render resolution; its denoised output
+        // texture is sized to the full display resolution (DLSS writes at display-res).
+        m_denoiser.init(m_device_ctx, output_count);
         for (uint32_t i = 0; i < output_count; ++i)
         {
             DisplayOutput& disp = m_display_manager.output(i);
-            m_path_tracer.resize_output(m_device_ctx, i, disp.width(), disp.height());
-        }
-    }
+            uint32_t dw = disp.width(), dh = disp.height();
+            m_denoiser.resize_output(i, dw, dh);
 
-    // Initialise Denoiser (DLSS 4) — after path tracer so resources are known.
-    m_denoiser.init(m_device_ctx, output_count);
-    for (uint32_t i = 0; i < output_count; ++i)
-    {
-        DisplayOutput& disp = m_display_manager.output(i);
-        m_denoiser.resize_output(i, disp.width(), disp.height());
-    }
+            uint32_t rw = dw, rh = dh;
+            m_denoiser.get_render_resolution(i, rw, rh);
+            // rw x rh  = render resolution  (DispatchRays, path-tracer UAVs)
+            // dw x dh  = display resolution (denoised output that DLSS upscales into)
+            m_path_tracer.resize_output(m_device_ctx, i, rw, rh, dw, dh);
+        }
 
     // Initialise per-output camera state list
     m_cameras.resize(output_count);
@@ -197,10 +201,20 @@ void Renderer::on_resize(uint32_t output_index, uint32_t width, uint32_t height)
 {
     m_device_ctx.flush_gpu();
     m_display_manager.resize(output_index, width, height);
-    if (m_path_tracer.is_initialised())
-        m_path_tracer.resize_output(m_device_ctx, output_index, width, height);
+
+    // Resize denoiser first so it can recompute the DLSS render resolution,
+    // then resize the path tracer to that render resolution (not the display
+    // resolution), so DispatchRays fills exactly the region DLSS will read.
     if (m_denoiser.is_initialised())
         m_denoiser.resize_output(output_index, width, height);
+
+    uint32_t rw = width, rh = height;
+    if (m_denoiser.is_initialised())
+        m_denoiser.get_render_resolution(output_index, rw, rh);
+
+    if (m_path_tracer.is_initialised())
+        m_path_tracer.resize_output(m_device_ctx, output_index, rw, rh, width, height);
+
     // DenoisedOutputUAV is recreated in COMMON state on resize.
     if (output_index < m_denoised_in_uav_state.size())
         m_denoised_in_uav_state[output_index] = false;
@@ -224,13 +238,28 @@ void Renderer::set_camera(uint32_t output_index,
 
     CameraState& cam = m_cameras[output_index];
 
-    // Compute current-frame view-projection from the previous frame's stored inverses
-    // (which are still the last committed values) so prev_view_proj stays one frame behind.
-    if (cam.view_inv.m[0][0] != 0.0f || cam.view_inv.m[1][1] != 0.0f) // not fresh default
+    // Compute proj * view (world→clip) — must match the shader convention mul(view_proj, pos).
+    Mat4x4 curr_view = view_inv.inverse();
+    Mat4x4 curr_proj = proj_inv.inverse();
+    Mat4x4 curr_view_proj = curr_proj * curr_view;
+
+    // Save previous-frame matrices before overwriting.
+    // On the very first call (prev_view_proj is still zero), seed it with the
+    // current VP so frame 0 produces zero motion vectors instead of garbage.
+    bool is_first_frame = (cam.view_inv.m[0][0] == 0.0f && cam.view_inv.m[1][1] == 0.0f);
+    if (is_first_frame)
+    {
+        cam.prev_view_proj = curr_view_proj;
+        cam.prev_view_inv  = view_inv;
+        cam.prev_proj_inv  = proj_inv;
+    }
+    else
     {
         Mat4x4 prev_view = cam.view_inv.inverse();
         Mat4x4 prev_proj = cam.proj_inv.inverse();
-        cam.prev_view_proj = prev_view * prev_proj;
+        cam.prev_view_proj = prev_proj * prev_view;
+        cam.prev_view_inv  = cam.view_inv;
+        cam.prev_proj_inv  = cam.proj_inv;
     }
 
     cam.position = position;
@@ -319,8 +348,8 @@ bool Renderer::load_scene(const std::string& marsscene_path)
         {
             uint32_t blas_idx = blas_base_index[inst.model_index] + mi;
 
-            // Material: use a per-mesh material entry (white for now; extend when
-            // proper material data is plumbed through ResourceManager)
+            // Material: start from model's own texture slots, then apply any
+            // per-instance override declared in the .marsscene file.
             uint32_t mat_idx = static_cast<uint32_t>(cpu_materials.size());
             {
                 CpuMaterialData mat{};
@@ -329,9 +358,38 @@ bool Renderer::load_scene(const std::string& marsscene_path)
                 mat.base_color_factor[2] = 0.8f;
                 mat.base_color_factor[3] = 1.0f;
                 mat.roughness_factor = 0.8f;
-                // If the model has a bound texture for this mesh, wire it in
+
+                // Apply model's own base-colour texture (if any)
                 if (mi < model.texture_slots.size() && model.texture_slots[mi] != UINT32_MAX)
                     mat.base_color_tex = model.texture_slots[mi];
+
+                // Apply per-instance material override from the scene file
+                const MaterialOverride& mo = inst.material_override;
+                if (mo.has_any())
+                {
+                    auto load_override_tex = [&](const std::string& path, bool srgb) -> uint32_t
+                    {
+                        if (path.empty()) return UINT32_MAX;
+                        return m_resource_mgr.load_texture(m_device_ctx, path, srgb);
+                    };
+
+                    uint32_t slot;
+                    if (slot = load_override_tex(mo.base_color_texture, true);         slot != UINT32_MAX) mat.base_color_tex           = slot;
+                    if (slot = load_override_tex(mo.normal_texture, false);             slot != UINT32_MAX) mat.normal_tex               = slot;
+                    if (slot = load_override_tex(mo.metallic_roughness_texture, false); slot != UINT32_MAX) mat.metallic_roughness_tex   = slot;
+                    if (slot = load_override_tex(mo.roughness_texture, false);          slot != UINT32_MAX) mat.metallic_roughness_tex   = slot;
+                    if (slot = load_override_tex(mo.occlusion_texture, false);          slot != UINT32_MAX) mat.metallic_roughness_tex   = slot;
+                    if (slot = load_override_tex(mo.emissive_texture, true);            slot != UINT32_MAX) mat.emissive_tex             = slot;
+
+                    if (mo.base_color_r >= 0.0f) mat.base_color_factor[0] = mo.base_color_r;
+                    if (mo.base_color_g >= 0.0f) mat.base_color_factor[1] = mo.base_color_g;
+                    if (mo.base_color_b >= 0.0f) mat.base_color_factor[2] = mo.base_color_b;
+                    if (mo.base_color_a >= 0.0f) mat.base_color_factor[3] = mo.base_color_a;
+                    if (mo.metallic_factor  >= 0.0f) mat.metallic_factor  = mo.metallic_factor;
+                    if (mo.roughness_factor >= 0.0f) mat.roughness_factor = mo.roughness_factor;
+                    if (mo.emissive_scale   >= 0.0f) mat.emissive_scale   = mo.emissive_scale;
+                }
+
                 cpu_materials.push_back(mat);
             }
 
@@ -533,6 +591,7 @@ void Renderer::render_frame_path_traced()
             rr_evaluated = m_denoiser.evaluate_dlss_rr(
                                         m_cmd_list.Get(), oi, m_frame_index,
                                         view, cam.view_inv, proj,
+                                        cam.prev_view_inv, cam.prev_proj_inv,
                                         0.0f, 0.0f, rw, rh, dw, dh);
             if (!m_denoiser.dlss_rr_supported())
             {

@@ -65,4 +65,45 @@ struct SkyboxDesc
     std::string hdri_path;                           // used when type == HDRI
 };
 
+// =============================================================================
+// MaterialOverride â€" per-instance material override specified in .marsscene
+//
+// Any field left at its default (empty string / negative factor) means "use
+// whatever the model's own material provides".  Set a path to replace that
+// texture slot; set a factor >= 0 to replace the scalar factor.
+// =============================================================================
+struct MaterialOverride
+{
+    // Texture path overrides (empty = no override)
+    std::string base_color_texture;
+    std::string normal_texture;
+    std::string metallic_roughness_texture;
+    std::string roughness_texture;       // single-channel roughness (no metallic)
+    std::string occlusion_texture;
+    std::string emissive_texture;
+
+    // Scalar factor overrides (negative = no override, use model default)
+    float base_color_r    = -1.0f;
+    float base_color_g    = -1.0f;
+    float base_color_b    = -1.0f;
+    float base_color_a    = -1.0f;
+    float metallic_factor = -1.0f;
+    float roughness_factor= -1.0f;
+    float emissive_scale  = -1.0f;
+
+    bool has_any() const
+    {
+        return !base_color_texture.empty()
+            || !normal_texture.empty()
+            || !metallic_roughness_texture.empty()
+            || !roughness_texture.empty()
+            || !occlusion_texture.empty()
+            || !emissive_texture.empty()
+            || base_color_r    >= 0.0f
+            || metallic_factor >= 0.0f
+            || roughness_factor>= 0.0f
+            || emissive_scale  >= 0.0f;
+    }
+};
+
 } // namespace mars

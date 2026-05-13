@@ -238,6 +238,17 @@ As of M7, the closest-hit shader writes real G-buffer data each frame:
 3. World-space geometric normal → normals UAV
 4. Perceptual roughness → roughness UAV (R8_UNORM)
 
+### DLSS-RR Temporal Contract (established M6, validated post-M8)
+The following invariants must be maintained for artifact-free DLSS-RR output:
+- `kBufferTypeDepth` contains NDC projected depth: `saturate(clip.z / clip.w)`. Never ray distance.
+- Motion vectors are NDC-space deltas (`prevNDC - currNDC`), Y-negated (screen-space convention), multiplied by `{0.5, 0.5}`. `mvecScale = {0.5f, 0.5f}`.
+- `cameraMotionIncluded = eTrue` — MVs encode full-scene motion (camera + objects).
+- `clipToPrevClip` and `prevClipToClip` are identity matrices when `cameraMotionIncluded = eTrue`.
+- `view_proj` uploaded to shaders is `proj * view` (column-vector convention).
+- `prev_view_proj` is seeded to the current VP on the very first frame to produce zero MVs on frame 0.
+- Path-tracer inputs (noisy color, MVs, depth, AOVs) are allocated at **render resolution**; denoised output is allocated at **display resolution**.
+- Sky/background pixels write motion vectors by projecting a far-plane world point through both `view_proj` and `prev_view_proj`.
+
 ---
 
 ## 7. Scene Management & File Format

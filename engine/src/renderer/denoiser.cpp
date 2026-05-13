@@ -378,6 +378,8 @@ bool Denoiser::evaluate_dlss_rr(void* cmd_buffer,
                                  const Mat4x4& view,
                                  const Mat4x4& view_inv,
                                  const Mat4x4& proj,
+                                 const Mat4x4& prev_view_inv,
+                                 const Mat4x4& prev_proj_inv,
                                  float jitter_x, float jitter_y,
                                  uint32_t render_width,
                                  uint32_t render_height,
@@ -387,6 +389,10 @@ bool Denoiser::evaluate_dlss_rr(void* cmd_buffer,
 #if MARS_HAS_STREAMLINE
     if (!m_initialised || !m_dlss_rr_supported) return false;
     (void)frame_index;
+    (void)prev_view_inv;
+    (void)prev_proj_inv;
+    (void)render_width;
+    (void)render_height;
 
     auto& out = m_outputs[output_index];
     if (!out.frame_token) return false;
@@ -409,26 +415,20 @@ bool Denoiser::evaluate_dlss_rr(void* cmd_buffer,
     //   row 3 = camera position (x,y,z)
     // proj is the standard D3D12 perspective matrix:
     //   m[0][0] = 1/(aspect*tan(vFOV/2)),  m[1][1] = 1/tan(vFOV/2)
-    Mat4x4 proj_inv = proj.inverse();
-
-    // clipToPrevClip: transforms from current clip to previous clip space.
-    // For a static camera (or first frame) this is identity.
-    // Identity is explicitly constructed — Streamline treats a zero-initialised
-    // sl::float4x4 as "not set" (invalid), which causes it to silently skip
-    // slEvaluateFeature, leaving DenoisedOutputUAV untouched while the
-    // post-evaluate Enhanced Barrier fires with LayoutBefore=UAV → crash.
-    sl::float4x4 sl_identity{};
-    sl_identity[0] = { 1.f, 0.f, 0.f, 0.f };
-    sl_identity[1] = { 0.f, 1.f, 0.f, 0.f };
-    sl_identity[2] = { 0.f, 0.f, 1.f, 0.f };
-    sl_identity[3] = { 0.f, 0.f, 0.f, 1.f };
+    //
+    // cameraMotionIncluded = eTrue: motion vectors already encode full camera + object
+    // motion, so DLSS-RR uses them directly for reprojection. In this mode we must pass
+    // identity for clipToPrevClip/prevClipToClip — passing real transforms would cause
+    // DLSS-RR to apply camera reprojection a second time on top of the MVs, moving
+    // everything at 2x the correct speed.
+    Mat4x4 proj_inv  = proj.inverse();
+    Mat4x4 identity  = Mat4x4::identity();
 
     sl::Constants constants{};
     constants.cameraViewToClip = to_sl(proj);
     constants.clipToCameraView = to_sl(proj_inv);
-    // clipToPrevClip / prevClipToClip — both identity for a static camera.
-    constants.clipToPrevClip = sl_identity;
-    constants.prevClipToClip = sl_identity;
+    constants.clipToPrevClip   = to_sl(identity);
+    constants.prevClipToClip   = to_sl(identity);
 
     // Camera position and orientation derived from view_inv (camera-to-world).
     constants.cameraPos   = { view_inv.m[3][0], view_inv.m[3][1], view_inv.m[3][2] };
@@ -449,15 +449,17 @@ bool Denoiser::evaluate_dlss_rr(void* cmd_buffer,
     constants.motionVectorsInvalidValue = 1e8f;
 
     constants.jitterOffset       = sl::float2{ jitter_x, jitter_y };
-    // mvecScale converts from pixel-space motion vectors to NDC (our shader writes pixel deltas).
-    constants.mvecScale = sl::float2{
-        1.0f / static_cast<float>(render_width),
-        1.0f / static_cast<float>(render_height)
-    };
+    // Motion vectors are written as (prevNDC - currNDC) where NDC spans [-1,+1] (2 units).
+    // DLSS-RR expects values in normalized screen space where 1.0 = full screen width.
+    // NDC spans 2 units for a full-screen displacement, so scale by 0.5 to convert.
+    constants.mvecScale = sl::float2{ 0.5f, 0.5f };
     constants.depthInverted        = sl::Boolean::eFalse;
     constants.cameraNear           = 0.1f;
     constants.cameraFar            = 100000.0f;
-    constants.cameraMotionIncluded = sl::Boolean::eFalse;
+    // Motion vectors written by the path tracer include full camera + object motion
+    // (pixel-space displacement from previous to current frame for each hit point).
+    // eTrue tells DLSS-RR to use them directly for reprojection.
+    constants.cameraMotionIncluded = sl::Boolean::eTrue;
     constants.motionVectors3D      = sl::Boolean::eFalse;
     constants.reset                = sl::Boolean::eFalse;
     slSetConstants(constants, *out.frame_token, out.viewport);
@@ -470,6 +472,7 @@ bool Denoiser::evaluate_dlss_rr(void* cmd_buffer,
 #else
     (void)cmd_buffer; (void)output_index; (void)frame_index;
     (void)view; (void)view_inv; (void)proj;
+    (void)prev_view_inv; (void)prev_proj_inv;
     (void)jitter_x; (void)jitter_y;
     (void)render_width; (void)render_height;
     (void)display_width; (void)display_height;

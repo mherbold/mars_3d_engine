@@ -26,9 +26,10 @@ class SceneLoader;
 // =============================================================================
 struct SceneModelInstance
 {
-    uint32_t  model_index = UINT32_MAX; // index into ResourceManager::m_models
-    Transform transform   = {};
-    std::string name;
+    uint32_t         model_index       = UINT32_MAX; // index into ResourceManager::m_models
+    Transform        transform         = {};
+    std::string      name;
+    MaterialOverride material_override = {};          // optional per-instance material override
 };
 
 // =============================================================================

@@ -1,103 +1,167 @@
 {
-    "scene": {
-        "name": "Test Scene (M5)"
+  "scene": {
+    "name": "Test Scene (M5)"
+  },
+  "skybox": {
+    "type": "physical",
+    "sun_direction": [ 0.5, 0.5, 0.5 ],
+    "sun_color": [ 1.0, 0.95, 0.85 ],
+    "sun_intensity": 5.0
+  },
+  "cameras": [
+    {
+      "id": "main",
+      "position": [ 0.0, 1.5, 5.0 ],
+      "target": [ 0.0, 0.5, 0.0 ],
+      "fov_deg": 90.0,
+      "near_z": 0.1,
+      "far_z": 10000.0
+    }
+  ],
+  "lights": [
+    {
+      "name": "Sun",
+      "type": "directional",
+      "direction": [ 0.5, 0.5, 0.5 ],
+      "color": [ 1.0, 0.95, 0.85 ],
+      "intensity": 5.0
+    }
+  ],
+  "models": [
+    {
+      "id": "ground_plane",
+      "file": "models/ground_plane.obj",
+      "transform": {
+        "position": [ 0.0, 0.0, 0.0 ]
+      }
     },
-    "skybox": {
-        "type": "physical",
-        "sun_direction": [ 0.3, 0.5, 0.5 ],
-        "sun_color":     [ 1.0, 0.95, 0.85 ],
-        "sun_intensity": 5.0
+    {
+      "id": "box_center",
+      "file": "models/box.obj",
+      "transform": {
+        "position": [ 0.0, 0.5, 0.0 ],
+        "scale": 1.0
+      },
+      "material": {
+        "base_color_texture": "models/textures/Metal048A_2K-PNG_Color.png",
+        "normal_texture": "models/textures/Metal048A_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/Metal048A_2K-PNG_Roughness.png",
+        "metallic_roughness_texture": "models/textures/Metal048A_2K-PNG_Metalness.png",
+        "metallic_factor": 1.0,
+        "roughness_factor": 0.3
+      }
     },
-    "cameras": [
-        {
-            "id": "main",
-            "position": [ 0.0, 1.5, 5.0 ],
-            "target":   [ 0.0, 0.5, 0.0 ],
-            "fov_deg":  90.0,
-            "near_z":   0.1,
-            "far_z":    10000.0
-        }
-    ],
-    "lights": [
-        {
-            "name": "Sun",
-            "type": "directional",
-            "direction": [ 0.3, 0.5, 0.5 ],
-            "color":     [ 1.0, 0.95, 0.85 ],
-            "intensity": 5.0
-        }
-    ],
-    "models": [
-        {
-            "id": "ground_plane",
-            "file": "models/ground_plane.obj",
-            "transform": {
-                "position": [ 0.0, 0.0, 0.0 ]
-            }
-        },
-        {
-            "id": "box_center",
-            "file": "models/box.obj",
-            "transform": {
-                "position": [ 0.0, 0.5, 0.0 ],
-                "scale": 1.0
-            }
-        },
-        {
-            "id": "box_left",
-            "file": "models/box.obj",
-            "transform": {
-                "position": [ -2.5, 0.75, -1.0 ],
-                "scale": 1.5
-            }
-        },
-        {
-            "id": "box_right",
-            "file": "models/box.obj",
-            "transform": {
-                "position": [ 2.5, 0.4, 1.0 ],
-                "scale": 0.8
-            }
-        },
-        {
-            "id": "box_back_left",
-            "file": "models/box.obj",
-            "transform": {
-                "position": [ -3.5, 1.0, -5.0 ],
-                "scale": 2.0
-            }
-        },
-        {
-            "id": "box_back_right",
-            "file": "models/box.obj",
-            "transform": {
-                "position": [ 3.0, 0.5, -4.0 ],
-                "scale": 1.0
-            }
-        },
-        {
-            "id": "pyramid_left",
-            "file": "models/pyramid.obj",
-            "transform": {
-                "position": [ -1.5, 0.0, -3.0 ],
-                "scale": 1.5
-            }
-        },
-        {
-            "id": "pyramid_right",
-            "file": "models/pyramid.obj",
-            "transform": {
-                "position": [ 2.0, 0.0, -2.0 ],
-                "scale": 2.0
-            }
-        },
-        {
-            "id": "pyramid_far",
-            "file": "models/pyramid.obj",
-            "transform": {
-                "position": [ 0.5, 0.0, -7.0 ],
-                "scale": 3.0
-            }
-        }
-    ]
+    {
+      "id": "box_left",
+      "enabled": true,
+      "file": "models/box.obj",
+      "transform": {
+        "position": [ -2.0, 0.5, 0.0 ],
+        "scale": 1.0
+      },
+      "material": {
+        "base_color_texture": "models/textures/Bricks070_2K-PNG_Color.png",
+        "normal_texture": "models/textures/Bricks070_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/Bricks070_2K-PNG_Roughness.png",
+        "occlusion_texture": "models/textures/Bricks070_2K-PNG_AmbientOcclusion.png",
+        "roughness_factor": 0.9
+      }
+    },
+    {
+      "id": "box_right",
+      "enabled": true,
+      "file": "models/box.obj",
+      "transform": {
+        "position": [ 2.0, 0.5, 0.0 ],
+        "scale": 1.0
+      },
+      "material": {
+        "base_color_texture": "models/textures/Tiles099_2K-PNG_Color.png",
+        "normal_texture": "models/textures/Tiles099_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/Tiles099_2K-PNG_Roughness.png",
+        "occlusion_texture": "models/textures/Tiles099_2K-PNG_AmbientOcclusion.png",
+        "roughness_factor": 0.7
+      }
+    },
+    {
+      "id": "box_far_left",
+      "enabled": true,
+      "file": "models/box.obj",
+      "transform": {
+        "position": [ -4.0, 0.5, 0.0 ],
+        "scale": 1.0
+      },
+      "material": {
+        "base_color_texture": "models/textures/Metal053C_2K-PNG_Color.png",
+        "normal_texture": "models/textures/Metal053C_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/Metal053C_2K-PNG_Roughness.png",
+        "metallic_roughness_texture": "models/textures/Metal053C_2K-PNG_Metalness.png",
+        "metallic_factor": 1.0,
+        "roughness_factor": 0.5
+      }
+    },
+    {
+      "id": "box_far_right",
+      "enabled": true,
+      "file": "models/box.obj",
+      "transform": {
+        "position": [ 4.0, 0.5, 0.0 ],
+        "scale": 1.0
+      },
+      "material": {
+        "base_color_texture": "models/textures/Metal054B_2K-PNG_Color.png",
+        "normal_texture": "models/textures/Metal054B_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/Metal054B_2K-PNG_Roughness.png",
+        "metallic_roughness_texture": "models/textures/Metal054B_2K-PNG_Metalness.png",
+        "metallic_factor": 1.0,
+        "roughness_factor": 0.4
+      }
+    },
+    {
+      "id": "pyramid_center",
+      "enabled": true,
+      "file": "models/pyramid.obj",
+      "transform": {
+        "position": [ 0.0, 0.0, -3.0 ],
+        "scale": 1.5
+      },
+      "material": {
+        "base_color_texture": "models/textures/Marble016_2K-PNG_Color.png",
+        "normal_texture": "models/textures/Marble016_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/Marble016_2K-PNG_Roughness.png",
+        "roughness_factor": 0.3
+      }
+    },
+    {
+      "id": "pyramid_left",
+      "enabled": true,
+      "file": "models/pyramid.obj",
+      "transform": {
+        "position": [ -2.0, 0.0, -3.0 ],
+        "scale": 1.5
+      },
+      "material": {
+        "base_color_texture": "models/textures/Marble022_2K-PNG_Color.png",
+        "normal_texture": "models/textures/Marble022_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/Marble022_2K-PNG_Roughness.png",
+        "roughness_factor": 0.4
+      }
+    },
+    {
+      "id": "pyramid_right",
+      "enabled": true,
+      "file": "models/pyramid.obj",
+      "transform": {
+        "position": [ 2.0, 0.0, -3.0 ],
+        "scale": 1.5
+      },
+      "material": {
+        "base_color_texture": "models/textures/PavingStones048_2K-PNG_Color.png",
+        "normal_texture": "models/textures/PavingStones048_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/PavingStones048_2K-PNG_Roughness.png",
+        "occlusion_texture": "models/textures/PavingStones048_2K-PNG_AmbientOcclusion.png",
+        "roughness_factor": 0.8
+      }
+    }
+  ]
 }

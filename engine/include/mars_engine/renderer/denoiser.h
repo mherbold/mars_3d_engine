@@ -138,6 +138,8 @@ public:
                           const Mat4x4& view,
                           const Mat4x4& view_inv,
                           const Mat4x4& proj,
+                          const Mat4x4& prev_view_inv,
+                          const Mat4x4& prev_proj_inv,
                           float jitter_x, float jitter_y,
                           uint32_t render_width,
                           uint32_t render_height,

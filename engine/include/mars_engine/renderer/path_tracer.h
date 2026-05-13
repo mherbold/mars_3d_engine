@@ -165,9 +165,14 @@ public:
                              bool use_denoised = false);
 
     // Resize the UAV texture for a given output (e.g. on WM_SIZE).
+    // new_width/new_height     — render resolution (DLSS internal, e.g. 853x480).
+    // display_width/height     — display resolution written by DLSS into the
+    //                           denoised output (e.g. 1280x720).  Pass 0 to use
+    //                           the same dimensions as the render resolution.
     void resize_output(DeviceContext& ctx,
                        uint32_t output_index,
-                       uint32_t new_width, uint32_t new_height);
+                       uint32_t new_width, uint32_t new_height,
+                       uint32_t display_width = 0, uint32_t display_height = 0);
 
     // ---- Accessors ----------------------------------------------------------
     bool     is_initialised() const { return m_initialised; }
@@ -198,6 +203,13 @@ public:
     ID3D12Resource* specular_albedo_resource(uint32_t output_index) const;
     ID3D12Resource* normals_aov_resource(uint32_t output_index)     const;
     ID3D12Resource* roughness_aov_resource(uint32_t output_index)   const;
+
+    // Returns the GI reservoir structured buffer resource for a given output.
+    // Element count = output_width * output_height * 2 (two ping-pong layers).
+    ID3D12Resource* gi_reservoir_resource(uint32_t output_index) const;
+
+    // Enable or disable secondary GI ray tracing (default: enabled).
+    void set_gi_enabled(bool enabled) { m_gi_enabled = enabled; }
 
 private:
     // --- Helpers -------------------------------------------------------------
@@ -295,6 +307,21 @@ private:
     std::vector<OutputTexture> m_specular_albedo_outputs;
     std::vector<OutputTexture> m_normals_aov_outputs;
     std::vector<OutputTexture> m_roughness_aov_outputs;
+
+    // --- Per-output GI reservoir structured buffers (M8) --------------------
+    // Element count = width * height * 2  (ping-pong layers 0 and 1).
+    // Written by path_trace.hlsl ClosestHit when gi_enabled = 1.
+    struct GIBuffer
+    {
+        D3D12MA::Allocation* alloc    = nullptr;
+        ID3D12Resource*      resource = nullptr;
+        uint32_t             uav_slot = UINT32_MAX;
+        uint32_t             width    = 0;
+        uint32_t             height   = 0;
+    };
+    std::vector<GIBuffer> m_gi_reservoir_buffers;
+
+    bool m_gi_enabled = true;  // passed to FrameConstants::gi_enabled each frame
 
     // --- Per-frame constant buffer ring --------------------------------------
     // One upload buffer per output × k_frame_count slots.

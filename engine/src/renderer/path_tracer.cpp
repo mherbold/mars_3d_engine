@@ -388,7 +388,7 @@ void PathTracer::create_rtpso(DeviceContext& ctx)
         // offsetInDescriptorsFromTableStart = 0 explicitly; using the default
         // D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND after an unbounded (UINT_MAX) range
         // causes an arithmetic overflow and E_INVALIDARG during serialization.
-        CD3DX12_DESCRIPTOR_RANGE1 ranges[13]{};
+        CD3DX12_DESCRIPTOR_RANGE1 ranges[14]{};
         // SRV space0 – g_Textures[]
         ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, k_unbounded, 0, 0, k_volatile_flags, 0);
         // SRV space1 – g_Buffers[]
@@ -415,8 +415,10 @@ void PathTracer::create_rtpso(DeviceContext& ctx)
         ranges[11].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, k_unbounded, 0, 7, k_volatile_flags, 0);
         // UAV space8 – g_RoughnessUAV[]      [M7]
         ranges[12].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, k_unbounded, 0, 8, k_volatile_flags, 0);
+        // UAV space9 – g_GIReservoirs[]       [M8]
+        ranges[13].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, k_unbounded, 0, 9, k_volatile_flags, 0);
 
-        params[1].InitAsDescriptorTable(13, ranges, D3D12_SHADER_VISIBILITY_ALL);
+        params[1].InitAsDescriptorTable(14, ranges, D3D12_SHADER_VISIBILITY_ALL);
 
         // Static sampler s0: linear wrap
         CD3DX12_STATIC_SAMPLER_DESC sampler(0,
@@ -485,10 +487,10 @@ void PathTracer::create_rtpso(DeviceContext& ctx)
     hg->SetHitGroupExport(L"HitGroup_Primary");
     hg->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
 
-    // Shader config: payload = float3 radiance + float hit_t + bool missed
+    // Shader config: payload = float3 radiance + float hit_t + uint missed + uint depth + float3 sec_normal
     auto* shader_cfg = so_desc.CreateSubobject<CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT>();
     shader_cfg->Config(
-        sizeof(float) * 4 + sizeof(uint32_t), // payload size (radiance xyz, hit_t, missed)
+        sizeof(float) * 4 + sizeof(uint32_t) * 2 + sizeof(float) * 3, // payload size (36 bytes)
         sizeof(float) * 2);                   // attribute size (barycentrics)
 
     // Pipeline config: max recursion depth 2 (primary + shadow)
@@ -588,6 +590,7 @@ void PathTracer::create_output_textures(DeviceContext& ctx)
     m_specular_albedo_outputs.resize(m_output_count);
     m_normals_aov_outputs.resize(m_output_count);
     m_roughness_aov_outputs.resize(m_output_count);
+    m_gi_reservoir_buffers.resize(m_output_count);
 
     for (uint32_t i = 0; i < m_output_count; ++i)
     {
@@ -631,6 +634,14 @@ void PathTracer::release_output_textures()
     release_vec(m_specular_albedo_outputs);
     release_vec(m_normals_aov_outputs);
     release_vec(m_roughness_aov_outputs);
+
+    // Release GI reservoir structured buffers (M8)
+    for (auto& gi : m_gi_reservoir_buffers)
+    {
+        if (gi.alloc) { gi.alloc->Release(); gi.alloc = nullptr; gi.resource = nullptr; }
+        gi.uav_slot = UINT32_MAX;
+    }
+    m_gi_reservoir_buffers.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -654,17 +665,30 @@ void PathTracer::create_cb_ring(DeviceContext& ctx)
 // ---------------------------------------------------------------------------
 // resize_output
 // (Re)creates the UAV texture for the given output at the new dimensions.
+// new_width/new_height   — render resolution (path-tracer fires rays at this size).
+// display_width/height   — display resolution for the DLSS denoised output texture.
+//                          Pass 0 to use the same dimensions as render (no upscaling).
 // ---------------------------------------------------------------------------
 void PathTracer::resize_output(DeviceContext& ctx,
                                 uint32_t output_index,
-                                uint32_t new_width, uint32_t new_height)
+                                uint32_t new_width, uint32_t new_height,
+                                uint32_t display_width, uint32_t display_height)
 {
+    // Default denoised-output size to render size when not upscaling.
+    if (display_width  == 0) display_width  = new_width;
+    if (display_height == 0) display_height = new_height;
+
     assert(output_index < m_output_count);
     OutputTexture& out = m_outputs[output_index];
 
-    if (out.width == new_width && out.height == new_height) return;
+    // Skip reallocation only when both render AND display dims are unchanged.
+    {
+        OutputTexture& dn = m_denoised_outputs[output_index];
+        if (out.width == new_width && out.height == new_height &&
+            dn.width  == display_width && dn.height == display_height) return;
+    }
 
-    // Release old texture
+    // Release old render-res texture
     if (out.alloc) { out.alloc->Release(); out.alloc = nullptr; out.resource = nullptr; }
 
     out.width  = new_width;
@@ -785,14 +809,17 @@ void PathTracer::resize_output(DeviceContext& ctx,
     }
 
     // ---- Denoised output texture (RGBA16F) — separate from m_outputs -------
-    // DLSS-RR reads from m_outputs (noisy) and writes to m_denoised_outputs.
+    // DLSS-RR reads from m_outputs (noisy, render-res) and writes to m_denoised_outputs
+    // at DISPLAY resolution (after upscaling).  Must be allocated at display_width x display_height.
     {
         OutputTexture& dn = m_denoised_outputs[output_index];
         if (dn.alloc) { dn.alloc->Release(); dn.alloc = nullptr; dn.resource = nullptr; }
-        dn.width  = new_width;
-        dn.height = new_height;
+        dn.width  = display_width;
+        dn.height = display_height;
 
         D3D12_RESOURCE_DESC dn_desc = tex_desc; // RGBA16F, UAV flag
+        dn_desc.Width  = display_width;
+        dn_desc.Height = display_height;
 
         // Create in COMMON state so Streamline can issue valid legacy ResourceBarrier
         // transitions from COMMON on every frame. After each slEvaluateFeature call the
@@ -871,11 +898,61 @@ void PathTracer::resize_output(DeviceContext& ctx,
         aov_cpu.ptr += static_cast<SIZE_T>(aov.uav_slot) * ctx.bindless_descriptor_size();
         device->CreateUnorderedAccessView(aov.resource, nullptr, &aov_uav_desc, aov_cpu);
     }
+
+    // ---- GI reservoir structured buffer (M8) --------------------------------
+    // Two layers (ping-pong temporal reuse): total = width * height * 2 elements.
+    // Each element is a GIReservoir (must match the HLSL struct; 48 bytes).
+    {
+        static constexpr uint32_t k_gi_reservoir_stride = 64u; // sizeof GIReservoir in HLSL
+        GIBuffer& gi = m_gi_reservoir_buffers[output_index];
+        if (gi.alloc) { gi.alloc->Release(); gi.alloc = nullptr; gi.resource = nullptr; }
+        gi.width  = new_width;
+        gi.height = new_height;
+
+        uint64_t element_count = static_cast<uint64_t>(new_width) * new_height * 2u;
+        uint64_t byte_size     = element_count * k_gi_reservoir_stride;
+
+        D3D12MA::ALLOCATION_DESC gi_alloc_desc{};
+        gi_alloc_desc.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+
+        D3D12_RESOURCE_DESC gi_buf_desc{};
+        gi_buf_desc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        gi_buf_desc.Width            = byte_size;
+        gi_buf_desc.Height           = 1;
+        gi_buf_desc.DepthOrArraySize = 1;
+        gi_buf_desc.MipLevels        = 1;
+        gi_buf_desc.SampleDesc.Count = 1;
+        gi_buf_desc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        gi_buf_desc.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+        throw_if_failed(
+            m_allocator->CreateResource(
+                &gi_alloc_desc, &gi_buf_desc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                nullptr,
+                &gi.alloc,
+                IID_PPV_ARGS(&gi.resource)),
+            "PathTracer: create GI reservoir buffer failed");
+        gi.resource->SetName(
+            std::wstring(L"MARS::PathTracer::GIReservoirBuffer[" +
+                         std::to_wstring(output_index) + L"]").c_str());
+
+        gi.uav_slot = ctx.allocate_bindless_slot();
+        D3D12_UNORDERED_ACCESS_VIEW_DESC gi_uav_desc{};
+        gi_uav_desc.Format                      = DXGI_FORMAT_UNKNOWN;
+        gi_uav_desc.ViewDimension               = D3D12_UAV_DIMENSION_BUFFER;
+        gi_uav_desc.Buffer.FirstElement         = 0;
+        gi_uav_desc.Buffer.NumElements          = static_cast<UINT>(element_count);
+        gi_uav_desc.Buffer.StructureByteStride  = k_gi_reservoir_stride;
+        gi_uav_desc.Buffer.Flags                = D3D12_BUFFER_UAV_FLAG_NONE;
+        D3D12_CPU_DESCRIPTOR_HANDLE gi_cpu = ctx.bindless_heap()->GetCPUDescriptorHandleForHeapStart();
+        gi_cpu.ptr += static_cast<SIZE_T>(gi.uav_slot) * ctx.bindless_descriptor_size();
+        device->CreateUnorderedAccessView(gi.resource, nullptr, &gi_uav_desc, gi_cpu);
+    }
 }
 
 // ---------------------------------------------------------------------------
 // build_blas
-// ---------------------------------------------------------------------------
 uint32_t PathTracer::build_blas(DeviceContext& ctx,
                                  const GpuMeshBuffer& mesh,
                                  bool allow_update)
@@ -1273,10 +1350,21 @@ void PathTracer::update_frame_constants(DeviceContext& ctx,
     fc.specular_albedo_uav_slot = m_specular_albedo_outputs[output_index].uav_slot;
     fc.normals_uav_slot         = m_normals_aov_outputs[output_index].uav_slot;
     fc.roughness_uav_slot       = m_roughness_aov_outputs[output_index].uav_slot;
+    fc.gi_reservoir_uav_slot    = (output_index < m_gi_reservoir_buffers.size())
+                                      ? m_gi_reservoir_buffers[output_index].uav_slot
+                                      : UINT32_MAX;
+    fc.gi_enabled               = m_gi_enabled ? 1u : 0u;
     fc.sun_direction            = sun_direction;
     fc.sun_intensity            = sun_intensity;
     fc.sun_color                = sun_color;
     fc.prev_view_proj           = prev_view_proj;
+
+    // Compute proj * view (world→clip) for depth and motion-vector projection in the shader.
+    // Must be proj * view, not view * proj: the shader does mul(view_proj, worldPos)
+    // which is view_proj × pos in column-vector convention.
+    Mat4x4 view = view_inv.inverse();
+    Mat4x4 proj = proj_inv.inverse();
+    fc.view_proj = proj * view;
 
     memcpy(slot.mapped_ptr, &fc, sizeof(FrameConstants));
 }
@@ -1495,6 +1583,13 @@ ID3D12Resource* PathTracer::roughness_aov_resource(uint32_t output_index) const
 {
     if (output_index < m_roughness_aov_outputs.size())
         return m_roughness_aov_outputs[output_index].resource;
+    return nullptr;
+}
+
+ID3D12Resource* PathTracer::gi_reservoir_resource(uint32_t output_index) const
+{
+    if (output_index < m_gi_reservoir_buffers.size())
+        return m_gi_reservoir_buffers[output_index].resource;
     return nullptr;
 }
 

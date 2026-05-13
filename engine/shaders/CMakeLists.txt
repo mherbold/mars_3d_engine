@@ -31,6 +31,7 @@ set(HLSLI_HEADERS
     "${CMAKE_CURRENT_SOURCE_DIR}/sky/physical_sky.hlsli"
     "${CMAKE_CURRENT_SOURCE_DIR}/sky/hdri_sky.hlsli"
     "${CMAKE_CURRENT_SOURCE_DIR}/gi/restir_di.hlsli"
+    "${CMAKE_CURRENT_SOURCE_DIR}/gi/restir_gi.hlsli"
 )
 
 # ---------------------------------------------------------------------------
@@ -80,6 +81,7 @@ source_group("Shaders\\\\gi"        FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/gi/restir_di.hlsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/gi/restir_di.hlsli"
     "${CMAKE_CURRENT_SOURCE_DIR}/gi/restir_gi.hlsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/gi/restir_gi.hlsli"
 )
 source_group("Shaders\\\\post"      FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/tone_map_blit_vs.hlsl"

@@ -137,8 +137,10 @@ private:
         Vec3    position     = {};
         Mat4x4  view_inv     = Mat4x4::identity();
         Mat4x4  proj_inv     = Mat4x4::identity();
-        // Previous-frame view * proj (for motion vector / DLSS reprojection).
+        // Previous-frame matrices (for motion vector / DLSS reprojection).
         Mat4x4  prev_view_proj = Mat4x4::identity();
+        Mat4x4  prev_view_inv  = Mat4x4::identity();
+        Mat4x4  prev_proj_inv  = Mat4x4::identity();
     };
     std::vector<CameraState> m_cameras;
 

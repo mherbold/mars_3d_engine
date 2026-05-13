@@ -178,6 +178,13 @@ bool SceneLoader::load(const std::string& file_path,
     {
         for (const auto& jm : s["models"])
         {
+            if (jm.value("enabled", true) == false)
+            {
+                const std::string skipped_name = jm.value("id", jm.value("file", "<unknown>"));
+                std::println("[SceneLoader] Model '{}': disabled — skipped", skipped_name);
+                continue;
+            }
+
             if (!jm.contains("file"))
             {
                 std::println("[SceneLoader] WARNING: model entry missing 'file' field — skipped");
@@ -235,6 +242,44 @@ bool SceneLoader::load(const std::string& file_path,
             }
             else
             {
+                // Parse optional material override block
+                if (jm.contains("material"))
+                {
+                    const json& jmat = jm["material"];
+                    MaterialOverride& mo = scene.m_instances[inst_idx].material_override;
+
+                    auto read_tex = [&](const char* key) -> std::string
+                    {
+                        if (jmat.contains(key) && jmat[key].is_string())
+                        {
+                            std::string p = jmat[key].get<std::string>();
+                            return p.empty() ? std::string{} : resolve_path(base_dir, p);
+                        }
+                        return {};
+                    };
+
+                    mo.base_color_texture          = read_tex("base_color_texture");
+                    mo.normal_texture              = read_tex("normal_texture");
+                    mo.metallic_roughness_texture  = read_tex("metallic_roughness_texture");
+                    mo.roughness_texture           = read_tex("roughness_texture");
+                    mo.occlusion_texture           = read_tex("occlusion_texture");
+                    mo.emissive_texture            = read_tex("emissive_texture");
+
+                    if (jmat.contains("base_color") && jmat["base_color"].is_array())
+                    {
+                        Vec4 c = json_vec4(jmat["base_color"]);
+                        mo.base_color_r = c.x;
+                        mo.base_color_g = c.y;
+                        mo.base_color_b = c.z;
+                        mo.base_color_a = c.w;
+                    }
+                    mo.metallic_factor  = jmat.value("metallic_factor",  -1.0f);
+                    mo.roughness_factor = jmat.value("roughness_factor", -1.0f);
+                    mo.emissive_scale   = jmat.value("emissive_scale",   -1.0f);
+
+                    if (mo.has_any())
+                        std::println("[SceneLoader]   Material override applied to '{}'", model_name);
+                }
                 ++models_loaded;
             }
         }

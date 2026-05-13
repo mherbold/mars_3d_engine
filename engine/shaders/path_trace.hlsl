@@ -13,6 +13,7 @@
 #include "material/material_data.hlsli"
 #include "material/pbr_brdf.hlsli"
 #include "gi/restir_di.hlsli"
+#include "gi/restir_gi.hlsli"
 
 // ---------------------------------------------------------------------------
 // Per-frame constant buffer (bound at b0, space0)
@@ -46,6 +47,14 @@ struct FrameConstants
     uint     specular_albedo_uav_slot;
     uint     normals_uav_slot;
     uint     roughness_uav_slot;
+    // ReSTIR GI (M8) — offset 304, registers 19..19
+    uint     gi_reservoir_uav_slot;   // bindless UAV slot for GIReservoir structured buffer
+    uint     gi_enabled;              // 1 = trace secondary GI ray in ClosestHit
+    // padding — offset 312, registers 20..20
+    uint     _pad_gi0;
+    uint     _pad_gi1;
+    // current-frame view * projection — offset 320, registers 21..24
+    float4x4 view_proj;
 };
 
 ConstantBuffer<FrameConstants> g_Frame : register(b0, space0);
@@ -68,6 +77,10 @@ RWTexture2D<float4> g_SpecularAlbedoUAV[] : register(u0, space6);
 RWTexture2D<float4> g_NormalsUAV[]        : register(u0, space7);
 RWTexture2D<float>  g_RoughnessUAV[]      : register(u0, space8);
 
+// GI reservoir structured buffer — per-pixel GIReservoir ping-pong (M8)
+// Dimensions: width * height * 2 elements (two layers for temporal reuse)
+RWStructuredBuffer<GIReservoir> g_GIReservoirs[] : register(u0, space9);
+
 // ---------------------------------------------------------------------------
 // Payload structures
 // ---------------------------------------------------------------------------
@@ -75,7 +88,9 @@ struct PrimaryPayload
 {
     float3 radiance;
     float  hit_t;
-    bool   missed;
+    uint   missed;      // 1 = missed, 0 = hit (bool unreliable in DXR payloads)
+    uint   depth;       // 0 = primary ray, 1 = secondary GI ray (no further recursion)
+    float3 sec_normal;  // world-space shading normal at the secondary hit (depth-1 only)
 };
 
 struct ShadowPayload
@@ -261,9 +276,11 @@ void RayGen()
     ray.TMax      = 1e6f;
 
     PrimaryPayload payload;
-    payload.radiance = float3(0, 0, 0);
-    payload.hit_t    = -1.0f;
-    payload.missed   = false;
+    payload.radiance   = float3(0, 0, 0);
+    payload.hit_t      = -1.0f;
+    payload.missed     = 0u;
+    payload.depth      = 0u;
+    payload.sec_normal = float3(0, 1, 0);
 
     TraceRay(g_TLAS[g_Frame.tlas_slot],
              0u,             // RAY_FLAG_NONE
@@ -279,25 +296,29 @@ void RayGen()
     // ---- Motion vectors and linear depth ------------------------------------
     if (g_Frame.motion_vector_uav_slot != 0xFFFFFFFF)
     {
+        // Full motion vector (camera + object motion) in NDC space.
+        // Written directly as prevNDC - currNDC so mvecScale = {1,1} (no extra scaling).
+        // cameraMotionIncluded = eTrue tells DLSS-RR the MVs encode full camera motion.
+        // Y is negated: D3D12 clip-space NDC has Y+ up, but DLSS-RR expects Y+ down
+        // (screen-space convention where pixel row 0 is at the top).
         float2 motionVec = float2(0.0f, 0.0f);
-        float  linearDepth = 1e6f;
 
-        if (!payload.missed && payload.hit_t > 0.0f)
+        float3 mvWorldPos;
+        if (payload.missed == 0u && payload.hit_t > 0.0f)
+            mvWorldPos = ray.Origin + ray.Direction * payload.hit_t;
+        else
+            mvWorldPos = ray.Origin + ray.Direction * 1e5f; // sky: far-plane point
+
         {
-            // Reconstruct world-space hit position
-            float3 worldHit = ray.Origin + ray.Direction * payload.hit_t;
-            linearDepth = payload.hit_t;
+            float4 currClip = mul(g_Frame.view_proj,      float4(mvWorldPos, 1.0f));
+            float4 prevClip = mul(g_Frame.prev_view_proj, float4(mvWorldPos, 1.0f));
 
-            // Re-project to previous clip space
-            float4 prevClip = mul(g_Frame.prev_view_proj, float4(worldHit, 1.0f));
-            prevClip.xyz /= prevClip.w;
-            // Convert NDC [-1,1] to screen UV [0,1] (flip Y for D3D)
-            float2 prevUV = float2(prevClip.x * 0.5f + 0.5f,
-                                   -prevClip.y * 0.5f + 0.5f);
-            float2 prevPixel = prevUV * float2(g_Frame.output_width, g_Frame.output_height);
+            float2 currNDC = currClip.xy / currClip.w;
+            float2 prevNDC = prevClip.xy / prevClip.w;
 
-            // Motion vector = current pixel − previous pixel (screen-space pixels)
-            motionVec = float2(launchIdx) - prevPixel;
+            // DLSS-RR uses screen-space Y+ down; negate Y to convert from NDC Y+ up.
+            float2 delta = prevNDC - currNDC;
+            motionVec = float2(delta.x, -delta.y);
         }
 
         g_MotionVectorUAV[g_Frame.motion_vector_uav_slot][launchIdx] =
@@ -306,7 +327,14 @@ void RayGen()
 
     if (g_Frame.depth_uav_slot != 0xFFFFFFFF)
     {
-        float d = payload.missed ? 1e6f : max(payload.hit_t, 0.0f);
+        float d = 1.0f; // default: far plane
+        if (payload.missed == 0u && payload.hit_t > 0.0f)
+        {
+            // Project the world-space hit point to get NDC depth (clip.z / clip.w).
+            float3 worldPos = ray.Origin + ray.Direction * payload.hit_t;
+            float4 clip     = mul(g_Frame.view_proj, float4(worldPos, 1.0f));
+            d = saturate(clip.z / clip.w);
+        }
         g_LinearDepthUAV[g_Frame.depth_uav_slot][launchIdx] = d;
     }
 }
@@ -398,7 +426,7 @@ void Miss(inout PrimaryPayload payload)
 
     payload.radiance = color;
     payload.hit_t    = -1.0f;
-    payload.missed   = true;
+    payload.missed   = 1u;
 }
 
 // ---------------------------------------------------------------------------
@@ -442,13 +470,25 @@ void ClosestHit(inout PrimaryPayload payload, in BuiltInTriangleIntersectionAttr
     float3 N                  = ResolveNormal(mat, tri.uv, worldNormal, worldTangent, worldBitangent);
     float3 emissive           = ResolveEmissive(mat, tri.uv);
 
-    float3 V = normalize(g_Frame.camera_pos - worldPos);
+    // V = outgoing direction toward the ray origin.
+    // For primary rays (depth 0) this is the camera.
+    // For secondary GI rays (depth 1) it is the direction back along the incoming ray.
+    // Using camera_pos at depth 1 gives the wrong half-vector → EvaluatePBR returns 0
+    // for any surface not directly facing the camera, making GI always black.
+    float3 V = (payload.depth == 0u)
+                   ? normalize(g_Frame.camera_pos - worldPos)
+                   : normalize(-WorldRayDirection());
     if (dot(N, V) < 0.0f)
         N = -N;   // flip for double-sided surfaces
 
     uint2 pixelIdx = DispatchRaysIndex().xy;
 
     // ---- Write G-buffer AOV textures (DLSS-RR mandatory inputs) ----------------
+    // Only write from primary-ray hits (depth 0). Secondary-ray hits must NOT
+    // overwrite these — DispatchRaysIndex() is the same pixel for both depths,
+    // so a depth-1 write would stomp the primary surface's G-buffer data.
+    if (payload.depth == 0u)
+    {
     if (g_Frame.albedo_uav_slot != 0xFFFFFFFF)
     {
         // Diffuse base color with metallic masking: metals have no diffuse albedo.
@@ -474,6 +514,7 @@ void ClosestHit(inout PrimaryPayload payload, in BuiltInTriangleIntersectionAttr
     {
         g_RoughnessUAV[g_Frame.roughness_uav_slot][pixelIdx] = roughness;
     }
+    } // end depth == 0u guard for AOV writes
 
     // ---- ReSTIR DI — direct illumination via RIS + visibility ----------------
     uint rng = PcgSeed(pixelIdx, g_Frame.frame_index);
@@ -484,32 +525,130 @@ void ClosestHit(inout PrimaryPayload payload, in BuiltInTriangleIntersectionAttr
 
     Reservoir res = RIS_GenerateCandidates(baseColor, metallic, roughness, N, V, sun, rng);
 
-    // Shadow ray for the selected reservoir sample
-    ShadowPayload shadowPayload;
-    shadowPayload.occluded = 1u;
+    // Shadow ray for the selected reservoir sample — only at depth 0 (primary hits).
+    // Secondary hits (depth 1) use unshadowed direct lighting to stay within recursion depth 2.
+    bool visible = true;
+    if (payload.depth == 0u)
+    {
+        ShadowPayload shadowPayload;
+        shadowPayload.occluded = 1u;
 
-    RayDesc shadowRay;
-    shadowRay.Origin    = worldPos + N * 1e-3f;
-    shadowRay.Direction = res.y_direction;
-    shadowRay.TMin      = 1e-4f;
-    shadowRay.TMax      = 1e6f;
+        RayDesc shadowRay;
+        shadowRay.Origin    = worldPos + N * 1e-3f;
+        shadowRay.Direction = res.y_direction;
+        shadowRay.TMin      = 1e-4f;
+        shadowRay.TMax      = 1e6f;
 
-    TraceRay(g_TLAS[g_Frame.tlas_slot],
-             0x4u | 0x8u, // RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER
-             0xFFu,
-             0u, 1u,
-             1u,  // ShadowMiss index
-             shadowRay,
-             shadowPayload);
+        TraceRay(g_TLAS[g_Frame.tlas_slot],
+                 0x4u | 0x8u, // RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER
+                 0xFFu,
+                 0u, 1u,
+                 1u,  // ShadowMiss index
+                 shadowRay,
+                 shadowPayload);
 
-    bool visible   = (shadowPayload.occluded == 0u);
+        visible = (shadowPayload.occluded == 0u);
+    }
     float3 directLight = ReservoirShade(N, V, baseColor, metallic, roughness, res, visible);
 
-    // Simple ambient (will be replaced by path-traced GI in M8)
-    float3 ambient = baseColor * 0.02f;
+    // ---- GI — single-bounce BRDF-importance-sampled Monte Carlo ----------------
+    // For diffuse surfaces: cosine-hemisphere sampling (pdf = NdotL/PI).
+    // For specular/metallic surfaces: GGX VNDF sampling so that mirror-like and
+    // glossy reflections are captured correctly.
+    // We select between the two lobes probabilistically (MIS one-sample model):
+    //   p_spec = luminance of the Fresnel-weighted specular albedo / total albedo
+    //   p_diff = 1 - p_spec
+    // The chosen direction is traced and the estimator weight is BRDF / pdf.
+    // DLSS-RR temporally accumulates the noisy 1-spp result.
 
-    payload.radiance = directLight + ambient + emissive;
-    payload.hit_t    = RayTCurrent();
-    payload.missed   = false;
+    float3 giContrib = float3(0, 0, 0);
+
+    if (g_Frame.gi_enabled != 0u && payload.depth == 0u)
+    {
+        // --- Decide which lobe to sample -----------------------------------
+        float3 F0      = lerp(float3(0.04f, 0.04f, 0.04f), baseColor, metallic);
+        float  NdotV_g = saturate(dot(N, V));
+        float3 F_view  = FresnelSchlick(NdotV_g, F0);
+        float  lum_spec = dot(F_view, float3(0.2126f, 0.7152f, 0.0722f));
+        float  lum_diff = (1.0f - metallic) * dot((1.0f - F_view) * baseColor,
+                                                    float3(0.2126f, 0.7152f, 0.0722f));
+        float  total    = lum_spec + lum_diff;
+        float  p_spec   = (total > 1e-6f) ? saturate(lum_spec / total) : 0.0f;
+
+        float  u0 = PcgRand(rng);
+        float  u1 = PcgRand(rng);
+        float  u2 = PcgRand(rng);
+
+        float3 secDir;
+        float  pdf;
+
+        if (u0 < p_spec)
+        {
+            // --- Specular lobe: GGX VNDF importance sampling ---------------
+            // Transform V into the tangent-space frame (T, B, N).
+            float3 T = normalize(worldTangent);
+            float3 B = normalize(worldBitangent);
+            float3 V_local = float3(dot(V, T), dot(V, B), dot(V, N));
+
+            float3 H_local = SampleGGX_VNDF(V_local, max(roughness * roughness, 0.01f), u1, u2);
+            float3 H_world = normalize(H_local.x * T + H_local.y * B + H_local.z * N);
+
+            secDir = reflect(-V, H_world);
+
+            // GGX VNDF pdf for the sampled half-vector, converted to solid-angle pdf for L.
+            // pdf_L = D_visible(H) / (4 * dot(V, H))
+            float NdotH = saturate(dot(N, H_world));
+            float VdotH = saturate(dot(V, H_world));
+            float alpha = roughness * roughness;
+            float alpha2 = alpha * alpha;
+            float denom  = NdotH * NdotH * (alpha2 - 1.0f) + 1.0f;
+            float D      = alpha2 / (PI * denom * denom);
+            float NdotV_l = saturate(dot(N, V));
+            float lambdaV = NdotV_l + sqrt(alpha2 + (1.0f - alpha2) * NdotV_l * NdotV_l);
+            float G1V    = 2.0f * NdotV_l / max(lambdaV, 1e-6f);
+            float D_vis  = D * G1V / max(2.0f * NdotV_l, 1e-6f);
+            pdf = p_spec * D_vis / max(4.0f * VdotH, 1e-6f);
+        }
+        else
+        {
+            // --- Diffuse lobe: cosine-hemisphere sampling ------------------
+            secDir = SampleCosineHemisphere(N, u1, u2);
+            float NdotL_s = saturate(dot(N, secDir));
+            pdf = (1.0f - p_spec) * CosineHemispherePdf(NdotL_s);
+        }
+
+        float NdotL_sec = saturate(dot(N, secDir));
+
+        if (pdf > 1e-6f && NdotL_sec > 0.0f)
+        {
+            RayDesc secRay;
+            secRay.Origin    = worldPos + N * 1e-3f;
+            secRay.Direction = secDir;
+            secRay.TMin      = 1e-4f;
+            secRay.TMax      = 1e4f;
+
+            PrimaryPayload secPayload;
+            secPayload.radiance   = float3(0, 0, 0);
+            secPayload.hit_t      = -1.0f;
+            secPayload.missed     = 0u;
+            secPayload.depth      = 1u;
+            secPayload.sec_normal = float3(0, 1, 0);
+
+            TraceRay(g_TLAS[g_Frame.tlas_slot],
+                     0u, 0xFFu, 0u, 1u,
+                     0u,
+                     secRay, secPayload);
+
+            float3 Lo      = secPayload.radiance;
+            float3 brdfVal = EvaluatePBR(baseColor, metallic, roughness, N, V, secDir);
+            // Estimator: BRDF(x,wi,wo) * Li / pdf  — EvaluatePBR includes NdotL
+            giContrib = (brdfVal / pdf) * Lo;
+        }
+    }
+
+    payload.radiance   = directLight + giContrib + emissive;
+    payload.hit_t      = RayTCurrent();
+    payload.missed     = 0u;
+    payload.sec_normal = N;  // depth-1 callers use this as the secondary hit normal for GI reservoirs
 }
 

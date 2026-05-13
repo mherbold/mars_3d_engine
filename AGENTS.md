@@ -102,3 +102,19 @@ Two CMake sub-projects live under the repo root:
 - Each `DisplayOutput` owns a D3D12 swap chain and one or more `Camera` views
 - The renderer dispatches one ray-tracing pass per active `DisplayOutput` per frame
 - Monitor topology (angles, offsets) is described in the scene/config file
+
+---
+
+## DLSS-RR Temporal Contract (Invariants — Do Not Break)
+
+These rules were established through extensive debugging and must all hold simultaneously for DLSS-RR to produce artifact-free output.
+
+| Rule | Detail |
+|---|---|
+| **Depth = NDC projected depth** | Write `saturate(clip.z / clip.w)` to `kBufferTypeDepth`. Never write world-space ray distance (`hit_t`). Sky/miss pixels write `1.0`. |
+| **`view_proj` = `proj * view`** | The C++ frame-constants upload must compute `view_proj = proj * view`. HLSL uses column-vector `mul(M, v)`, so the order on the CPU side must match. Same rule applies to `prev_view_proj`. |
+| **Motion vectors = NDC delta, Y negated, ×0.5** | Compute `mv = (prevClip.xy/prevClip.w) - (currClip.xy/currClip.w)`, negate Y, then multiply by `{0.5, 0.5}`. Set `sl::DLSSDOptions::mvecScale = {0.5f, 0.5f}`. This converts DLSS-RR's screen-space [0,1] convention from NDC [-1,+1]. |
+| **Full-scene motion vectors (`cameraMotionIncluded = eTrue`)** | Motion vectors must encode total pixel displacement including camera movement. Sky pixels must project a far-plane world point (not `rayDir`). |
+| **Identity clip matrices when MVs include camera motion** | Set `sl::Constants::clipToPrevClip` and `prevClipToClip` to identity `float4x4(1,…)` whenever `cameraMotionIncluded = eTrue`. Passing real previous-frame matrices doubles the camera motion. |
+| **`prev_view_proj` seeded on frame 0** | In `Renderer::set_camera()`, on the first call initialise `cam.prev_view_proj = curr_view_proj` to produce zero motion vectors on frame 0 and prevent NaN/Inf in DLSS-RR's history buffer. |
+| **Render ≠ Display resolution** | Path-tracer noisy-color, MVs, depth, and AOVs are allocated at **render resolution** (DLSS input). Denoised output UAV is allocated at **display resolution** (DLSS output). Never mix the two sizes in the same allocation path. |

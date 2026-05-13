@@ -1,6 +1,10 @@
 newmtl Ground
-Ka 0.2 0.2 0.2
-Kd 0.4 0.55 0.3
+Ka 1.0 1.0 1.0
+Kd 1.0 1.0 1.0
 Ks 0.0 0.0 0.0
 d 1.0
 illum 1
+map_Kd   textures/Ground082S_2K-PNG_Color.png
+norm     textures/Ground082S_2K-PNG_NormalDX.png
+map_Pr   textures/Ground082S_2K-PNG_Roughness.png
+map_Ka   textures/Ground082S_2K-PNG_AmbientOcclusion.png
