@@ -105,6 +105,64 @@ Two CMake sub-projects live under the repo root:
 
 ---
 
+## Cloth Simulation Design (M9 — `cloth_sim.hlsl`)
+
+The GPU cloth solver uses a **canonical XPBD (Extended Position-Based Dynamics)** three-pass compute dispatch and the following invariants must be maintained:
+
+| Rule | Detail |
+|---|---|
+| **Three-pass dispatch** | Pass 0 = INTEGRATE (Verlet prediction: `x* = xc + (xc - xp)*damping + a*dt²`). Pass 1 = CONSTRAIN (Jacobi XPBD projection, repeated `xpbd_iterations` times). Pass 2 = FINALIZE (state rotation: `prev ← curr`, `curr ← final_pred`). Controlled by `ClothConstants::pass`. |
+| **Three positional-state buffers** | `pos_prev` (x_{n-1}), `pos_curr` (x_n / final output), and a pred ping-pong pair `pos_pred_a` / `pos_pred_b` (working scratch during CONSTRAIN). No explicit velocity buffers — velocity is implicit as `(pos_curr - pos_prev) / dt`. |
+| **Jacobi XPBD constraint formula** | `Δλ = -(C + α·λ) / (w_i + w_j + α)` where `α = compliance / dt²`. Applied independently per thread (Jacobi style); corrections are averaged across contributing constraints. |
+| **Pred ping-pong in CONSTRAIN** | Each CONSTRAIN iteration alternates between reading `pos_pred_a` and writing `pos_pred_b`, then vice versa. After `xpbd_iterations` iterations, `final_srv` selects the buffer that was last written. The selection variable tracks the *last write target*, not the next read target. |
+| **Pinned particles write render vertices** | Particles with `inv_mass == 0` (pinned) skip position updates but must still emit their render vertex in CONSTRAIN so the output vertex buffer is always fully populated. |
+| **Scene-driven wind** | Wind is specified as a `"wind"` object in `.marsscene` using the animated `WindDesc` schema (see below). A legacy `[x, y, z]` array is still accepted for backward compatibility. The renderer default wind is zero. Do not hard-code wind in `renderer.h`. |
+| **Delta-time clamp** | The cloth simulation clamps `delta_time` to a maximum of `1/30 s` to prevent instability during window-drag stalls or frame-rate drops. |
+| **No buffer swap in C++** | C++ never calls `swap_buffers()`. State rotation is entirely handled by the FINALIZE pass on the GPU. After FINALIZE, `pos_curr` holds the new authoritative positions and is used directly for BLAS refit. |
+
+---
+
+## Animated Wind System (M9 — `WindDesc` / `Renderer::update`)
+
+The wind system replaces the old static `Vec3 m_wind` with a structured, scene-driven animated model. The GPU cloth solver still receives a plain `Vec3 wind` each substep — no shader changes are needed.
+
+### Schema (`.marsscene`)
+
+```json
+"wind": {
+  "baseDirection": [ 1.0, 0.0, 0.0 ],   // normalised at load time
+  "baseSpeed": 8.0,                       // m/s
+
+  "gustStrength": 0.45,                   // fraction of baseSpeed (±45 %)
+  "gustFrequency": 0.25,                  // Hz
+
+  "directionWanderAngle": 12.0,           // degrees (half-range of oscillation)
+  "directionWanderFrequency": 0.12,       // Hz
+
+  "microVariation": 0.08,                 // fraction of current speed
+  "microFrequency": 1.5,                  // Hz
+
+  "responseSmoothing": 0.85               // IIR coefficient [0, 1)
+}
+```
+
+A legacy `[x, y, z]` array is still accepted; it converts to a `WindDesc` with no animation layers.
+
+### Evaluation (CPU, once per `Renderer::update()` call)
+
+Three oscillator layers are summed and passed through a one-pole IIR smoother:
+
+| Layer | Formula |
+|---|---|
+| **Gust** | `speed = baseSpeed × (1 + gustStrength × sin(gustPhase))` |
+| **Direction wander** | Rotate `baseDirection` in XZ by `directionWanderAngle × sin(wanderPhase)` degrees |
+| **Micro turbulence** | Add `microVariation × speed × sin(microPhaseX/Z)` to X and Z components |
+| **IIR smoother** | `output = lerp(target, prevOutput, responseSmoothing)` |
+
+Phase accumulators live in `Renderer::WindState` and are never reset (continuous oscillation). The resulting `Vec3 m_wind_current` is passed to every `dispatch_cloth_sim()` call.
+
+---
+
 ## DLSS-RR Temporal Contract (Invariants — Do Not Break)
 
 These rules were established through extensive debugging and must all hold simultaneously for DLSS-RR to produce artifact-free output.

@@ -260,6 +260,7 @@ The following invariants must be maintained for artifact-free DLSS-RR output:
   "scene": {
     "name": "Test Track",
     "skybox": { "type": "physical", "sun_direction": [0.3, 0.8, 0.1], "sun_intensity": 10 },
+    "wind": [0.0, 0.0, 0.0],
     "models": [
       {
         "id": "track_mesh",
@@ -395,7 +396,7 @@ Meshes are stored as interleaved vertex buffers (position | normal | tangent | u
 | Blend trees | Simple 1D/2D blend trees; cross-fade between clips |
 | Procedural animation | IK solver (FABRIK) for foot placement |
 | Rigid animation | Node transform animation (flags, doors, wheels) via float-curve evaluation |
-| Waving flags | Compute shader cloth simulation (spring lattice) driven by wind vector; updated positions written back before BLAS refit |
+| Waving flags | Compute shader cloth simulation (spring-mass lattice) driven by wind vector; two-pass dispatch: integrate (gravity+wind) then red-black Gauss-Seidel constraint relaxation with per-spring-type averaging; updated positions written back before BLAS refit |
 | BLAS update | Dynamic meshes: BLAS refit each frame (no full rebuild for small deformations) |
 
 ---

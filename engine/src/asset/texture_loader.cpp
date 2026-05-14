@@ -12,9 +12,9 @@
 
 #include <DirectXTex.h>
 
+#include "mars_engine/engine_api.h"
 #include <stdexcept>
 #include <format>
-#include <print>
 #include <filesystem>
 #include <cstring>
 
@@ -243,7 +243,7 @@ GpuTexture TextureLoader::load(
 
     if (!fs::exists(file_path))
     {
-        std::println(stderr, "[TextureLoader] File not found: {}", file_path);
+        MARS_LOG("[TextureLoader] File not found: {}", file_path);
         return {};
     }
 
@@ -270,7 +270,7 @@ GpuTexture TextureLoader::load(
 
     if (FAILED(hr))
     {
-        std::println(stderr, "[TextureLoader] Failed to load '{}' (HRESULT 0x{:08X})", file_path, static_cast<unsigned>(hr));
+        MARS_LOG("[TextureLoader] Failed to load '{}' (HRESULT 0x{:08X})", file_path, static_cast<unsigned>(hr));
         return {};
     }
 
@@ -292,13 +292,13 @@ GpuTexture TextureLoader::load(
     try
     {
         GpuTexture tex = upload_scratch(ctx, allocator, image, meta, view_format);
-        std::println("[TextureLoader] Loaded '{}' ({}×{}, {} mips, slot {})",
+        MARS_LOG("[TextureLoader] Loaded '{}' ({}\u00d7{}, {} mips, slot {})",
             file_path, tex.width, tex.height, tex.mip_levels, tex.srv_slot);
         return tex;
     }
     catch (const std::exception& e)
     {
-        std::println(stderr, "[TextureLoader] Upload failed for '{}': {}", file_path, e.what());
+        MARS_LOG("[TextureLoader] Upload failed for '{}': {}", file_path, e.what());
         return {};
     }
 }

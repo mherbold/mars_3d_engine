@@ -3,16 +3,20 @@
 // MARS 3D Engine — DXR path-tracing pipeline implementation
 // =============================================================================
 
+#include "mars_engine/engine_api.h"
 #include "mars_engine/renderer/path_tracer.h"
 #include "mars_engine/renderer/device_context.h"
+#include "mars_engine/scene/scene_types.h"
 
 #include <stdexcept>
+#include <algorithm>
 #include <format>
 #include <fstream>
 #include <vector>
 #include <string>
+#include <windows.h>
 #include <cassert>
-#include <print>
+#include <bit>
 
 // D3D12 Memory Allocator
 #pragma warning(push, 0)
@@ -67,23 +71,23 @@ static std::vector<uint8_t> load_dxil_blob(const std::wstring& filename)
         return s;
     };
 
-    std::println("[PathTracer] Searching for DXIL blob:");
-    std::println("[PathTracer]   Try 1: '{}'", wstr_to_str(path1));
+    MARS_LOG("[PathTracer] Searching for DXIL blob:");
+    MARS_LOG("[PathTracer]   Try 1: '{}'", wstr_to_str(path1));
 
     auto blob = try_load(path1);
     if (blob.empty())
     {
-        std::println("[PathTracer]   Try 1 FAILED — not found or empty.");
-        std::println("[PathTracer]   Try 2: '{}'", wstr_to_str(path2));
+        MARS_LOG("[PathTracer]   Try 1 FAILED — not found or empty.");
+        MARS_LOG("[PathTracer]   Try 2: '{}'", wstr_to_str(path2));
         blob = try_load(path2);
         if (blob.empty())
-            std::println("[PathTracer]   Try 2 FAILED — not found or empty.");
+            MARS_LOG("[PathTracer]   Try 2 FAILED — not found or empty.");
         else
-            std::println("[PathTracer]   Try 2 OK — {} bytes loaded.", blob.size());
+            MARS_LOG("[PathTracer]   Try 2 OK — {} bytes loaded.", blob.size());
     }
     else
     {
-        std::println("[PathTracer]   Try 1 OK — {} bytes loaded.", blob.size());
+        MARS_LOG("[PathTracer]   Try 1 OK — {} bytes loaded.", blob.size());
     }
 
     if (blob.empty())
@@ -166,6 +170,8 @@ void PathTracer::init(DeviceContext& ctx,
     create_allocator(ctx);
     create_rtpso(ctx);
     create_blit_pipeline(ctx);
+    create_skinning_pipeline(ctx);
+    create_cloth_pipeline(ctx);
     create_shader_tables(ctx);
     create_output_textures(ctx);
     create_cb_ring(ctx);
@@ -216,7 +222,10 @@ void PathTracer::shutdown()
 
     // Release BLAS list
     for (auto& b : m_blas_list)
+    {
+        if (b.scratch_alloc) { b.scratch_alloc->Release(); b.scratch_alloc = nullptr; b.scratch = nullptr; }
         if (b.alloc) { b.alloc->Release(); b.alloc = nullptr; b.resource = nullptr; }
+    }
     m_blas_list.clear();
 
     m_rtpso.Reset();
@@ -228,6 +237,9 @@ void PathTracer::shutdown()
     m_blit_pso_hdr10.Reset();
     m_blit_pso_scrgb.Reset();
     m_blit_root_sig.Reset();
+
+    m_skinning_pso.Reset();
+    m_skinning_root_sig.Reset();
 
     if (m_allocator) { m_allocator->Release(); m_allocator = nullptr; }
 
@@ -334,6 +346,259 @@ void PathTracer::create_blit_pipeline(DeviceContext& ctx)
     // Cache the GPU start of the bindless heap so copy_to_back_buffer can use it
     // without needing a DeviceContext pointer.
     m_bindless_heap_gpu_start = ctx.bindless_heap()->GetGPUDescriptorHandleForHeapStart();
+}
+
+// ---------------------------------------------------------------------------
+// create_skinning_pipeline
+// Builds the compute root signature and PSO for the GPU skinning pass.
+// Root signature layout:
+//   b0  space0  : SkinningConstants (4 root constants)
+//   Descriptor table: same bindless heap used everywhere (SRV + UAV)
+// ---------------------------------------------------------------------------
+void PathTracer::create_skinning_pipeline(DeviceContext& ctx)
+{
+    auto* device = ctx.device();
+
+    // ---- Root signature ----------------------------------------------------
+    {
+        CD3DX12_ROOT_PARAMETER1 params[2]{};
+
+        // 4 inline root constants (vertex_count, src_vertex_srv, bone_palette_srv, dst_vertex_uav)
+        params[0].InitAsConstants(4, 0, 0, D3D12_SHADER_VISIBILITY_ALL);
+
+        static constexpr UINT k_unbounded = UINT_MAX;
+        static constexpr D3D12_DESCRIPTOR_RANGE_FLAGS k_volatile =
+            D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE |
+            D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+
+        CD3DX12_DESCRIPTOR_RANGE1 ranges[3]{};
+        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, k_unbounded, 0, 1, k_volatile, 0); // t0, space1 — g_Buffers[]
+        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, k_unbounded, 0, 2, k_volatile, 0); // t0, space2 — g_BonePalettes[]
+        ranges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, k_unbounded, 0, 3, k_volatile, 0); // u0, space3 — g_OutputBuffers[]
+
+        params[1].InitAsDescriptorTable(3, ranges, D3D12_SHADER_VISIBILITY_ALL);
+
+        CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rs_desc;
+        rs_desc.Init_1_1(2, params, 0, nullptr,
+                         D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
+        ComPtr<ID3DBlob> rs_blob, err_blob;
+        throw_if_failed(
+            D3DX12SerializeVersionedRootSignature(&rs_desc,
+                D3D_ROOT_SIGNATURE_VERSION_1_1, &rs_blob, &err_blob),
+            "PathTracer: serialize skinning root signature failed");
+        throw_if_failed(
+            device->CreateRootSignature(0,
+                rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(),
+                IID_PPV_ARGS(&m_skinning_root_sig)),
+            "PathTracer: create skinning root signature failed");
+        m_skinning_root_sig->SetName(L"MARS::PathTracer::SkinningRootSig");
+    }
+
+    // ---- Compute PSO -------------------------------------------------------
+    auto dxil = load_dxil_blob(L"skinning.dxil");
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
+    pso_desc.pRootSignature = m_skinning_root_sig.Get();
+    pso_desc.CS             = { dxil.data(), dxil.size() };
+
+    throw_if_failed(
+        device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&m_skinning_pso)),
+        "PathTracer: create skinning compute PSO failed");
+    m_skinning_pso->SetName(L"MARS::PathTracer::SkinningPSO");
+}
+
+// ---------------------------------------------------------------------------
+// create_cloth_pipeline
+// Same root signature layout as the skinning pipeline but with more root
+// constants to cover all ClothConstants fields (28 DWORDs).
+// ---------------------------------------------------------------------------
+void PathTracer::create_cloth_pipeline(DeviceContext& ctx)
+{
+    auto* device = ctx.device();
+
+    {
+        // 28 root constants (all ClothConstants fields packed as DWORDs)
+        CD3DX12_ROOT_PARAMETER1 params[2]{};
+        params[0].InitAsConstants(28, 0, 0, D3D12_SHADER_VISIBILITY_ALL);
+
+        static constexpr UINT k_unbounded = UINT_MAX;
+        static constexpr D3D12_DESCRIPTOR_RANGE_FLAGS k_volatile =
+            D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE |
+            D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+
+        // cloth_sim.hlsl uses:
+        //   t0, space1 — g_Buffers[]    (SRV: pos_prev, pos_curr, pos_pred_a/b reads)
+        //   u0, space3 — g_RWBuffers[]  (UAV: pos_prev, pos_curr, pos_pred_a/b writes + output vertex buffer)
+        CD3DX12_DESCRIPTOR_RANGE1 ranges[2]{};
+        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, k_unbounded, 0, 1, k_volatile, 0); // t0, space1 — SRV inputs
+        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, k_unbounded, 0, 3, k_volatile, 0); // u0, space3 — UAV outputs
+        params[1].InitAsDescriptorTable(2, ranges, D3D12_SHADER_VISIBILITY_ALL);
+
+        CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rs_desc;
+        rs_desc.Init_1_1(2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
+        ComPtr<ID3DBlob> rs_blob, err_blob;
+        throw_if_failed(
+            D3DX12SerializeVersionedRootSignature(&rs_desc,
+                D3D_ROOT_SIGNATURE_VERSION_1_1, &rs_blob, &err_blob),
+            "PathTracer: serialize cloth root signature failed");
+        throw_if_failed(
+            device->CreateRootSignature(0,
+                rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(),
+                IID_PPV_ARGS(&m_cloth_root_sig)),
+            "PathTracer: create cloth root signature failed");
+        m_cloth_root_sig->SetName(L"MARS::PathTracer::ClothRootSig");
+    }
+
+    auto dxil = load_dxil_blob(L"cloth_sim.dxil");
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
+    pso_desc.pRootSignature = m_cloth_root_sig.Get();
+    pso_desc.CS             = { dxil.data(), dxil.size() };
+
+    throw_if_failed(
+        device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&m_cloth_pso)),
+        "PathTracer: create cloth compute PSO failed");
+    m_cloth_pso->SetName(L"MARS::PathTracer::ClothPSO");
+}
+
+// ---------------------------------------------------------------------------
+// dispatch_cloth_sim
+// Runs INTEGRATE pass then CONSTRAIN pass on the given ClothInstance.
+// After this call, gpu.output_vertex_uav() contains the final deformed verts.
+// ---------------------------------------------------------------------------
+void PathTracer::dispatch_cloth_sim(ID3D12GraphicsCommandList6* cmd_list,
+                                    ClothInstance&             ci,
+                                    const Vec3&                wind,
+                                    float                      delta_time)
+{
+    const ClothDesc& cd   = ci.cloth_desc;
+    const uint32_t   n    = ci.vertex_count;
+    const uint32_t   gw   = cd.grid_w;
+    const uint32_t   gh   = cd.grid_h;
+
+    static bool s_logged = false;
+    if (!s_logged)
+    {
+        s_logged = true;
+        MARS_LOG("[PathTracer] dispatch_cloth_sim '{}': n={} gw={} gh={}"
+                     " pos_prev_srv={} pos_curr_srv={} pos_pred_a_uav={} out_vtx_uav={}"
+                     " dt={} inv_mass={} rest_struct={} rest_shear={} rest_bend={}",
+                     ci.name, n, gw, gh,
+                     ci.gpu.pos_prev_srv(), ci.gpu.pos_curr_srv(),
+                     ci.gpu.pos_pred_a_uav(), ci.gpu.output_vertex_uav(),
+                     delta_time,
+                     cd.mass > 0.0f ? 1.0f / cd.mass : 0.0f,
+                     ci.rest_len_struct, ci.rest_len_shear, ci.rest_len_bend);
+    }
+
+    cmd_list->SetComputeRootSignature(m_cloth_root_sig.Get());
+    cmd_list->SetPipelineState(m_cloth_pso.Get());
+    cmd_list->SetComputeRootDescriptorTable(1, m_bindless_heap_gpu_start);
+
+    // ClothConstants HLSL layout (28 DWORDs):
+    //  [0]  grid_w       [1]  grid_h        [2]  vertex_count  [3]  delta_time
+    //  [4..6] gravity    [7]  inv_mass
+    //  [8..10] wind      [11] damping
+    //  [12] structural_compliance  [13] shear_compliance  [14] bend_compliance
+    //  [15] rest_len_struct  [16] rest_len_shear  [17] rest_len_bend
+    //  [18] pos_prev_srv    [19] pos_curr_srv
+    //  [20] pos_prev_uav    [21] pos_curr_uav
+    //  [22] pos_pred_a_uav
+    //  [23] output_vertex_uav
+    //  [24] sim_pass
+    //  [25] constrain_read_srv   [26] constrain_write_uav
+    //  [27] pin_corners
+
+    const float    inv_mass   = (cd.mass > 0.0f) ? (1.0f / cd.mass) : 0.0f;
+    auto&          gpu        = ci.gpu;
+    const uint32_t dispatch_x = (n + 63u) / 64u;
+
+    D3D12_RESOURCE_BARRIER uav_barrier{};
+    uav_barrier.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uav_barrier.UAV.pResource = nullptr;
+
+    auto fill_common = [&](uint32_t c[28])
+    {
+        c[ 0] = gw;
+        c[ 1] = gh;
+        c[ 2] = n;
+        c[ 3] = std::bit_cast<uint32_t>(delta_time);
+        c[ 4] = std::bit_cast<uint32_t>(0.0f);
+        c[ 5] = std::bit_cast<uint32_t>(-9.8f);
+        c[ 6] = std::bit_cast<uint32_t>(0.0f);
+        c[ 7] = std::bit_cast<uint32_t>(inv_mass);
+        c[ 8] = std::bit_cast<uint32_t>(wind.x);
+        c[ 9] = std::bit_cast<uint32_t>(wind.y);
+        c[10] = std::bit_cast<uint32_t>(wind.z);
+        c[11] = std::bit_cast<uint32_t>(cd.damping);
+        c[12] = std::bit_cast<uint32_t>(cd.structural_compliance);
+        c[13] = std::bit_cast<uint32_t>(cd.shear_compliance);
+        c[14] = std::bit_cast<uint32_t>(cd.bend_compliance);
+        c[15] = std::bit_cast<uint32_t>(ci.rest_len_struct);
+        c[16] = std::bit_cast<uint32_t>(ci.rest_len_shear);
+        c[17] = std::bit_cast<uint32_t>(ci.rest_len_bend);
+        c[18] = gpu.pos_prev_srv();
+        c[19] = gpu.pos_curr_srv();
+        c[20] = gpu.pos_prev_uav();
+        c[21] = gpu.pos_curr_uav();
+        c[22] = gpu.pos_pred_a_uav();
+        c[23] = gpu.output_vertex_uav();
+    };
+
+    // --- PASS 0: INTEGRATE ---------------------------------------------------
+    {
+        uint32_t c[28]{};
+        fill_common(c);
+        c[24] = 0u;   // sim_pass = INTEGRATE
+        c[25] = 0u;   // constrain_read_srv  (unused)
+        c[26] = 0u;   // constrain_write_uav (unused)
+        c[27] = cd.pin_corners;
+        cmd_list->SetComputeRoot32BitConstants(0, 28, c, 0);
+        cmd_list->Dispatch(dispatch_x, 1, 1);
+        cmd_list->ResourceBarrier(1, &uav_barrier);
+    }
+
+    // --- PASS 1: CONSTRAIN (xpbd_iterations times) ---------------------------
+    // Ping-pongs between pred_a and pred_b.
+    // First iteration reads pred_a (integrate output) and writes pred_b.
+    bool read_pred_a = true;
+    for (uint32_t iter = 0; iter < cd.xpbd_iterations; ++iter)
+    {
+        const uint32_t read_srv  = read_pred_a ? gpu.pos_pred_a_srv() : gpu.pos_pred_b_srv();
+        const uint32_t write_uav = read_pred_a ? gpu.pos_pred_b_uav() : gpu.pos_pred_a_uav();
+
+        uint32_t c[28]{};
+        fill_common(c);
+        c[24] = 1u;
+        c[25] = read_srv;
+        c[26] = write_uav;
+        c[27] = cd.pin_corners;
+        cmd_list->SetComputeRoot32BitConstants(0, 28, c, 0);
+        cmd_list->Dispatch(dispatch_x, 1, 1);
+        cmd_list->ResourceBarrier(1, &uav_barrier);
+
+        read_pred_a = !read_pred_a;
+    }
+
+    // --- PASS 2: FINALIZE ----------------------------------------------------
+    // Rotate state: pos_prev = old pos_curr, pos_curr = final prediction.
+    // After the loop read_pred_a was flipped one extra time; the last
+    // CONSTRAIN wrote to the buffer that is now "NOT read_pred_a".
+    {
+        const uint32_t final_srv = read_pred_a ? gpu.pos_pred_a_srv() : gpu.pos_pred_b_srv();
+
+        uint32_t c[28]{};
+        fill_common(c);
+        c[24] = 2u;
+        c[25] = final_srv;
+        c[26] = 0u;
+        c[27] = cd.pin_corners;
+        cmd_list->SetComputeRoot32BitConstants(0, 28, c, 0);
+        cmd_list->Dispatch(dispatch_x, 1, 1);
+        cmd_list->ResourceBarrier(1, &uav_barrier);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -488,9 +753,14 @@ void PathTracer::create_rtpso(DeviceContext& ctx)
     hg->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
 
     // Shader config: payload = float3 radiance + float hit_t + uint missed + uint depth + float3 throughput + float3 sec_normal
+    // Total: 12 + 4 + 4 + 4 + 12 + 12 = 48 bytes (C++ layout).
+    // The compiled HLSL Miss shader reports 56 bytes — the HLSL payload struct
+    // contains an extra 8 bytes (e.g. padding or an additional field).  This
+    // value must be >= the largest payload size reported by any shader in the
+    // library; use 56 to match what the driver validates against.
     auto* shader_cfg = so_desc.CreateSubobject<CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT>();
     shader_cfg->Config(
-        sizeof(float) * 4 + sizeof(uint32_t) * 2 + sizeof(float) * 6, // payload size (48 bytes)
+        56,                // payload size: 56 bytes (matches compiled HLSL Miss shader)
         sizeof(float) * 2);                   // attribute size (barycentrics)
 
     // Pipeline config: max recursion depth 3 (primary + up to 2 GI bounces; shadow is a separate non-recursive dispatch)
@@ -982,14 +1252,21 @@ uint32_t PathTracer::build_blas(DeviceContext& ctx,
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuild{};
     device->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &prebuild);
 
-    // Allocate scratch buffer (DEFAULT heap, UAV)
+    // Allocate scratch buffer (DEFAULT heap, UAV).
+    // When allow_update is requested the scratch must also be large enough
+    // to serve as an update scratch on every subsequent refit call.
+    // UpdateScratchDataSizeInBytes can exceed ScratchDataSizeInBytes on some
+    // drivers, so we always allocate the maximum of the two.
     D3D12MA::Allocation* scratch_alloc = nullptr;
     ID3D12Resource*      scratch       = nullptr;
     {
         D3D12MA::ALLOCATION_DESC ad{};  ad.HeapType = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC bd{};
         bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bd.Width            = prebuild.ScratchDataSizeInBytes;
+        bd.Width            = allow_update
+                                  ? std::max(prebuild.ScratchDataSizeInBytes,
+                                             prebuild.UpdateScratchDataSizeInBytes)
+                                  : prebuild.ScratchDataSizeInBytes;
         bd.Height           = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
         bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         bd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -1005,7 +1282,8 @@ uint32_t PathTracer::build_blas(DeviceContext& ctx,
         D3D12MA::ALLOCATION_DESC ad{};  ad.HeapType = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC bd{};
         bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bd.Width            = prebuild.ResultDataMaxSizeInBytes;
+        bd.Width            = align_up(prebuild.ResultDataMaxSizeInBytes,
+                                       D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
         bd.Height           = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
         bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         bd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
@@ -1044,17 +1322,288 @@ uint32_t PathTracer::build_blas(DeviceContext& ctx,
         ctx.flush_gpu();
     }
 
-    // Free scratch immediately after build
-    scratch_alloc->Release();
+    // Free scratch immediately after build — UNLESS allow_update is requested,
+    // in which case the scratch must be kept alive for per-frame BLAS refits.
+    if (!allow_update)
+        scratch_alloc->Release();
 
     uint32_t index = static_cast<uint32_t>(m_blas_list.size());
-    m_blas_list.push_back({ result_alloc, result });
+    BlasEntry entry{};
+    entry.alloc        = result_alloc;
+    entry.resource     = result;
+    entry.allow_update = allow_update;
+    if (allow_update)
+    {
+        entry.scratch_alloc = scratch_alloc;
+        entry.scratch       = scratch;
+        entry.vertex_count  = mesh.vertex_count();
+        entry.index_count   = mesh.index_count();
+    }
+    m_blas_list.push_back(entry);
     return index;
 }
 
 // ---------------------------------------------------------------------------
-// set_instance
+// build_skinned_blas
+// Like build_blas but keeps a persistent scratch buffer and uses ALLOW_UPDATE
+// so the BLAS can be refitted each frame after GPU skinning.
 // ---------------------------------------------------------------------------
+uint32_t PathTracer::build_skinned_blas(DeviceContext& ctx, const GpuMeshBuffer& mesh)
+{
+    auto* device = ctx.device();
+
+    D3D12_RAYTRACING_GEOMETRY_DESC geom_desc{};
+    geom_desc.Type                                 = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+    geom_desc.Flags                                = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+    geom_desc.Triangles.VertexBuffer.StartAddress  = mesh.skinned_vertex_buffer()->GetGPUVirtualAddress();
+    geom_desc.Triangles.VertexBuffer.StrideInBytes = sizeof(Vertex);
+    geom_desc.Triangles.VertexFormat               = DXGI_FORMAT_R32G32B32_FLOAT;
+    geom_desc.Triangles.VertexCount                = mesh.vertex_count();
+    geom_desc.Triangles.IndexBuffer                = mesh.index_buffer_view().BufferLocation;
+    geom_desc.Triangles.IndexFormat                = DXGI_FORMAT_R32_UINT;
+    geom_desc.Triangles.IndexCount                 = mesh.index_count();
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
+    inputs.Type           = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    inputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    inputs.NumDescs       = 1;
+    inputs.pGeometryDescs = &geom_desc;
+    inputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE |
+                            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
+
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuild{};
+    device->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &prebuild);
+
+    D3D12MA::ALLOCATION_DESC ad{}; ad.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+
+    // Persistent scratch — kept alive across frames for refit.
+    // Must be large enough for both the initial full build (ScratchDataSizeInBytes)
+    // and subsequent per-frame update passes (UpdateScratchDataSizeInBytes).
+    // UpdateScratchDataSizeInBytes can be smaller than ScratchDataSizeInBytes, so
+    // we take the maximum to guarantee the buffer is never undersized for either use.
+    D3D12MA::Allocation* scratch_alloc = nullptr;
+    ID3D12Resource*      scratch       = nullptr;
+    {
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width            = std::max(prebuild.ScratchDataSizeInBytes,
+                                       prebuild.UpdateScratchDataSizeInBytes);
+        bd.Height           = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        throw_if_failed(m_allocator->CreateResource(&ad, &bd,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, &scratch_alloc, IID_PPV_ARGS(&scratch)),
+            "SkinnedBLAS: create scratch failed");
+    }
+
+    D3D12MA::Allocation* result_alloc = nullptr;
+    ID3D12Resource*      result       = nullptr;
+    {
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width            = align_up(prebuild.ResultDataMaxSizeInBytes,
+                                       D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+        bd.Height           = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+                              D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE;
+        throw_if_failed(m_allocator->CreateResource(&ad, &bd,
+            D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr,
+            &result_alloc, IID_PPV_ARGS(&result)),
+            "SkinnedBLAS: create result failed");
+    }
+
+    // Initial full build using a temporary command list.
+    // The persistent scratch is already sized for ScratchDataSizeInBytes, so
+    // it can be reused directly here — no separate temporary allocation needed.
+    {
+        ComPtr<ID3D12CommandAllocator>     alloc_cmd;
+        ComPtr<ID3D12GraphicsCommandList6> cmd;
+        throw_if_failed(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        IID_PPV_ARGS(&alloc_cmd)), "SkinnedBLAS: CreateCommandAllocator failed");
+        throw_if_failed(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        alloc_cmd.Get(), nullptr, IID_PPV_ARGS(&cmd)), "SkinnedBLAS: CreateCommandList failed");
+
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC build_desc{};
+        build_desc.Inputs                           = inputs;
+        build_desc.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+        build_desc.DestAccelerationStructureData    = result->GetGPUVirtualAddress();
+
+        cmd->BuildRaytracingAccelerationStructure(&build_desc, 0, nullptr);
+
+        D3D12_RESOURCE_BARRIER uav_barrier{};
+        uav_barrier.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        uav_barrier.UAV.pResource = result;
+        cmd->ResourceBarrier(1, &uav_barrier);
+        cmd->Close();
+
+        ID3D12CommandList* lists[] = { cmd.Get() };
+        ctx.direct_queue()->ExecuteCommandLists(1, lists);
+        ctx.flush_gpu();
+    }
+
+    BlasEntry entry{};
+    entry.alloc         = result_alloc;
+    entry.resource      = result;
+    entry.scratch_alloc = scratch_alloc;
+    entry.scratch       = scratch;
+    entry.allow_update  = true;
+    entry.vertex_count  = mesh.vertex_count();
+    entry.index_count   = mesh.index_count();
+
+    uint32_t index = static_cast<uint32_t>(m_blas_list.size());
+    m_blas_list.push_back(entry);
+    return index;
+}
+
+// ---------------------------------------------------------------------------
+// refit_blas
+// Issues an in-place BLAS update (refit) for a skinned mesh using the
+// skinned vertex buffer written by dispatch_skinning().
+// Call this after dispatch_skinning() and a UAV barrier, before build_tlas().
+// ---------------------------------------------------------------------------
+void PathTracer::refit_blas(DeviceContext& /*ctx*/,
+                             ID3D12GraphicsCommandList6* cmd_list,
+                             uint32_t blas_index,
+                             const GpuMeshBuffer& mesh)
+{
+    assert(blas_index < m_blas_list.size());
+    BlasEntry& entry = m_blas_list[blas_index];
+    assert(entry.allow_update && entry.scratch);
+
+    D3D12_RAYTRACING_GEOMETRY_DESC geom_desc{};
+    geom_desc.Type                                 = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+    geom_desc.Flags                                = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+    geom_desc.Triangles.VertexBuffer.StartAddress  = mesh.skinned_vertex_buffer()->GetGPUVirtualAddress();
+    geom_desc.Triangles.VertexBuffer.StrideInBytes = sizeof(Vertex);
+    geom_desc.Triangles.VertexFormat               = DXGI_FORMAT_R32G32B32_FLOAT;
+    geom_desc.Triangles.VertexCount                = entry.vertex_count;
+    geom_desc.Triangles.IndexBuffer                = mesh.index_buffer_view().BufferLocation;
+    geom_desc.Triangles.IndexFormat                = DXGI_FORMAT_R32_UINT;
+    geom_desc.Triangles.IndexCount                 = entry.index_count;
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
+    inputs.Type           = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    inputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    inputs.NumDescs       = 1;
+    inputs.pGeometryDescs = &geom_desc;
+    inputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE |
+                            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC refit_desc{};
+    refit_desc.Inputs                           = inputs;
+    refit_desc.ScratchAccelerationStructureData = entry.scratch->GetGPUVirtualAddress();
+    refit_desc.SourceAccelerationStructureData  = entry.resource->GetGPUVirtualAddress();
+    refit_desc.DestAccelerationStructureData    = entry.resource->GetGPUVirtualAddress();
+
+    cmd_list->BuildRaytracingAccelerationStructure(&refit_desc, 0, nullptr);
+
+    D3D12_RESOURCE_BARRIER uav_barrier{};
+    uav_barrier.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uav_barrier.UAV.pResource = entry.resource;
+    cmd_list->ResourceBarrier(1, &uav_barrier);
+}
+
+// ---------------------------------------------------------------------------
+// refit_blas (cloth overload)
+// Same as the GpuMeshBuffer overload but accepts an explicit vertex resource.
+// Used by cloth instances whose deformed vertices live in ClothGpuResources.
+// ---------------------------------------------------------------------------
+void PathTracer::refit_blas(DeviceContext& /*ctx*/,
+                             ID3D12GraphicsCommandList6* cmd_list,
+                             uint32_t blas_index,
+                             ID3D12Resource* vertex_resource,
+                             uint32_t vertex_count,
+                             uint32_t index_count,
+                             ID3D12Resource* index_resource)
+{
+    assert(blas_index < m_blas_list.size());
+    BlasEntry& entry = m_blas_list[blas_index];
+    assert(entry.allow_update && entry.scratch);
+
+    static bool s_logged = false;
+    if (!s_logged)
+    {
+        s_logged = true;
+        MARS_LOG("[PathTracer] refit_blas(cloth): blas_index={} vtx_res={} vtx_count={}"
+                     " idx_res={} idx_count={} scratch={} result={}",
+                     blas_index,
+                     static_cast<void*>(vertex_resource), vertex_count,
+                     static_cast<void*>(index_resource),  index_count,
+                     static_cast<void*>(entry.scratch),
+                     static_cast<void*>(entry.resource));
+    }
+
+    D3D12_RAYTRACING_GEOMETRY_DESC geom_desc{};
+    geom_desc.Type                                 = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+    geom_desc.Flags                                = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+    geom_desc.Triangles.VertexBuffer.StartAddress  = vertex_resource->GetGPUVirtualAddress();
+    geom_desc.Triangles.VertexBuffer.StrideInBytes = sizeof(Vertex);
+    geom_desc.Triangles.VertexFormat               = DXGI_FORMAT_R32G32B32_FLOAT;
+    geom_desc.Triangles.VertexCount                = vertex_count;
+    geom_desc.Triangles.IndexBuffer                = index_resource->GetGPUVirtualAddress();
+    geom_desc.Triangles.IndexFormat                = DXGI_FORMAT_R32_UINT;
+    geom_desc.Triangles.IndexCount                 = index_count;
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
+    inputs.Type           = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    inputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    inputs.NumDescs       = 1;
+    inputs.pGeometryDescs = &geom_desc;
+    inputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE |
+                            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC refit_desc{};
+    refit_desc.Inputs                           = inputs;
+    refit_desc.ScratchAccelerationStructureData = entry.scratch->GetGPUVirtualAddress();
+    refit_desc.SourceAccelerationStructureData  = entry.resource->GetGPUVirtualAddress();
+    refit_desc.DestAccelerationStructureData    = entry.resource->GetGPUVirtualAddress();
+
+    cmd_list->BuildRaytracingAccelerationStructure(&refit_desc, 0, nullptr);
+
+    D3D12_RESOURCE_BARRIER uav_barrier{};
+    uav_barrier.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uav_barrier.UAV.pResource = entry.resource;
+    cmd_list->ResourceBarrier(1, &uav_barrier);
+}
+// Uploads a CPU bone palette to the mesh's bone palette upload buffer and
+// dispatches the skinning compute shader to produce skinned vertices.
+// Call this before refit_blas() on the same command list.
+// ---------------------------------------------------------------------------
+void PathTracer::dispatch_skinning(ID3D12GraphicsCommandList6* cmd_list,
+                                    const GpuMeshBuffer& mesh,
+                                    const std::vector<Mat4x4>& bone_palette)
+{
+    assert(mesh.is_skinned());
+    assert(!bone_palette.empty());
+
+    // Upload bone palette to the mesh's CPU-writable upload buffer.
+    mesh.upload_bone_palette(bone_palette);
+
+    // Bind the skinning pipeline.
+    cmd_list->SetComputeRootSignature(m_skinning_root_sig.Get());
+    cmd_list->SetPipelineState(m_skinning_pso.Get());
+
+    // Root constants: [vertex_count, src_vertex_srv, bone_palette_srv, dst_vertex_uav]
+    const uint32_t constants[4] = {
+        mesh.vertex_count(),
+        mesh.vertex_srv_slot(),
+        mesh.bone_palette_srv_slot(),
+        mesh.skinned_vertex_uav_slot()
+    };
+    cmd_list->SetComputeRoot32BitConstants(0, 4, constants, 0);
+
+    // Dispatch — 64 threads per group (matches [numthreads(64,1,1)] in skinning.hlsl)
+    constexpr uint32_t k_threads = 64;
+    const uint32_t groups = (mesh.vertex_count() + k_threads - 1) / k_threads;
+    cmd_list->Dispatch(groups, 1, 1);
+
+    // UAV barrier so the skinned vertex buffer is ready for BLAS refit.
+    D3D12_RESOURCE_BARRIER uav{};
+    uav.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uav.UAV.pResource = mesh.skinned_vertex_buffer();
+    cmd_list->ResourceBarrier(1, &uav);
+}
 void PathTracer::set_instance(uint32_t instance_index,
                                uint32_t blas_index,
                                const Mat4x4& transform,
@@ -1071,6 +1620,7 @@ void PathTracer::set_instance(uint32_t instance_index,
 // ---------------------------------------------------------------------------
 void PathTracer::build_tlas(DeviceContext& ctx,
                              ID3D12GraphicsCommandList6* cmd_list,
+                             uint32_t frame_index,
                              bool allow_update)
 {
     auto* device = ctx.device();
@@ -1078,10 +1628,11 @@ void PathTracer::build_tlas(DeviceContext& ctx,
     uint32_t instance_count = static_cast<uint32_t>(m_instances.size());
     if (instance_count == 0)
     {
-        std::println("[PathTracer] build_tlas: instance_count == 0 — TLAS not built, tlas_srv_slot stays UINT32_MAX.");
+        MARS_LOG("[PathTracer] build_tlas: instance_count == 0 — TLAS not built, tlas_srv_slot stays UINT32_MAX.");
         return;
     }
-    std::println("[PathTracer] build_tlas: building TLAS for {} instance(s).", instance_count);
+    if (frame_index < 3)
+        MARS_LOG("[PathTracer] build_tlas: building TLAS for {} instance(s).", instance_count);
 
     // Upload instance descriptors to an upload buffer
     uint64_t instance_buf_size = sizeof(D3D12_RAYTRACING_INSTANCE_DESC) * instance_count;
@@ -1117,6 +1668,16 @@ void PathTracer::build_tlas(DeviceContext& ctx,
         d.InstanceContributionToHitGroupIndex = 0;
         d.Flags                               = D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
         d.AccelerationStructure               = m_blas_list[inst.blas_index].resource->GetGPUVirtualAddress();
+
+        static uint32_t s_tlas_log_count = 0;
+        if (s_tlas_log_count < instance_count)
+        {
+            ++s_tlas_log_count;
+            MARS_LOG("[PathTracer] build_tlas: inst[{}] blas_index={} mat={} gpu_va={:#018x} allow_update={}",
+                         i, inst.blas_index, inst.material_index,
+                         d.AccelerationStructure,
+                         m_blas_list[inst.blas_index].allow_update);
+        }
     }
     m_instance_buffer->Unmap(0, nullptr);
 
@@ -1181,7 +1742,8 @@ void PathTracer::build_tlas(DeviceContext& ctx,
     if (m_tlas_srv_slot == UINT32_MAX)
         m_tlas_srv_slot = ctx.allocate_bindless_slot();
 
-    std::println("[PathTracer] build_tlas: TLAS built successfully. tlas_srv_slot = {}.", m_tlas_srv_slot);
+    if (frame_index < 3)
+        MARS_LOG("[PathTracer] build_tlas: TLAS built successfully. tlas_srv_slot = {}.", m_tlas_srv_slot);
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
     srv_desc.Format                                   = DXGI_FORMAT_UNKNOWN;
@@ -1307,7 +1869,7 @@ void PathTracer::upload_scene_buffers(DeviceContext& ctx,
                       L"MARS::MaterialDataBuffer",
                       m_material_data_alloc, m_material_data_buffer, m_material_data_srv_slot);
 
-    std::println("[PathTracer] upload_scene_buffers: instance_srv={} material_srv={}",
+    MARS_LOG("[PathTracer] upload_scene_buffers: instance_srv={} material_srv={}",
                  m_instance_data_srv_slot, m_material_data_srv_slot);
 }
 
@@ -1383,7 +1945,7 @@ void PathTracer::trace(ID3D12GraphicsCommandList6* cmd_list,
         if (!s_logged)
         {
             s_logged = true;
-            std::println("[PathTracer] trace() early-return: initialised={} tlas_srv_slot={}",
+            MARS_LOG("[PathTracer] trace() early-return: initialised={} tlas_srv_slot={}",
                          m_initialised ? "true" : "false", m_tlas_srv_slot);
         }
         return;
@@ -1396,7 +1958,7 @@ void PathTracer::trace(ID3D12GraphicsCommandList6* cmd_list,
         if (!s_logged_out)
         {
             s_logged_out = true;
-            std::println("[PathTracer] trace() early-return: output[{}] not ready ({}x{}, resource={})",
+            MARS_LOG("[PathTracer] trace() early-return: output[{}] not ready ({}x{}, resource={})",
                          output_index, out.width, out.height,
                          out.resource ? "valid" : "null");
         }

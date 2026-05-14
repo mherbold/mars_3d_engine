@@ -92,6 +92,7 @@ struct PrimaryPayload
     uint   depth;        // 0 = primary, 1+ = GI bounce index
     float3 throughput;   // accumulated path throughput (product of BRDF/pdf weights so far)
     float3 sec_normal;   // world-space shading normal at this hit (used by the calling bounce)
+    float2 motion_vec;   // screen-space motion vector (prevNDC - currNDC, Y-flipped); written by ClosestHit
 };
 
 struct ShadowPayload
@@ -283,6 +284,7 @@ void RayGen()
     payload.depth      = 0u;
     payload.throughput = float3(1, 1, 1);
     payload.sec_normal = float3(0, 1, 0);
+    payload.motion_vec = float2(0.0f, 0.0f);
 
     TraceRay(g_TLAS[g_Frame.tlas_slot],
              0u,             // RAY_FLAG_NONE
@@ -305,13 +307,21 @@ void RayGen()
         // (screen-space convention where pixel row 0 is at the top).
         float2 motionVec = float2(0.0f, 0.0f);
 
-        float3 mvWorldPos;
-        if (payload.missed == 0u && payload.hit_t > 0.0f)
-            mvWorldPos = ray.Origin + ray.Direction * payload.hit_t;
-        else
-            mvWorldPos = ray.Origin + ray.Direction * 1e5f; // sky: far-plane point
-
+        if (payload.missed == 0u && payload.hit_t > 0.0f && any(payload.motion_vec != float2(0.0f, 0.0f)))
         {
+            // ClosestHit computed a per-vertex motion vector (cloth / deformable geometry).
+            motionVec = payload.motion_vec;
+        }
+        else
+        {
+            // Camera-motion fallback: project the world-space hit point (or sky sentinel)
+            // through both current and previous VP to capture rigid object + camera motion.
+            float3 mvWorldPos;
+            if (payload.missed == 0u && payload.hit_t > 0.0f)
+                mvWorldPos = ray.Origin + ray.Direction * payload.hit_t;
+            else
+                mvWorldPos = ray.Origin + ray.Direction * 1e5f; // sky: far-plane point
+
             float4 currClip = mul(g_Frame.view_proj,      float4(mvWorldPos, 1.0f));
             float4 prevClip = mul(g_Frame.prev_view_proj, float4(mvWorldPos, 1.0f));
 
@@ -451,6 +461,9 @@ void ClosestHit(inout PrimaryPayload payload, in BuiltInTriangleIntersectionAttr
     uint primitiveIndex = PrimitiveIndex();
     float2 bary         = attr.barycentrics;
 
+    // Initialise motion_vec for depth-0 hits; overwritten below when prev buffer is available.
+    payload.motion_vec = float2(0.0f, 0.0f);
+
     // Fetch interpolated vertex data
     TriangleVertices tri = FetchInterpolatedVertex(instanceIndex, primitiveIndex, bary);
 
@@ -485,6 +498,38 @@ void ClosestHit(inout PrimaryPayload payload, in BuiltInTriangleIntersectionAttr
         N = -N;   // flip for double-sided surfaces
 
     uint2 pixelIdx = DispatchRaysIndex().xy;
+
+    // ---- Per-vertex motion vector for cloth / deformable geometry ----------------
+    // If the instance carries a previous-frame position buffer (cloth sim pos_prev),
+    // interpolate the previous-frame world position from that buffer and compute the
+    // full per-surface motion vector here, storing it in the payload for RayGen to use.
+    // For non-cloth instances prev_vertex_buffer_srv == UINT32_MAX; in that case the
+    // motion vector is computed in RayGen from the world-space hit point as before.
+    if (payload.depth == 0u && inst.prev_vertex_buffer_srv != 0xFFFFFFFFu)
+    {
+        // pos_prev stores float3 per vertex (ByteAddressBuffer, stride 12 bytes)
+        uint baseIdx      = primitiveIndex * 3u;
+        uint i0 = g_Buffers[inst.index_buffer_srv].Load((baseIdx + 0u) * 4u);
+        uint i1 = g_Buffers[inst.index_buffer_srv].Load((baseIdx + 1u) * 4u);
+        uint i2 = g_Buffers[inst.index_buffer_srv].Load((baseIdx + 2u) * 4u);
+
+        float3 pp0 = asfloat(g_Buffers[inst.prev_vertex_buffer_srv].Load3(i0 * 12u));
+        float3 pp1 = asfloat(g_Buffers[inst.prev_vertex_buffer_srv].Load3(i1 * 12u));
+        float3 pp2 = asfloat(g_Buffers[inst.prev_vertex_buffer_srv].Load3(i2 * 12u));
+
+        float  w0 = 1.0f - bary.x - bary.y;
+        float3 prevWorldPos = pp0 * w0 + pp1 * bary.x + pp2 * bary.y;
+        // Apply instance world transform (identity for cloth, but written for generality)
+        prevWorldPos = mul(inst.world_transform, float4(prevWorldPos, 1.0f)).xyz;
+
+        float4 currClip = mul(g_Frame.view_proj,      float4(worldPos,     1.0f));
+        float4 prevClip = mul(g_Frame.prev_view_proj, float4(prevWorldPos, 1.0f));
+
+        float2 currNDC = currClip.xy / currClip.w;
+        float2 prevNDC = prevClip.xy / prevClip.w;
+        float2 delta   = prevNDC - currNDC;
+        payload.motion_vec = float2(delta.x, -delta.y); // flip Y: DLSS-RR expects screen-space Y+ down
+    }
 
     // ---- Write G-buffer AOV textures (DLSS-RR mandatory inputs) ----------------
     // Only write from primary-ray hits (depth 0). Secondary-ray hits must NOT

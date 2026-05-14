@@ -18,6 +18,7 @@
 #include "denoiser.h"
 #include "../asset/resource_manager.h"
 #include "../scene/scene.h"
+#include "../animation/animation_system.h"
 
 #include <wrl/client.h>
 #include <array>
@@ -64,6 +65,12 @@ public:
     // trace rays; otherwise falls back to the solid-color clear.
     void render_frame();
 
+    // Advance simulation by `delta_time` seconds.
+    // Updates all active animation states and, for skinned meshes,
+    // uploads bone palettes and triggers GPU skinning + BLAS refit.
+    // Call this once per frame before render_frame().
+    void update(float delta_time);
+
     // ---- Camera / scene wiring ------------------------------------------
 
     // Set the camera transform for the given output index.
@@ -76,6 +83,15 @@ public:
     // Load a .marsscene file and build the DXR acceleration structure.
     // Must be called after init(). Returns false on parse/load errors.
     bool load_scene(const std::string& marsscene_path);
+
+    // Set the animated wind description used for cloth simulation.
+    // Call after load_scene() to override the scene-file wind, or let
+    // load_scene() populate it automatically.
+    void set_wind_desc(const WindDesc& desc) { m_wind_desc = desc; m_wind_state = {}; }
+    const WindDesc& wind_desc() const        { return m_wind_desc; }
+
+    // Returns the instantaneous evaluated wind vector (updated each update() call).
+    Vec3 wind() const { return m_wind_current; }
 
     // Rebuild the TLAS from the current scene (e.g. after adding instances).
     void rebuild_tlas();
@@ -94,6 +110,7 @@ public:
     Scene&            scene()             { return m_scene; }
     const Scene&      scene()       const { return m_scene; }
     ResourceManager&  resource_manager()  { return m_resource_mgr; }
+    AnimationSystem&  animation_system()  { return m_anim_system; }
 
     // ---- Accessors ----------------------------------------------------------
     DeviceContext&   device_context()              { return m_device_ctx; }
@@ -120,6 +137,7 @@ private:
     Denoiser        m_denoiser;
     ResourceManager m_resource_mgr;
     Scene           m_scene;
+    AnimationSystem m_anim_system;
 
     // Per-frame command allocators (one per back buffer).
     std::array<ComPtr<ID3D12CommandAllocator>, k_frame_count>  m_cmd_allocators;
@@ -144,8 +162,25 @@ private:
     };
     std::vector<CameraState> m_cameras;
 
-    uint32_t m_frame_index = 0;  // monotonically increasing (for temporal jitter)
-    bool     m_initialised = false;
+    uint32_t m_frame_index       = 0;
+    bool     m_initialised       = false;
+    bool     m_rigid_nodes_dirty = false;
+    bool     m_cloth_dirty       = false;   // true when cloth instances need GPU sim + BLAS refit
+    float    m_last_delta_time        = 0.0f;  // stored by update(), used by render_frame_path_traced()
+    float    m_cloth_time_accumulator  = 0.0f;  // leftover time carried between frames for fixed-step cloth sim
+
+    // ---- Wind state ---------------------------------------------------------
+    WindDesc m_wind_desc    = {};        // scene-file parameters (loaded once)
+    Vec3     m_wind_current = {};        // evaluated wind vector this frame (IIR-smoothed output)
+
+    // Runtime phase accumulators for the three oscillator layers.
+    struct WindState
+    {
+        float gust_phase      = 0.0f;
+        float wander_phase    = 0.0f;
+        float micro_phase_x   = 0.0f;
+        float micro_phase_z   = 0.0f;
+    } m_wind_state;
 
     // Per-output flag: true when slEvaluateFeature (DLSS-RR) left DenoisedOutputUAV
     // in legacy D3D12_RESOURCE_STATE_UNORDERED_ACCESS (Streamline always issues a

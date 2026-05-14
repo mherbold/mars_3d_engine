@@ -41,7 +41,7 @@ struct GpuInstanceData
     uint     material_index;             // index into g_MaterialBuffer SRV
     uint     vertex_buffer_srv;          // bindless SRV for vertex StructuredBuffer
     uint     index_buffer_srv;           // bindless SRV for index ByteAddressBuffer
-    uint     _pad;
+    uint     prev_vertex_buffer_srv;     // previous-frame positions ByteAddressBuffer (cloth); UINT32_MAX = none
 };
 
 // Bindless structured buffer containing all materials for this frame

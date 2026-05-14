@@ -23,6 +23,7 @@
 #include "frame_constants.h"
 #include "../asset/gpu_mesh_buffer.h"
 #include "../math/math_types.h"
+#include "../scene/scene_types.h"
 
 #include <wrl/client.h>
 #include <cstdint>
@@ -43,10 +44,10 @@ struct CpuInstanceData
 {
     float    world_transform[4][4]              = {};
     float    world_transform_inv_transpose[4][4]= {};
-    uint32_t material_index    = 0;
-    uint32_t vertex_buffer_srv = UINT32_MAX;
-    uint32_t index_buffer_srv  = UINT32_MAX;
-    uint32_t _pad              = 0;
+    uint32_t material_index          = 0;
+    uint32_t vertex_buffer_srv       = UINT32_MAX;
+    uint32_t index_buffer_srv        = UINT32_MAX;
+    uint32_t prev_vertex_buffer_srv  = UINT32_MAX; // previous-frame vertex positions (cloth); UINT32_MAX = none
 };
 
 struct CpuMaterialData
@@ -128,6 +129,7 @@ public:
 
     void build_tlas(DeviceContext& ctx,
                     ID3D12GraphicsCommandList6* cmd_list,
+                    uint32_t frame_index,
                     bool allow_update = false);
 
     // ---------------------------------------------------------------------------
@@ -212,6 +214,47 @@ public:
     // Default is 1. Set to 2 for richer color bleeding and inter-reflection.
     void set_gi_bounce_count(uint32_t count) { m_gi_bounce_count = count; }
 
+    // ---------------------------------------------------------------------------
+    // Animation / skinning
+    // Build a BLAS that supports incremental refit (ALLOW_UPDATE flag).
+    // The returned index should be used with refit_blas() each frame.
+    // ---------------------------------------------------------------------------
+    uint32_t build_skinned_blas(DeviceContext& ctx, const GpuMeshBuffer& mesh);
+
+    // Refit a previously built skinned BLAS using the mesh's skinned vertex buffer
+    // (populated by dispatch_skinning). Must be called before build_tlas().
+    void refit_blas(DeviceContext& ctx,
+                    ID3D12GraphicsCommandList6* cmd_list,
+                    uint32_t blas_index,
+                    const GpuMeshBuffer& mesh);
+
+    // Overload for cloth: refit using an explicit vertex resource (the cloth
+    // output vertex buffer written by dispatch_cloth_sim).
+    void refit_blas(DeviceContext& ctx,
+                    ID3D12GraphicsCommandList6* cmd_list,
+                    uint32_t blas_index,
+                    ID3D12Resource* vertex_resource,
+                    uint32_t vertex_count,
+                    uint32_t index_count,
+                    ID3D12Resource* index_resource);
+
+    // Upload a bone palette (array of Mat4x4) to the mesh's bone palette buffer
+    // and dispatch the skinning compute shader. Must be called before refit_blas().
+    void dispatch_skinning(ID3D12GraphicsCommandList6* cmd_list,
+                           const GpuMeshBuffer& mesh,
+                           const std::vector<Mat4x4>& bone_palette);
+
+    // ---------------------------------------------------------------------------
+    // Cloth simulation
+    // Dispatch the two-pass cloth compute shader (INTEGRATE then CONSTRAIN).
+    // Must be called before refit_blas() for the cloth BLAS.
+    // `ci` is the ClothInstance whose gpu buffers will be written.
+    // ---------------------------------------------------------------------------
+    void dispatch_cloth_sim(ID3D12GraphicsCommandList6* cmd_list,
+                            ClothInstance&             ci,
+                            const Vec3&                wind,
+                            float                      delta_time);
+
 private:
     // --- Helpers -------------------------------------------------------------
     void create_allocator(DeviceContext& ctx);
@@ -221,6 +264,8 @@ private:
     void create_cb_ring(DeviceContext& ctx);
 
     void create_blit_pipeline(DeviceContext& ctx);
+    void create_skinning_pipeline(DeviceContext& ctx);
+    void create_cloth_pipeline(DeviceContext& ctx);
 
     void release_output_textures();
 
@@ -254,8 +299,14 @@ private:
     // --- BLAS list -----------------------------------------------------------
     struct BlasEntry
     {
-        D3D12MA::Allocation* alloc    = nullptr;
-        ID3D12Resource*      resource = nullptr;
+        D3D12MA::Allocation* alloc          = nullptr;
+        ID3D12Resource*      resource       = nullptr;
+        // Only set for skinned (allow-update) BLASes — needed for refit each frame.
+        D3D12MA::Allocation* scratch_alloc  = nullptr;
+        ID3D12Resource*      scratch        = nullptr;
+        bool                 allow_update   = false;
+        uint32_t             vertex_count   = 0;
+        uint32_t             index_count    = 0;
     };
     std::vector<BlasEntry> m_blas_list;
 
@@ -267,7 +318,7 @@ private:
     D3D12MA::Allocation* m_instance_buf_alloc = nullptr;
     ID3D12Resource*      m_instance_buffer    = nullptr;  // D3D12_RAYTRACING_INSTANCE_DESC[]
 
-    uint32_t m_tlas_srv_slot = UINT32_MAX;
+    uint32_t m_tlas_srv_slot      = UINT32_MAX;
 
     struct InstanceDesc
     {
@@ -343,6 +394,14 @@ private:
     ComPtr<ID3D12PipelineState> m_blit_pso_hdr10;  // DXGI_FORMAT_R10G10B10A2_UNORM
     ComPtr<ID3D12PipelineState> m_blit_pso_scrgb;  // DXGI_FORMAT_R16G16B16A16_FLOAT
     D3D12_GPU_DESCRIPTOR_HANDLE m_bindless_heap_gpu_start{}; // cached from DeviceContext
+
+    // --- Skinning compute pipeline -----------------------------------------
+    ComPtr<ID3D12RootSignature> m_skinning_root_sig;
+    ComPtr<ID3D12PipelineState> m_skinning_pso;
+
+    // --- Cloth simulation compute pipeline --------------------------------
+    ComPtr<ID3D12RootSignature> m_cloth_root_sig;
+    ComPtr<ID3D12PipelineState> m_cloth_pso;
 
     // --- Scene instance / material structured buffers -----------------------
     D3D12MA::Allocation* m_instance_data_alloc   = nullptr;

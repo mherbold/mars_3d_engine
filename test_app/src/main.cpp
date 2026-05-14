@@ -17,38 +17,16 @@
 #include <mars_engine/mars_engine.h>
 
 #include <stdexcept>
+#include <format>
 #include <string>
 #include <vector>
 #include <filesystem>
 #include <chrono>
-#include <print>
-#include <cstdio>
-#include <cstdlib>
 
-// ---------------------------------------------------------------------------
-// attach_debug_console
-// In Debug builds, allocates a Win32 console and redirects stdout/stderr into
-// it so that std::println output is visible.  No-op in Release.
-// ---------------------------------------------------------------------------
-#ifdef _DEBUG
-static void attach_debug_console()
-{
-    AllocConsole();
-    SetConsoleTitleW(L"MARS Debug Output");
-
-    // Redirect the C-runtime FILE* handles to the new console.
-    FILE* dummy = nullptr;
-    freopen_s(&dummy, "CONOUT$", "w", stdout);
-    freopen_s(&dummy, "CONOUT$", "w", stderr);
-    freopen_s(&dummy, "CONIN$",  "r", stdin);
-
-    // Make std::cout / std::cerr / std::print sync with the C FILE* streams.
-    std::setvbuf(stdout, nullptr, _IONBF, 0);
-    std::setvbuf(stderr, nullptr, _IONBF, 0);
-}
-#else
+// attach_debug_console — no longer spawns a console window; all engine log
+// output is routed through OutputDebugStringA and appears in the VS Output
+// (Debug) window via the MARS_LOG macro in the engine library.
 static void attach_debug_console() {}
-#endif
 
 // ---------------------------------------------------------------------------
 // Globals
@@ -290,18 +268,18 @@ int WINAPI WinMain(
 
     // ---- Load scene --------------------------------------------------------
     std::string scene_path = "test_scene.marsscene";
-    std::println("[Main] Working directory : '{}'", std::filesystem::current_path().string());
-    std::println("[Main] Scene path        : '{}'", std::filesystem::absolute(scene_path).string());
-    std::println("[Main] Scene file exists : {}", std::filesystem::exists(scene_path) ? "YES" : "NO");
+    MARS_LOG("[Main] Working directory : '{}'", std::filesystem::current_path().string());
+    MARS_LOG("[Main] Scene path        : '{}'", std::filesystem::absolute(scene_path).string());
+    MARS_LOG("[Main] Scene file exists : {}", std::filesystem::exists(scene_path) ? "YES" : "NO");
 
     if (std::filesystem::exists(scene_path))
     {
         bool ok = g_renderer.load_scene(scene_path);
-        std::println("[Main] load_scene() returned: {}", ok ? "true" : "false");
+        MARS_LOG("[Main] load_scene() returned: {}", ok ? "true" : "false");
     }
     else
     {
-        std::println("[Main] WARNING: scene file not found — renderer will show clear-color fallback.");
+        MARS_LOG("[Main] WARNING: scene file not found — renderer will show clear-color fallback.");
     }
 
     // ---- Initialise fly camera ---------------------------------------------
@@ -327,6 +305,13 @@ int WINAPI WinMain(
     // ---- Frame timer -------------------------------------------------------
     auto prev_time = std::chrono::steady_clock::now();
 
+    // ---- FPS display in window title (diagnostic) -------------------------
+    float  fps_accum    = 0.0f;
+    int    fps_frames   = 0;
+    float  fps_display  = 0.0f;
+    float  peak_dt_ms   = 0.0f;
+    float  fps_interval = 0.5f;  // update title every 0.5 s
+
     // ---- Main message + render loop ----------------------------------------
     MSG msg{};
     while (g_running)
@@ -344,6 +329,22 @@ int WINAPI WinMain(
         float  dt  = std::chrono::duration<float>(now - prev_time).count();
         dt         = std::min(dt, 0.1f);  // clamp to avoid spiral of death
         prev_time  = now;
+
+        // Update FPS / peak-dt display in window title
+        fps_accum  += dt;
+        peak_dt_ms  = std::max(peak_dt_ms, dt * 1000.0f);
+        ++fps_frames;
+        if (fps_accum >= fps_interval)
+        {
+            fps_display = static_cast<float>(fps_frames) / fps_accum;
+            wchar_t title[128];
+            swprintf_s(title, L"MARS  |  %.1f fps  |  peak dt: %.1f ms",
+                       fps_display, peak_dt_ms);
+            SetWindowTextW(hwnds[0], title);
+            fps_accum  = 0.0f;
+            fps_frames = 0;
+            peak_dt_ms = 0.0f;
+        }
 
         // Build movement vector from WASD / QE / Space
         mars::Vec3 move = {};
@@ -363,6 +364,8 @@ int WINAPI WinMain(
         const mars::Camera& cam = g_fly_cam.camera();
         for (uint32_t oi = 0; oi < g_renderer.display_manager().output_count(); ++oi)
             g_renderer.set_camera(oi, cam.position(), cam.view_inv(), cam.proj_inv());
+
+        g_renderer.update(dt);
 
         try { g_renderer.render_frame(); }
         catch (const std::exception& e)

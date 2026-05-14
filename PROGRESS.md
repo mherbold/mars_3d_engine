@@ -3,7 +3,7 @@
 ---
 
 ## Current Focus
-Multi-bounce GI implemented — `gi_bounce_count` in `FrameConstants` controls bounce depth (0=off, 1=single-bounce, 2=two-bounce). RTPSO max recursion raised to 3; payload carries accumulated throughput; Russian Roulette terminates paths at depth >= 1. `PathTracer::set_gi_bounce_count()` is the public toggle. Default is 1 (same behaviour as before). Ready to validate and then continue with M9 (Animation System).
+M9 (Animation System) is complete, including GPU cloth simulation for waving flags and an animated wind system. The cloth solver is a canonical XPBD implementation (INTEGRATE → CONSTRAIN×N → FINALIZE, 3-position-state buffers, implicit velocity). Wind is driven by a layered CPU oscillator model (gust + direction wander + micro-turbulence + IIR smoothing) parsed from the `WindDesc` schema in `.marsscene`. Ready to proceed with M10 (Ecosystem / Vegetation + Wind).
 
 ---
 
@@ -32,7 +32,7 @@ Multi-bounce GI implemented — `gi_bounce_count` in `FrameConstants` controls b
 | M6 | DLSS 4 integration (SR, RR, MFG) | ✅ | DLSS-RR temporal stability fully resolved post-M8: depth buffer corrected to NDC projected depth; motion vectors corrected to NDC space with proper sign, Y-flip, and scale; `cameraMotionIncluded = eTrue`; `clipToPrevClip` set to identity when MVs carry full camera motion. See Notes in AGENTS.md. |
 | M7 | ReSTIR DI + real G-buffer AOV writes | ✅ | FrameConstants extended with 4 AOV UAV slots; path_tracer.cpp root signature expanded (spaces 5–8); AOV textures allocated and filled each frame; ClosestHit writes real diffuse albedo / specular F0 / world normals / roughness to DLSS-RR G-buffer; ReSTIR DI direct lighting via RIS + shadow ray replaces the old flat NdotL; restir_di.hlsli contains shared reservoir math; DXR-dependent helpers (RIS_GenerateCandidates, ReservoirShade + shadow TraceRay) live in path_trace.hlsl; verified: dxc -T lib_6_3 compiles with -WX clean |
 | M8 | ReSTIR GI — multi-bounce global illumination | ✅ | GI implemented as BRDF-importance-sampled MC estimator with configurable bounce depth (`gi_bounce_count`; 0=off, 1=single, 2=two-bounce). Russian Roulette path termination at depth >= 1. RTPSO max recursion = 3. Reservoir-based temporal/spatial reuse removed after debugging — see Notes. DLSS-RR denoises the noisy indirect signal. |
-| M9 | Animation system + skeletal mesh rendering | 🔲 Not started |
+| M9 | Animation system + skeletal mesh rendering | ✅ | Cloth sim: canonical XPBD solver (INTEGRATE → CONSTRAIN×N → FINALIZE), 3-position-state buffers, implicit velocity, compliance-based constraints, `final_srv` inversion bug fixed. Animated wind: `WindDesc` layered oscillator (gust + direction wander + micro + IIR smoother), parsed from `.marsscene`. |
 | M10 | Ecosystem / vegetation + wind | 🔲 Not started |
 | M11 | Particle system | 🔲 Not started |
 | M12 | Weather system (rain, clouds, fog) | 🔲 Not started |
@@ -150,13 +150,17 @@ Multi-bounce GI implemented — `gi_bounce_count` in `FrameConstants` controls b
 - ✅ `PathTracer::set_gi_bounce_count(uint32_t)` public API; default = 1 (backward-compatible)
 
 ### M9 — Animation System + Skeletal Mesh Rendering
-- 🔲 CPU clip evaluation → bone palette
-- 🔲 GPU skinning compute shader (bone palette → skinned vertex buffer)
-- 🔲 BLAS refit for skinned meshes each frame
-- 🔲 1D / 2D blend trees; cross-fade between clips
-- 🔲 FABRIK IK solver for foot placement
-- 🔲 Rigid node animation (wheels, doors, flags)
-- 🔲 Compute cloth simulation for waving flags (spring lattice, wind vector)
+- ✅ Skeleton and AnimationClip data structures (bone hierarchy, keyframes, interpolation)
+- ✅ AnimationSystem class: clip evaluation, blend trees, cross-fade, bone palette computation
+- ✅ AssetImporter extensions: import_skeleton() and import_animations() from FBX/glTF via Assimp
+- ✅ GPU skinning compute shader (skinning.hlsl: bone palette → skinned vertex buffer)
+- ✅ GpuMeshBuffer extensions: skinned vertex buffer UAV, bone palette SRV, enable_skinning(), upload_bone_palette()
+- ✅ PathTracer integration: build_skinned_blas(), dispatch_skinning(), refit_blas() — skinning dispatch, bone palette upload, and per-frame BLAS refit
+- ✅ Scene integration: animated mesh instances, clip assignment, playback control — SceneLoader parses `"animation"` blocks; Renderer creates AnimationState per instance, builds skinned BLASes, dispatches GPU skinning and BLAS refit each frame
+- ✅ Rigid node animation (wheels, doors, flags) — `RigidNodeInstance` in scene types; `SceneLoader` parses `"rigid_nodes"` array; `Renderer::update()` evaluates clip, composes world transform, updates TLAS slot; TLAS rebuilt when any rigid node moves
+- ✅ Compute cloth simulation for waving flags (spring lattice, wind vector) — `ClothDesc`/`ClothInstance` in scene types; `SceneLoader` parses `"cloth"` array; `GpuMeshBuffer::create_cloth_mesh()` procedural grid; `ClothGpuResources` ping-pong buffers; `cloth_sim.hlsl` two-pass compute (INTEGRATE + CONSTRAIN); `PathTracer::create_cloth_pipeline()` / `dispatch_cloth_sim()`; `Renderer` dispatches cloth each frame, refits BLAS, then rebuilds TLAS
+- ✅ Cloth solver: red-black Gauss-Seidel constraint relaxation (alternating checkerboard sub-passes via `color_pass` constant); per-type separate accumulators (structural/shear/bend averaged independently) to prevent spring-type cross-dilution; scene-driven wind via top-level `"wind"` field in `.marsscene`; renderer cloth delta-time clamped to 1/30s to survive window-drag stalls
+- ✅ ~~FABRIK IK solver for foot placement~~ (removed from scope — pit crew animations are pre-baked)
 
 ### M10 — Procedural Ecosystem / Vegetation + Wind
 - 🔲 GPU-driven instance placement compute shader (reads density map)

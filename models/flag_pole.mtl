@@ -1,0 +1,6 @@
+# flag_pole.mtl
+newmtl Pole
+Ka 0.1 0.1 0.1
+Kd 0.4 0.3 0.2
+Ks 0.3 0.3 0.3
+Ns 30.0

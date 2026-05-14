@@ -14,6 +14,8 @@
 #include "asset_importer.h"
 #include "gpu_mesh_buffer.h"
 #include "texture_loader.h"
+#include "../animation/skeleton.h"
+#include "../animation/animation_clip.h"
 
 #include <wrl/client.h>
 
@@ -43,6 +45,12 @@ struct GpuModel
     std::vector<GpuMeshBuffer>     mesh_buffers;  // parallel to ModelAsset::meshes
     std::vector<uint32_t>          texture_slots;  // SRV slot per material base-colour texture
     AABB                           bounds = {};
+
+    // Skeletal animation data (empty if the model has no skeleton).
+    Skeleton                       skeleton;
+    std::vector<AnimationClip>     animation_clips;
+
+    bool has_skeleton() const { return !skeleton.bones.empty(); }
 };
 
 // =============================================================================

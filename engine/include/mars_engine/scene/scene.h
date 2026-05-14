@@ -30,6 +30,11 @@ struct SceneModelInstance
     Transform        transform         = {};
     std::string      name;
     MaterialOverride material_override = {};          // optional per-instance material override
+    AnimationDesc    animation         = {};          // optional skeletal animation settings
+
+    // Runtime state (set during load_scene / update — not parsed from file)
+    uint32_t         anim_state_id     = UINT32_MAX; // AnimationSystem state ID (UINT32_MAX = none)
+    uint32_t         skinned_blas_base = UINT32_MAX; // first BLAS index built via build_skinned_blas()
 };
 
 // =============================================================================
@@ -60,6 +65,23 @@ public:
                        const Transform&  transform = {},
                        const std::string& name = {});
 
+    // Add a rigid-node animated instance (transform-only animation, no GPU skinning).
+    // Returns the index into the rigid_nodes() list, or UINT32_MAX on failure.
+    uint32_t add_rigid_node(const std::string& model_path,
+                             DeviceContext&     ctx,
+                             ResourceManager&   resource_mgr,
+                             uint32_t           mesh_index,
+                             const Transform&   base_transform,
+                             const std::string& clip_name,
+                             bool               loop,
+                             float              speed,
+                             const std::string& name = {});
+
+    // Add a cloth simulation instance.  Returns the index into cloth_instances().
+    uint32_t add_cloth(const Transform&  base_transform,
+                       const ClothDesc&  desc,
+                       const std::string& name = {});
+
     void unload();
 
     // ---- Accessors ----------------------------------------------------------
@@ -68,9 +90,21 @@ public:
     uint32_t                               instance_count() const
         { return static_cast<uint32_t>(m_instances.size()); }
 
+    const std::vector<RigidNodeInstance>&  rigid_nodes()    const { return m_rigid_nodes; }
+    std::vector<RigidNodeInstance>&        rigid_nodes()          { return m_rigid_nodes; }
+    uint32_t                               rigid_node_count() const
+        { return static_cast<uint32_t>(m_rigid_nodes.size()); }
+
+    const std::vector<ClothInstance>&      cloth_instances()  const { return m_cloth_instances; }
+    std::vector<ClothInstance>&            cloth_instances()        { return m_cloth_instances; }
+    uint32_t                               cloth_count()      const
+        { return static_cast<uint32_t>(m_cloth_instances.size()); }
+
     const std::vector<LightDesc>&          lights()         const { return m_lights; }
     const std::vector<CameraDesc>&         cameras()        const { return m_cameras; }
     const SkyboxDesc&                      skybox()         const { return m_skybox; }
+    Vec3                                   wind()           const { return m_wind; }
+    const WindDesc&                        wind_desc()      const { return m_wind_desc; }
 
     bool is_loaded() const { return m_loaded; }
 
@@ -79,9 +113,13 @@ private:
 
     std::string                     m_name;
     std::vector<SceneModelInstance> m_instances;
+    std::vector<RigidNodeInstance>  m_rigid_nodes;
+    std::vector<ClothInstance>      m_cloth_instances;
     std::vector<LightDesc>          m_lights;
     std::vector<CameraDesc>         m_cameras;
     SkyboxDesc                      m_skybox;
+    Vec3                            m_wind      = {};
+    WindDesc                        m_wind_desc = {};
     bool                            m_loaded = false;
 };
 

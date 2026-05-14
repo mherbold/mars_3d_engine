@@ -10,9 +10,9 @@
 #include <D3D12MemAlloc.h>
 #pragma warning(pop)
 
+#include "mars_engine/engine_api.h"
 #include <stdexcept>
 #include <format>
-#include <print>
 
 namespace mars
 {
@@ -35,7 +35,7 @@ void ResourceManager::init(DeviceContext& ctx)
             std::format("D3D12MA::CreateAllocator failed (HRESULT 0x{:08X})", static_cast<unsigned>(hr)));
 
     m_initialised = true;
-    std::println("[ResourceManager] Initialised (D3D12MA allocator ready).");
+    MARS_LOG("[ResourceManager] Initialised (D3D12MA allocator ready).");
 }
 
 // ---------------------------------------------------------------------------
@@ -74,7 +74,7 @@ uint32_t ResourceManager::load_model(DeviceContext& ctx, const std::string& file
     auto cpu_asset = m_importer.import(file_path);
     if (!cpu_asset)
     {
-        std::println(stderr, "[ResourceManager] load_model failed for '{}'", file_path);
+        MARS_LOG("[ResourceManager] load_model failed for '{}'", file_path);
         return UINT32_MAX;
     }
 
@@ -110,14 +110,27 @@ uint32_t ResourceManager::load_model(DeviceContext& ctx, const std::string& file
         }
     }
 
+    // Import skeleton and animation clips (no-op if the model has none).
+    {
+        auto skel = m_importer.import_skeleton(file_path);
+        if (skel && !skel->bones.empty())
+        {
+            gpu_model.skeleton = std::move(*skel);
+            gpu_model.animation_clips = m_importer.import_animations(file_path);
+
+            MARS_LOG("[ResourceManager] Skeleton loaded: {} bones, {} clip(s).",
+                         gpu_model.skeleton.bones.size(),
+                         gpu_model.animation_clips.size());
+        }
+    }
+
     uint32_t index = static_cast<uint32_t>(m_models.size());
     m_models.push_back(std::move(gpu_model));
     m_model_cache.emplace(file_path, index);
 
-    std::println("[ResourceManager] Model '{}' loaded as index {}.", file_path, index);
+    MARS_LOG("[ResourceManager] Model '{}' loaded as index {}.", file_path, index);
     return index;
 }
-
 // ---------------------------------------------------------------------------
 // load_texture
 // ---------------------------------------------------------------------------
@@ -130,7 +143,7 @@ uint32_t ResourceManager::load_texture(DeviceContext& ctx, const std::string& fi
     GpuTexture tex = m_tex_loader.load(ctx, m_allocator, file_path, is_srgb);
     if (!tex.is_valid())
     {
-        std::println(stderr, "[ResourceManager] load_texture failed for '{}'", file_path);
+        MARS_LOG("[ResourceManager] load_texture failed for '{}'", file_path);
         return UINT32_MAX;
     }
 

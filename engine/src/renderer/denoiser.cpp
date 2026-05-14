@@ -3,10 +3,10 @@
 // MARS 3D Engine — DLSS 4 denoiser / upscaler / frame-generation implementation
 // =============================================================================
 
+#include "mars_engine/engine_api.h"
 #include "mars_engine/renderer/denoiser.h"
 #include "mars_engine/renderer/device_context.h"
 
-#include <print>
 #include <stdexcept>
 #include <format>
 #include <cmath>
@@ -87,13 +87,13 @@ void Denoiser::pre_device_init()
 
     sl::Result res = slInit(pref, sl::kSDKVersion);
     if (res == sl::Result::eOk)
-        std::println("[Denoiser] slInit() OK — Streamline v{}.{}.{}",
+        MARS_LOG("[Denoiser] slInit() OK — Streamline v{}.{}.{}",
                      SL_VERSION_MAJOR, SL_VERSION_MINOR, SL_VERSION_PATCH);
     else
-        std::println("[Denoiser] slInit() returned {} — DLSS will be unavailable.",
+        MARS_LOG("[Denoiser] slInit() returned {} — DLSS will be unavailable.",
                      static_cast<int>(res));
 #else
-    std::println("[Denoiser] Streamline SDK not present — DLSS disabled.");
+    MARS_LOG("[Denoiser] Streamline SDK not present — DLSS disabled.");
 #endif
 }
 
@@ -115,7 +115,7 @@ void Denoiser::init(DeviceContext& ctx,
     sl::Result res = slSetD3DDevice(ctx.device());
     if (res != sl::Result::eOk)
     {
-        std::println("[Denoiser] slSetD3DDevice failed ({}) — DLSS disabled.",
+        MARS_LOG("[Denoiser] slSetD3DDevice failed ({}) — DLSS disabled.",
                      static_cast<int>(res));
         m_initialised = true;
         return;
@@ -137,7 +137,7 @@ void Denoiser::init(DeviceContext& ctx,
     m_dlss_rr_supported = check(sl::kFeatureDLSS_RR);
     m_dlss_g_supported  = check(sl::kFeatureDLSS_G);
 
-    std::println("[Denoiser] Feature support — SR:{} RR:{} MFG:{}",
+    MARS_LOG("[Denoiser] Feature support — SR:{} RR:{} MFG:{}",
                  m_dlss_supported, m_dlss_rr_supported, m_dlss_g_supported);
 
     // Initialise per-output viewport handles.
@@ -224,7 +224,7 @@ void Denoiser::resize_output(uint32_t output_index,
 
     m_dirty = true;
 
-    std::println("[Denoiser] output[{}] display={}x{} render={}x{}",
+    MARS_LOG("[Denoiser] output[{}] display={}x{} render={}x{}",
                  output_index, display_width, display_height,
                  out.render_width, out.render_height);
 }

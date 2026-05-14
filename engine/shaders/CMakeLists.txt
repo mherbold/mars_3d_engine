@@ -19,6 +19,8 @@ set(HLSL_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/tone_map_blit_ps.hlsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/gi/restir_di.hlsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/gi/restir_gi.hlsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/skinning.hlsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/cloth_sim.hlsl"
 )
 
 # HLSLI headers — listed so they appear in the IDE; not compiled individually
@@ -64,6 +66,10 @@ target_compile_hlsl(
 # Source groups for Visual Studio IDE organisation
 # ---------------------------------------------------------------------------
 source_group("Shaders"              FILES ${HLSL_SOURCES})
+source_group("Shaders\\\\animation" FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/skinning.hlsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/cloth_sim.hlsl"
+)
 source_group("Shaders\\\\common"    FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/common/bindless.hlsli"
     "${CMAKE_CURRENT_SOURCE_DIR}/common/math.hlsli"

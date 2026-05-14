@@ -3,12 +3,14 @@
 // MARS 3D Engine — Renderer implementation (M5: scene loading + static scene)
 // =============================================================================
 
+#include "mars_engine/engine_api.h"
 #include "mars_engine/renderer/renderer.h"
 #include "mars_engine/scene/scene_loader.h"
 
 #include <stdexcept>
 #include <format>
-#include <print>
+#include <cmath>
+#include <windows.h>
 
 namespace mars
 {
@@ -71,6 +73,7 @@ void Renderer::init_internal(const std::vector<DisplayConfig>& configs,
     m_device_ctx.init();
     m_display_manager.init(m_device_ctx, configs, hwnds);
     m_resource_mgr.init(m_device_ctx);
+    m_anim_system.initialize(&m_device_ctx, &m_resource_mgr);
     create_frame_resources();
 
     // Initialise PathTracer for the primary output dimensions.
@@ -123,6 +126,7 @@ void Renderer::shutdown()
 
     m_path_tracer.shutdown();
     m_denoiser.shutdown();
+    m_anim_system.shutdown();
     m_scene.unload();
     m_resource_mgr.shutdown();
     release_frame_resources();
@@ -274,7 +278,7 @@ bool Renderer::load_scene(const std::string& marsscene_path)
 {
     if (!m_initialised)
     {
-        std::println("[Renderer] load_scene() called before init().");
+        MARS_LOG("[Renderer] load_scene() called before init().");
         return false;
     }
 
@@ -285,11 +289,15 @@ bool Renderer::load_scene(const std::string& marsscene_path)
     if (!loader.load(marsscene_path, m_device_ctx, m_resource_mgr, m_scene))
         return false;
 
+    m_wind_desc    = m_scene.wind_desc();
+    m_wind_state   = {};
+    m_wind_current = m_scene.wind();   // seed smoother with the base static vector
+
     // Build BLAS for every mesh in every model instance.
     // One BLAS per GpuMeshBuffer; share when the same model is used multiple times.
     std::vector<uint32_t> blas_base_index(m_resource_mgr.model_count(), UINT32_MAX);
 
-    std::println("[Renderer] load_scene: {} scene instance(s), {} model(s) in resource manager.",
+    MARS_LOG("[Renderer] load_scene: {} scene instance(s), {} model(s) in resource manager.",
                  m_scene.instances().size(), m_resource_mgr.model_count());
 
     for (const auto& inst : m_scene.instances())
@@ -300,20 +308,38 @@ bool Renderer::load_scene(const std::string& marsscene_path)
         if (blas_base_index[inst.model_index] != UINT32_MAX) continue;
 
         const GpuModel& model = m_resource_mgr.model(inst.model_index);
-        std::println("[Renderer]   Building BLAS for model_index={} mesh_count={}",
+        MARS_LOG("[Renderer]   Building BLAS for model_index={} mesh_count={}",
                      inst.model_index, model.mesh_buffers.size());
 
         for (uint32_t mi = 0; mi < static_cast<uint32_t>(model.mesh_buffers.size()); ++mi)
         {
-            std::println("[Renderer]     mesh[{}]: {} verts, {} idx",
+            MARS_LOG("[Renderer]     mesh[{}]: {} verts, {} idx",
                          mi,
                          model.mesh_buffers[mi].vertex_count(),
                          model.mesh_buffers[mi].index_count());
 
-            uint32_t blas_idx = m_path_tracer.build_blas(
-                m_device_ctx, model.mesh_buffers[mi]);
+            uint32_t blas_idx;
+            if (model.has_skeleton())
+            {
+                // Enable GPU skinning resources on first encounter.
+                if (!model.mesh_buffers[mi].is_skinned())
+                {
+                    // GpuMeshBuffer is stored inside GpuModel via ResourceManager —
+                    // cast away const to enable skinning (one-time initialisation).
+                    GpuModel& mutable_model = m_resource_mgr.model(inst.model_index);
+                    mutable_model.mesh_buffers[mi].enable_skinning(
+                        m_device_ctx, m_resource_mgr.allocator(),
+                        static_cast<uint32_t>(model.skeleton.bones.size()));
+                }
+                blas_idx = m_path_tracer.build_skinned_blas(m_device_ctx, model.mesh_buffers[mi]);
+            }
+            else
+            {
+                blas_idx = m_path_tracer.build_blas(m_device_ctx, model.mesh_buffers[mi]);
+            }
 
-            std::println("[Renderer]     -> BLAS index {}", blas_idx);
+            MARS_LOG("[Renderer]     -> BLAS index {} ({})", blas_idx,
+                         model.has_skeleton() ? "skinned" : "static");
 
             if (mi == 0)
                 blas_base_index[inst.model_index] = blas_idx;
@@ -337,12 +363,48 @@ bool Renderer::load_scene(const std::string& marsscene_path)
         cpu_materials.push_back(def);
     }
 
-    for (const auto& inst : m_scene.instances())
+    for (uint32_t scene_inst_idx = 0;
+         scene_inst_idx < m_scene.instance_count();
+         ++scene_inst_idx)
     {
+        SceneModelInstance& inst = const_cast<SceneModelInstance&>(
+            m_scene.instances()[scene_inst_idx]);
+
         if (inst.model_index == UINT32_MAX) continue;
 
         const GpuModel& model = m_resource_mgr.model(inst.model_index);
         Mat4x4 world = inst.transform.to_matrix();
+
+        // Create an AnimationState for this instance if the model has a skeleton
+        // and the scene file requested animation for it.
+        if (model.has_skeleton() && inst.anim_state_id == UINT32_MAX)
+        {
+            // Register skeleton and clips on first encounter.
+            // (Idempotent: AnimationSystem checks for duplicates by content or ID.)
+            uint32_t skel_id = m_anim_system.register_skeleton(model.skeleton);
+
+            uint32_t initial_clip_id = 0;
+            for (const auto& clip : model.animation_clips)
+            {
+                uint32_t cid = m_anim_system.register_animation_clip(clip);
+                // Use the first clip, or the one named in the AnimationDesc.
+                if (initial_clip_id == 0 || clip.name == inst.animation.clip_name)
+                    initial_clip_id = cid;
+            }
+
+            inst.anim_state_id = m_anim_system.create_animation_state(skel_id, initial_clip_id);
+            inst.skinned_blas_base = blas_base_index[inst.model_index];
+
+            AnimationState* state = m_anim_system.get_state(inst.anim_state_id);
+            if (state)
+            {
+                state->looping        = inst.animation.loop;
+                state->playback_speed = inst.animation.speed;
+            }
+
+            MARS_LOG("[Renderer]   Instance '{}': anim_state={} skel_id={} clip={}",
+                         inst.name, inst.anim_state_id, skel_id, initial_clip_id);
+        }
 
         for (uint32_t mi = 0; mi < static_cast<uint32_t>(model.mesh_buffers.size()); ++mi)
         {
@@ -401,11 +463,15 @@ bool Renderer::load_scene(const std::string& marsscene_path)
             // re-normalised in the shader anyway.
             memcpy(inst_data.world_transform_inv_transpose, world.m, sizeof(world.m));
             inst_data.material_index    = mat_idx;
-            inst_data.vertex_buffer_srv = model.mesh_buffers[mi].vertex_srv_slot();
+            // For skinned meshes the hit shader must read the skinned output buffer;
+            // point vertex_buffer_srv at the skinned SRV slot (registered in enable_skinning).
+            inst_data.vertex_buffer_srv = model.has_skeleton()
+                ? model.mesh_buffers[mi].skinned_vertex_srv_slot()
+                : model.mesh_buffers[mi].vertex_srv_slot();
             inst_data.index_buffer_srv  = model.mesh_buffers[mi].index_srv_slot();
             cpu_instances.push_back(inst_data);
 
-            std::println("[Renderer]   TLAS instance {}: blas={} mat={} vtx_srv={} idx_srv={} ('{}')",
+            MARS_LOG("[Renderer]   TLAS instance {}: blas={} mat={} vtx_srv={} idx_srv={} ('{}')",
                          tlas_instance, blas_idx, mat_idx,
                          inst_data.vertex_buffer_srv, inst_data.index_buffer_srv,
                          inst.name);
@@ -413,7 +479,167 @@ bool Renderer::load_scene(const std::string& marsscene_path)
         }
     }
 
-    std::println("[Renderer] Total TLAS instances to build: {}", tlas_instance);
+    // ---- Rigid-node animated instances ------------------------------------
+    // Build a static BLAS per rigid node and create an AnimationState for
+    // transform-only animations (wheels, doors, flags, etc.).
+    for (auto& rn : m_scene.rigid_nodes())
+    {
+        if (rn.model_index == UINT32_MAX) continue;
+
+        const GpuModel& model = m_resource_mgr.model(rn.model_index);
+        if (rn.mesh_index >= static_cast<uint32_t>(model.mesh_buffers.size())) continue;
+
+        // Static BLAS (no refit needed — transform change is handled by TLAS update).
+        rn.blas_index = m_path_tracer.build_blas(m_device_ctx, model.mesh_buffers[rn.mesh_index]);
+
+        // Create AnimationState if clips are present.
+        if (!model.animation_clips.empty())
+        {
+            uint32_t skel_id = m_anim_system.register_skeleton(model.skeleton);
+            uint32_t clip_id = 0;
+            for (const auto& clip : model.animation_clips)
+            {
+                uint32_t cid = m_anim_system.register_animation_clip(clip);
+                if (clip_id == 0 || clip.name == rn.clip_name)
+                    clip_id = cid;
+            }
+            rn.anim_state_id = m_anim_system.create_animation_state(skel_id, clip_id);
+            AnimationState* state = m_anim_system.get_state(rn.anim_state_id);
+            if (state) { state->looping = rn.loop; state->playback_speed = rn.speed; }
+        }
+
+        // Register as a TLAS instance using its base transform.
+        rn.current_world   = rn.base_transform.to_matrix();
+        rn.tlas_instance   = tlas_instance;
+        uint32_t mat_idx   = 0; // default material
+
+        CpuInstanceData rn_data{};
+        memcpy(rn_data.world_transform,                rn.current_world.m, sizeof(rn.current_world.m));
+        memcpy(rn_data.world_transform_inv_transpose,  rn.current_world.m, sizeof(rn.current_world.m));
+        rn_data.material_index    = mat_idx;
+        rn_data.vertex_buffer_srv = model.mesh_buffers[rn.mesh_index].vertex_srv_slot();
+        rn_data.index_buffer_srv  = model.mesh_buffers[rn.mesh_index].index_srv_slot();
+        cpu_instances.push_back(rn_data);
+
+        m_path_tracer.set_instance(tlas_instance++, rn.blas_index, rn.current_world, mat_idx);
+        MARS_LOG("[Renderer]   Rigid node '{}': BLAS={} TLAS={}", rn.name, rn.blas_index, rn.tlas_instance);
+    }
+
+    // ---- Cloth simulation instances ----------------------------------------
+    // Build a rest-pose cloth mesh, allocate ping-pong GPU buffers, and
+    // create a refittable BLAS.  The cloth is simulated each frame by
+    // dispatch_cloth_sim() and the BLAS is refitted before ray tracing.
+    for (auto& ci : m_scene.cloth_instances())
+    {
+        const uint32_t gw = ci.cloth_desc.grid_w;
+        const uint32_t gh = ci.cloth_desc.grid_h;
+        const float    scale   = ci.base_transform.scale;
+        const float    rl      = 1.0f;   // 1 unit per cell in local space; to_matrix() applies scale
+
+        // Compute rest lengths: world-space spacing = scale * rl = scale
+        ci.rest_len_struct = scale;
+        ci.rest_len_shear  = scale * 1.41421356f;
+        ci.rest_len_bend   = scale * 2.0f;
+
+        // Build rest-pose mesh on GPU
+        ci.mesh_buffer.create_cloth_mesh(m_device_ctx, m_resource_mgr.allocator(), gw, gh, rl);
+
+        // Extract initial positions from the mesh vertex buffer for the simulation
+        // buffers.  We regenerate from the grid formula (matches create_cloth_mesh).
+        std::vector<Vec3> initial_positions;
+        initial_positions.reserve(gw * gh);
+        const Mat4x4 world = ci.base_transform.to_matrix();
+        for (uint32_t row = 0; row < gh; ++row)
+        {
+            for (uint32_t col = 0; col < gw; ++col)
+            {
+                // Local space position from create_cloth_mesh (XZ plane)
+                Vec3 local{ col * rl, 0.0f, -(static_cast<float>(row) * rl) };
+                // Transform to world space
+                Vec4 w4 = world.transform(Vec4{ local.x, local.y, local.z, 1.0f });
+                initial_positions.push_back({ w4.x, w4.y, w4.z });
+            }
+        }
+
+        ci.vertex_count = gw * gh;
+        ci.index_count  = (gw - 1) * (gh - 1) * 6u;
+        ci.gpu.create(m_device_ctx, m_resource_mgr.allocator(), ci.vertex_count, initial_positions);
+
+        // Seed the cloth output vertex buffer with the rest-pose mesh data so
+        // the hit shader has valid UVs before the first simulation dispatch.
+        ci.gpu.seed_output_from(m_device_ctx, ci.mesh_buffer);
+
+        // Enable skinning resources on the cloth mesh so build_skinned_blas has a
+        // valid skinned vertex buffer to target.  Cloth uses no bones, so pass 1
+        // as the minimum required by enable_skinning.
+        if (!ci.mesh_buffer.is_skinned())
+        {
+            ci.mesh_buffer.enable_skinning(
+                m_device_ctx, m_resource_mgr.allocator(), 1u);
+        }
+
+        // Build refittable BLAS using the rest-pose mesh (plain vertex buffer).
+        // The cloth output vertex buffer (ci.gpu) is used for refits each frame.
+        ci.cloth_blas_index = m_path_tracer.build_blas(m_device_ctx, ci.mesh_buffer, /*allow_update=*/true);
+
+        // Material
+        uint32_t mat_idx = static_cast<uint32_t>(cpu_materials.size());
+        {
+            CpuMaterialData mat{};
+            mat.base_color_factor[0] = 0.9f;
+            mat.base_color_factor[1] = 0.9f;
+            mat.base_color_factor[2] = 0.9f;
+            mat.base_color_factor[3] = 1.0f;
+            mat.roughness_factor = 0.8f;
+
+            // Apply per-instance material override from the scene file
+            const MaterialOverride& mo = ci.cloth_desc.material;
+            if (mo.has_any())
+            {
+                auto load_override_tex = [&](const std::string& path, bool srgb) -> uint32_t
+                {
+                    if (path.empty()) return UINT32_MAX;
+                    return m_resource_mgr.load_texture(m_device_ctx, path, srgb);
+                };
+
+                uint32_t slot;
+                if (slot = load_override_tex(mo.base_color_texture, true);         slot != UINT32_MAX) mat.base_color_tex           = slot;
+                if (slot = load_override_tex(mo.normal_texture, false);             slot != UINT32_MAX) mat.normal_tex               = slot;
+                if (slot = load_override_tex(mo.metallic_roughness_texture, false); slot != UINT32_MAX) mat.metallic_roughness_tex   = slot;
+                if (slot = load_override_tex(mo.roughness_texture, false);          slot != UINT32_MAX) mat.metallic_roughness_tex   = slot;
+                if (slot = load_override_tex(mo.occlusion_texture, false);          slot != UINT32_MAX) mat.metallic_roughness_tex   = slot;
+                if (slot = load_override_tex(mo.emissive_texture, true);            slot != UINT32_MAX) mat.emissive_tex             = slot;
+
+                if (mo.base_color_r >= 0.0f) mat.base_color_factor[0] = mo.base_color_r;
+                if (mo.base_color_g >= 0.0f) mat.base_color_factor[1] = mo.base_color_g;
+                if (mo.base_color_b >= 0.0f) mat.base_color_factor[2] = mo.base_color_b;
+                if (mo.base_color_a >= 0.0f) mat.base_color_factor[3] = mo.base_color_a;
+                if (mo.metallic_factor  >= 0.0f) mat.metallic_factor  = mo.metallic_factor;
+                if (mo.roughness_factor >= 0.0f) mat.roughness_factor = mo.roughness_factor;
+                if (mo.emissive_scale   >= 0.0f) mat.emissive_scale   = mo.emissive_scale;
+            }
+
+            cpu_materials.push_back(mat);
+        }
+        ci.mat_index = mat_idx;
+
+        // Register TLAS instance
+        ci.tlas_instance = tlas_instance;
+        Mat4x4 identity  = Mat4x4::identity();
+        CpuInstanceData cloth_data{};
+        memcpy(cloth_data.world_transform,               identity.m, sizeof(identity.m));
+        memcpy(cloth_data.world_transform_inv_transpose, identity.m, sizeof(identity.m));
+        cloth_data.material_index        = mat_idx;
+        cloth_data.vertex_buffer_srv     = ci.gpu.output_vertex_srv();
+        cloth_data.index_buffer_srv      = ci.mesh_buffer.index_srv_slot();
+        cloth_data.prev_vertex_buffer_srv= ci.gpu.pos_prev_srv();  // previous-frame positions for motion vectors
+        cpu_instances.push_back(cloth_data);
+
+        m_path_tracer.set_instance(tlas_instance++, ci.cloth_blas_index, identity, mat_idx);
+        MARS_LOG("[Renderer]   Cloth '{}': {}x{} BLAS={} TLAS={}", ci.name, gw, gh, ci.cloth_blas_index, ci.tlas_instance);
+    }
+
+    MARS_LOG("[Renderer] Total TLAS instances to build: {}", tlas_instance);
 
     // Build the TLAS and flush.
     throw_if_failed(m_cmd_allocators[0]->Reset(), "CmdAlloc::Reset (load_scene)");
@@ -430,7 +656,7 @@ bool Renderer::load_scene(const std::string& marsscene_path)
     // Upload per-instance and per-material structured buffers to the GPU.
     m_path_tracer.upload_scene_buffers(m_device_ctx, cpu_instances, cpu_materials);
 
-    std::println("[Renderer] Scene '{}' loaded: {} TLAS instance(s).",
+    MARS_LOG("[Renderer] Scene '{}' loaded: {} TLAS instance(s).",
                  m_scene.name(), tlas_instance);
     return true;
 }
@@ -440,7 +666,113 @@ bool Renderer::load_scene(const std::string& marsscene_path)
 // ---------------------------------------------------------------------------
 void Renderer::rebuild_tlas()
 {
-    m_path_tracer.build_tlas(m_device_ctx, m_cmd_list.Get());
+    m_path_tracer.build_tlas(m_device_ctx, m_cmd_list.Get(), m_frame_index);
+}
+
+// ---------------------------------------------------------------------------
+// update — advance animation, update rigid-node transforms
+// ---------------------------------------------------------------------------
+void Renderer::update(float delta_time)
+{
+    if (!m_initialised) return;
+
+    // Cloth explicit-Euler integrator is unstable above ~33 ms; cap independently
+    // of whatever the caller passes (which may be as large as 100 ms after a
+    // window-move stall).
+    static constexpr float k_max_cloth_dt = 1.0f / 15.0f;  // absolute ceiling: discard runaway frames
+    m_last_delta_time          = std::min(delta_time, k_max_cloth_dt);
+    m_cloth_time_accumulator  += m_last_delta_time;
+
+    // ---- Animated wind evaluation ------------------------------------------
+    // Advance phase accumulators and combine the three oscillator layers to
+    // produce an IIR-smoothed instantaneous wind vector for the cloth solver.
+    {
+        const WindDesc& wd  = m_wind_desc;
+        const float     dt2 = m_last_delta_time;
+
+        // Two-pi factors for each oscillator.
+        const float tau = 6.28318530718f;
+
+        // Advance phases.
+        m_wind_state.gust_phase    += tau * wd.gust_frequency             * dt2;
+        m_wind_state.wander_phase  += tau * wd.direction_wander_frequency * dt2;
+        m_wind_state.micro_phase_x += tau * wd.micro_frequency            * dt2;
+        m_wind_state.micro_phase_z += tau * wd.micro_frequency * 1.37f    * dt2; // decouple X/Z
+
+        // Wrap phases to avoid float precision loss over time.
+        auto wrap = [&](float& p) { if (p > tau * 1000.0f) p -= tau * 1000.0f; };
+        wrap(m_wind_state.gust_phase);
+        wrap(m_wind_state.wander_phase);
+        wrap(m_wind_state.micro_phase_x);
+        wrap(m_wind_state.micro_phase_z);
+
+        // 1. Gust: modulate speed.
+        float gust_speed = wd.base_speed * (1.0f + wd.gust_strength * std::sin(m_wind_state.gust_phase));
+
+        // 2. Direction wander: rotate base_direction in XZ plane by a small angle.
+        float wander_rad  = (wd.direction_wander_angle * 0.01745329252f)   // deg→rad
+                            * std::sin(m_wind_state.wander_phase);
+        float cos_w = std::cos(wander_rad);
+        float sin_w = std::sin(wander_rad);
+        Vec3  wander_dir = {
+            wd.base_direction.x * cos_w - wd.base_direction.z * sin_w,
+            wd.base_direction.y,
+            wd.base_direction.x * sin_w + wd.base_direction.z * cos_w
+        };
+
+        // 3. Assemble pre-micro vector.
+        Vec3 target = {
+            wander_dir.x * gust_speed,
+            wander_dir.y * gust_speed,
+            wander_dir.z * gust_speed
+        };
+
+        // 4. Micro turbulence: add small per-axis sinusoidal offsets.
+        float micro_amp = wd.micro_variation * gust_speed;
+        target.x += micro_amp * std::sin(m_wind_state.micro_phase_x);
+        target.z += micro_amp * std::sin(m_wind_state.micro_phase_z);
+
+        // 5. One-pole IIR smoother: output = lerp(target, prev_output, smoothing).
+        float s = std::max(0.0f, std::min(wd.response_smoothing, 0.9999f));
+        m_wind_current.x = target.x + s * (m_wind_current.x - target.x);
+        m_wind_current.y = target.y + s * (m_wind_current.y - target.y);
+        m_wind_current.z = target.z + s * (m_wind_current.z - target.z);
+    }
+
+    // Advance all animation states on the CPU.
+    m_anim_system.update(delta_time);
+
+    // Update rigid-node TLAS instance transforms from their animation state.
+    // For a rigid node the "bone palette" is just one matrix: the root bone transform.
+    // We compose it with the base_transform to get the final world matrix.
+    bool any_rigid_updated = false;
+    for (auto& rn : m_scene.rigid_nodes())
+    {
+        if (rn.anim_state_id == UINT32_MAX) continue;
+        if (rn.tlas_instance  == UINT32_MAX) continue;
+
+        std::vector<Mat4x4> palette;
+        m_anim_system.evaluate_animation(rn.anim_state_id, palette);
+
+        // Rigid-node: use the first bone's world transform as a local delta,
+        // composed on top of the base transform.
+        Mat4x4 anim_local = palette.empty() ? Mat4x4::identity() : palette[0];
+        Mat4x4 base       = rn.base_transform.to_matrix();
+        rn.current_world  = base * anim_local;
+
+        m_path_tracer.set_instance(rn.tlas_instance, rn.blas_index, rn.current_world, 0);
+        any_rigid_updated = true;
+    }
+
+    // If any rigid node moved we need to rebuild the TLAS this frame.
+    // We set a flag that render_frame_path_traced can check; for simplicity
+    // we store it as a per-frame field.
+    m_rigid_nodes_dirty = any_rigid_updated;
+
+    // Cloth simulation: update is CPU-only; the GPU dispatch happens in
+    // render_frame_path_traced() using the evaluated m_wind_current and delta_time.
+    // We just mark cloth dirty here if there are any cloth instances.
+    m_cloth_dirty = !m_scene.cloth_instances().empty();
 }
 
 // ---------------------------------------------------------------------------
@@ -453,11 +785,11 @@ void Renderer::render_frame()
     // Log the render path exactly once so the output isn't spammed every frame.
     if (m_frame_index == 0)
     {
-        std::println("[Renderer] render_frame() path: {}",
+        MARS_LOG("[Renderer] render_frame() path: {}",
                      path_traced ? "PATH_TRACED" : "CLEAR_COLOR_FALLBACK");
-        std::println("[Renderer]   path_tracer.is_initialised() = {}",
+        MARS_LOG("[Renderer]   path_tracer.is_initialised() = {}",
                      m_path_tracer.is_initialised() ? "true" : "false");
-        std::println("[Renderer]   path_tracer.tlas_srv_slot()  = {}",
+        MARS_LOG("[Renderer]   path_tracer.tlas_srv_slot()  = {}",
                      m_path_tracer.tlas_srv_slot());
     }
 
@@ -478,6 +810,9 @@ void Renderer::render_frame_path_traced()
         ? m_display_manager.output(0).current_back_buffer_index()
         : 0;
 
+    if (m_frame_index < 3)
+        MARS_LOG("[Renderer] render_frame_path_traced: frame {}", m_frame_index);
+
     wait_for_frame(back_index);
 
     throw_if_failed(m_cmd_allocators[back_index]->Reset(), "CommandAllocator::Reset failed");
@@ -487,6 +822,91 @@ void Renderer::render_frame_path_traced()
     // Bind the bindless heap so DXR shaders can access all resources.
     ID3D12DescriptorHeap* heaps[] = { m_device_ctx.bindless_heap() };
     m_cmd_list->SetDescriptorHeaps(1, heaps);
+
+    // ---- GPU skinning pass --------------------------------------------------
+    // For each animated scene instance: evaluate bone palette on CPU, upload it,
+    // dispatch the skinning compute shader, then refit the BLAS.
+    // The TLAS is rebuilt once after all refits so path tracing sees updated BVHs.
+    bool any_skinned = false;
+    for (const auto& inst : m_scene.instances())
+    {
+        if (inst.anim_state_id == UINT32_MAX) continue;
+        if (inst.model_index   == UINT32_MAX) continue;
+
+        const GpuModel& model = m_resource_mgr.model(inst.model_index);
+        if (!model.has_skeleton()) continue;
+
+        std::vector<Mat4x4> bone_palette;
+        m_anim_system.evaluate_animation(inst.anim_state_id, bone_palette);
+
+        for (uint32_t mi = 0; mi < static_cast<uint32_t>(model.mesh_buffers.size()); ++mi)
+        {
+            const GpuMeshBuffer& mesh = model.mesh_buffers[mi];
+            if (!mesh.is_skinned()) continue;
+
+            m_path_tracer.dispatch_skinning(m_cmd_list.Get(), mesh, bone_palette);
+            m_path_tracer.refit_blas(m_device_ctx, m_cmd_list.Get(),
+                                     inst.skinned_blas_base + mi, mesh);
+            any_skinned = true;
+        }
+    }
+
+    // ---- GPU cloth simulation pass ------------------------------------------
+    // Compute how many fixed substeps to run this frame from the shared
+    // accumulator.  The accumulator is drained once here so all cloth instances
+    // run the same number of substeps — draining inside the per-cloth loop would
+    // cause the second+ cloths to see an empty accumulator and skip simulation.
+    static constexpr float k_cloth_substep_dt = 1.0f / 120.0f;
+    const uint32_t substep_count = static_cast<uint32_t>(m_cloth_time_accumulator / k_cloth_substep_dt);
+    m_cloth_time_accumulator -= static_cast<float>(substep_count) * k_cloth_substep_dt;
+
+    if (m_frame_index == 0)
+        MARS_LOG("[Renderer] Cloth instances at render time: {}", m_scene.cloth_instances().size());
+
+    for (auto& ci : m_scene.cloth_instances())
+    {
+        if (m_frame_index == 0)
+        {
+            MARS_LOG("[Renderer] Cloth '{}': blas={} tlas={} vtx_count={} idx_count={}"
+                         " out_vtx_srv={} idx_srv={} out_vtx_res={} idx_res={}"
+                         " pos_prev_srv={} pos_curr_srv={} pos_pred_a_uav={} out_vtx_uav={}",
+                         ci.name, ci.cloth_blas_index, ci.tlas_instance,
+                         ci.vertex_count, ci.index_count,
+                         ci.gpu.output_vertex_srv(), ci.mesh_buffer.index_srv_slot(),
+                         static_cast<void*>(ci.gpu.output_vertex_resource()),
+                         static_cast<void*>(ci.mesh_buffer.index_buffer_resource()),
+                         ci.gpu.pos_prev_srv(), ci.gpu.pos_curr_srv(),
+                         ci.gpu.pos_pred_a_uav(), ci.gpu.output_vertex_uav());
+        }
+
+        if (ci.cloth_blas_index == UINT32_MAX)
+        {
+            if (m_frame_index == 0) MARS_LOG("[Renderer]   SKIP: cloth_blas_index == UINT32_MAX");
+            continue;
+        }
+        if (!ci.gpu.is_valid())
+        {
+            if (m_frame_index == 0) MARS_LOG("[Renderer]   SKIP: gpu not valid");
+            continue;
+        }
+
+        if (substep_count == 0)
+            continue;  // no substep this frame — skip refit, nothing changed
+
+        for (uint32_t step = 0; step < substep_count; ++step)
+        {
+            m_path_tracer.dispatch_cloth_sim(m_cmd_list.Get(), ci, m_wind_current, k_cloth_substep_dt);
+        }
+
+        m_path_tracer.refit_blas(m_device_ctx, m_cmd_list.Get(), ci.cloth_blas_index,
+                                 ci.gpu.output_vertex_resource(),
+                                 ci.vertex_count, ci.index_count,
+                                 ci.mesh_buffer.index_buffer_resource());
+    }
+
+    // Rebuild TLAS once if any BLAS was refitted this frame.
+    if (any_skinned || m_rigid_nodes_dirty || m_cloth_dirty)
+        rebuild_tlas();
 
     for (uint32_t oi = 0; oi < m_display_manager.output_count(); ++oi)
     {

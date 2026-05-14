@@ -2,6 +2,21 @@
   "scene": {
     "name": "Test Scene (M5)"
   },
+  "wind": {
+    "baseDirection": [ 1.0, 0.0, 0.0 ],
+    "baseSpeed": 8.0,
+
+    "gustStrength": 0.45,
+    "gustFrequency": 0.25,
+
+    "directionWanderAngle": 12.0,
+    "directionWanderFrequency": 0.12,
+
+    "microVariation": 0.08,
+    "microFrequency": 1.5,
+
+    "responseSmoothing": 0.85
+  },
   "skybox": {
     "type": "physical",
     "sun_direction": [ 0.5, 0.5, 0.5 ],
@@ -37,6 +52,7 @@
     },
     {
       "id": "box_center",
+      "enabled": false,
       "file": "models/box.obj",
       "transform": {
         "position": [ 0.0, 0.5, 0.0 ],
@@ -53,7 +69,7 @@
     },
     {
       "id": "box_left",
-      "enabled": true,
+      "enabled": false,
       "file": "models/box.obj",
       "transform": {
         "position": [ -2.0, 0.5, 0.0 ],
@@ -69,7 +85,7 @@
     },
     {
       "id": "box_right",
-      "enabled": true,
+      "enabled": false,
       "file": "models/box.obj",
       "transform": {
         "position": [ 2.0, 0.5, 0.0 ],
@@ -85,7 +101,7 @@
     },
     {
       "id": "box_far_left",
-      "enabled": true,
+      "enabled": false,
       "file": "models/box.obj",
       "transform": {
         "position": [ -4.0, 0.5, 0.0 ],
@@ -102,7 +118,7 @@
     },
     {
       "id": "box_far_right",
-      "enabled": true,
+      "enabled": false,
       "file": "models/box.obj",
       "transform": {
         "position": [ 4.0, 0.5, 0.0 ],
@@ -119,7 +135,7 @@
     },
     {
       "id": "pyramid_center",
-      "enabled": true,
+      "enabled": false,
       "file": "models/pyramid.obj",
       "transform": {
         "position": [ 0.0, 0.0, -3.0 ],
@@ -134,7 +150,7 @@
     },
     {
       "id": "pyramid_left",
-      "enabled": true,
+      "enabled": false,
       "file": "models/pyramid.obj",
       "transform": {
         "position": [ -2.0, 0.0, -3.0 ],
@@ -149,7 +165,7 @@
     },
     {
       "id": "pyramid_right",
-      "enabled": true,
+      "enabled": false,
       "file": "models/pyramid.obj",
       "transform": {
         "position": [ 2.0, 0.0, -3.0 ],
@@ -164,35 +180,66 @@
       }
     },
     {
+      "id": "pyramid_far_left",
+      "enabled": false,
+      "file": "models/pyramid.obj",
+      "transform": {
+        "position": [ -4.0, 0.0, -3.0 ],
+        "scale": 1.5
+      },
+      "material": {
+        "base_color_texture": "models/textures/Marble022_2K-PNG_Color.png",
+        "normal_texture": "models/textures/Marble022_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/Marble022_2K-PNG_Roughness.png",
+        "roughness_factor": 0.4
+      }
+    },
+    {
+      "id": "pyramid_far_right",
+      "enabled": false,
+      "file": "models/pyramid.obj",
+      "transform": {
+        "position": [ 4.0, 0.0, -3.0 ],
+        "scale": 1.5
+      },
+      "material": {
+        "base_color_texture": "models/textures/PavingStones048_2K-PNG_Color.png",
+        "normal_texture": "models/textures/PavingStones048_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/PavingStones048_2K-PNG_Roughness.png",
+        "occlusion_texture": "models/textures/PavingStones048_2K-PNG_AmbientOcclusion.png",
+        "roughness_factor": 0.8
+      }
+    },
+    {
       "id": "sphere_far_left",
-      "enabled": true,
+      "enabled": false,
       "file": "models/sphere.obj",
       "transform": {
         "position": [ -4.0, 0.5, -6.0 ],
         "scale": 1.0
       },
       "material": {
-        "base_color_texture":         "models/textures/DiamondPlate008C_2K-PNG_Color.png",
-        "normal_texture":             "models/textures/DiamondPlate008C_2K-PNG_NormalDX.png",
-        "roughness_texture":          "models/textures/DiamondPlate008C_2K-PNG_Roughness.png",
+        "base_color_texture": "models/textures/DiamondPlate008C_2K-PNG_Color.png",
+        "normal_texture": "models/textures/DiamondPlate008C_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/DiamondPlate008C_2K-PNG_Roughness.png",
         "metallic_roughness_texture": "models/textures/DiamondPlate008C_2K-PNG_Metalness.png",
-        "occlusion_texture":          "models/textures/DiamondPlate008C_2K-PNG_AmbientOcclusion.png",
+        "occlusion_texture": "models/textures/DiamondPlate008C_2K-PNG_AmbientOcclusion.png",
         "metallic_factor": 1.0,
         "roughness_factor": 0.3
       }
     },
     {
       "id": "sphere_left",
-      "enabled": true,
+      "enabled": false,
       "file": "models/sphere.obj",
       "transform": {
         "position": [ -2.0, 0.5, -6.0 ],
         "scale": 1.0
       },
       "material": {
-        "base_color_texture":         "models/textures/Metal041C_2K-PNG_Color.png",
-        "normal_texture":             "models/textures/Metal041C_2K-PNG_NormalDX.png",
-        "roughness_texture":          "models/textures/Metal041C_2K-PNG_Roughness.png",
+        "base_color_texture": "models/textures/Metal041C_2K-PNG_Color.png",
+        "normal_texture": "models/textures/Metal041C_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/Metal041C_2K-PNG_Roughness.png",
         "metallic_roughness_texture": "models/textures/Metal041C_2K-PNG_Metalness.png",
         "metallic_factor": 1.0,
         "roughness_factor": 0.4
@@ -200,7 +247,7 @@
     },
     {
       "id": "sphere_center",
-      "enabled": true,
+      "enabled": false,
       "file": "models/sphere.obj",
       "transform": {
         "position": [ 0.0, 0.5, -6.0 ],
@@ -208,23 +255,23 @@
       },
       "material": {
         "base_color_texture": "models/textures/Onyx011_2K-PNG_Color.png",
-        "normal_texture":     "models/textures/Onyx011_2K-PNG_NormalDX.png",
-        "roughness_texture":  "models/textures/Onyx011_2K-PNG_Roughness.png",
+        "normal_texture": "models/textures/Onyx011_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/Onyx011_2K-PNG_Roughness.png",
         "roughness_factor": 0.15
       }
     },
     {
       "id": "sphere_right",
-      "enabled": true,
+      "enabled": false,
       "file": "models/sphere.obj",
       "transform": {
         "position": [ 2.0, 0.5, -6.0 ],
         "scale": 1.0
       },
       "material": {
-        "base_color_texture":         "models/textures/MetalPlates006_2K-PNG_Color.png",
-        "normal_texture":             "models/textures/MetalPlates006_2K-PNG_NormalDX.png",
-        "roughness_texture":          "models/textures/MetalPlates006_2K-PNG_Roughness.png",
+        "base_color_texture": "models/textures/MetalPlates006_2K-PNG_Color.png",
+        "normal_texture": "models/textures/MetalPlates006_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/MetalPlates006_2K-PNG_Roughness.png",
         "metallic_roughness_texture": "models/textures/MetalPlates006_2K-PNG_Metalness.png",
         "metallic_factor": 1.0,
         "roughness_factor": 0.5
@@ -232,7 +279,7 @@
     },
     {
       "id": "sphere_far_right",
-      "enabled": true,
+      "enabled": false,
       "file": "models/sphere.obj",
       "transform": {
         "position": [ 4.0, 0.5, -6.0 ],
@@ -240,32 +287,32 @@
       },
       "material": {
         "base_color_texture": "models/textures/Fabric026_2K-PNG_Color.png",
-        "normal_texture":     "models/textures/Fabric026_2K-PNG_NormalDX.png",
-        "roughness_texture":  "models/textures/Fabric026_2K-PNG_Roughness.png",
+        "normal_texture": "models/textures/Fabric026_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/Fabric026_2K-PNG_Roughness.png",
         "roughness_factor": 0.85
       }
     },
     {
       "id": "torus_far_left",
-      "enabled": true,
+      "enabled": false,
       "file": "models/torus.obj",
       "transform": {
         "position": [ -4.0, 0.2, -9.0 ],
         "scale": 1.0
       },
       "material": {
-        "base_color_texture":         "models/textures/CorrugatedSteel009_2K-PNG_Color.png",
-        "normal_texture":             "models/textures/CorrugatedSteel009_2K-PNG_NormalDX.png",
-        "roughness_texture":          "models/textures/CorrugatedSteel009_2K-PNG_Roughness.png",
+        "base_color_texture": "models/textures/CorrugatedSteel009_2K-PNG_Color.png",
+        "normal_texture": "models/textures/CorrugatedSteel009_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/CorrugatedSteel009_2K-PNG_Roughness.png",
         "metallic_roughness_texture": "models/textures/CorrugatedSteel009_2K-PNG_Metalness.png",
-        "occlusion_texture":          "models/textures/CorrugatedSteel009_2K-PNG_AmbientOcclusion.png",
+        "occlusion_texture": "models/textures/CorrugatedSteel009_2K-PNG_AmbientOcclusion.png",
         "metallic_factor": 1.0,
         "roughness_factor": 0.6
       }
     },
     {
       "id": "torus_left",
-      "enabled": true,
+      "enabled": false,
       "file": "models/torus.obj",
       "transform": {
         "position": [ -2.0, 0.2, -9.0 ],
@@ -273,15 +320,15 @@
       },
       "material": {
         "base_color_texture": "models/textures/Leather034C_2K-PNG_Color.png",
-        "normal_texture":     "models/textures/Leather034C_2K-PNG_NormalDX.png",
-        "roughness_texture":  "models/textures/Leather034C_2K-PNG_Roughness.png",
-        "occlusion_texture":  "models/textures/Leather034C_2K-PNG_AmbientOcclusion.png",
+        "normal_texture": "models/textures/Leather034C_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/Leather034C_2K-PNG_Roughness.png",
+        "occlusion_texture": "models/textures/Leather034C_2K-PNG_AmbientOcclusion.png",
         "roughness_factor": 0.65
       }
     },
     {
       "id": "torus_center",
-      "enabled": true,
+      "enabled": false,
       "file": "models/torus.obj",
       "transform": {
         "position": [ 0.0, 0.2, -9.0 ],
@@ -289,15 +336,15 @@
       },
       "material": {
         "base_color_texture": "models/textures/Bricks075A_2K-PNG_Color.png",
-        "normal_texture":     "models/textures/Bricks075A_2K-PNG_NormalDX.png",
-        "roughness_texture":  "models/textures/Bricks075A_2K-PNG_Roughness.png",
-        "occlusion_texture":  "models/textures/Bricks075A_2K-PNG_AmbientOcclusion.png",
+        "normal_texture": "models/textures/Bricks075A_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/Bricks075A_2K-PNG_Roughness.png",
+        "occlusion_texture": "models/textures/Bricks075A_2K-PNG_AmbientOcclusion.png",
         "roughness_factor": 0.85
       }
     },
     {
       "id": "torus_right",
-      "enabled": true,
+      "enabled": false,
       "file": "models/torus.obj",
       "transform": {
         "position": [ 2.0, 0.2, -9.0 ],
@@ -305,15 +352,15 @@
       },
       "material": {
         "base_color_texture": "models/textures/Tiles132A_2K-PNG_Color.png",
-        "normal_texture":     "models/textures/Tiles132A_2K-PNG_NormalDX.png",
-        "roughness_texture":  "models/textures/Tiles132A_2K-PNG_Roughness.png",
-        "occlusion_texture":  "models/textures/Tiles132A_2K-PNG_AmbientOcclusion.png",
+        "normal_texture": "models/textures/Tiles132A_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/Tiles132A_2K-PNG_Roughness.png",
+        "occlusion_texture": "models/textures/Tiles132A_2K-PNG_AmbientOcclusion.png",
         "roughness_factor": 0.7
       }
     },
     {
       "id": "torus_far_right",
-      "enabled": true,
+      "enabled": false,
       "file": "models/torus.obj",
       "transform": {
         "position": [ 4.0, 0.2, -9.0 ],
@@ -321,15 +368,15 @@
       },
       "material": {
         "base_color_texture": "models/textures/WoodFloor051_2K-PNG_Color.png",
-        "normal_texture":     "models/textures/WoodFloor051_2K-PNG_NormalDX.png",
-        "roughness_texture":  "models/textures/WoodFloor051_2K-PNG_Roughness.png",
-        "occlusion_texture":  "models/textures/WoodFloor051_2K-PNG_AmbientOcclusion.png",
+        "normal_texture": "models/textures/WoodFloor051_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/WoodFloor051_2K-PNG_Roughness.png",
+        "occlusion_texture": "models/textures/WoodFloor051_2K-PNG_AmbientOcclusion.png",
         "roughness_factor": 0.6
       }
     },
     {
       "id": "torus_knot_far_left",
-      "enabled": true,
+      "enabled": false,
       "file": "models/torus_knot.obj",
       "transform": {
         "position": [ -4.0, 0.4, -12.0 ],
@@ -337,15 +384,15 @@
       },
       "material": {
         "base_color_texture": "models/textures/Rock030_2K-PNG_Color.png",
-        "normal_texture":     "models/textures/Rock030_2K-PNG_NormalDX.png",
-        "roughness_texture":  "models/textures/Rock030_2K-PNG_Roughness.png",
-        "occlusion_texture":  "models/textures/Rock030_2K-PNG_AmbientOcclusion.png",
+        "normal_texture": "models/textures/Rock030_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/Rock030_2K-PNG_Roughness.png",
+        "occlusion_texture": "models/textures/Rock030_2K-PNG_AmbientOcclusion.png",
         "roughness_factor": 0.9
       }
     },
     {
       "id": "torus_knot_left",
-      "enabled": true,
+      "enabled": false,
       "file": "models/torus_knot.obj",
       "transform": {
         "position": [ -2.0, 0.4, -12.0 ],
@@ -353,15 +400,15 @@
       },
       "material": {
         "base_color_texture": "models/textures/Rock051_2K-PNG_Color.png",
-        "normal_texture":     "models/textures/Rock051_2K-PNG_NormalDX.png",
-        "roughness_texture":  "models/textures/Rock051_2K-PNG_Roughness.png",
-        "occlusion_texture":  "models/textures/Rock051_2K-PNG_AmbientOcclusion.png",
+        "normal_texture": "models/textures/Rock051_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/Rock051_2K-PNG_Roughness.png",
+        "occlusion_texture": "models/textures/Rock051_2K-PNG_AmbientOcclusion.png",
         "roughness_factor": 0.85
       }
     },
     {
       "id": "torus_knot_center",
-      "enabled": true,
+      "enabled": false,
       "file": "models/torus_knot.obj",
       "transform": {
         "position": [ 0.0, 0.4, -12.0 ],
@@ -369,15 +416,15 @@
       },
       "material": {
         "base_color_texture": "models/textures/Rock064_2K-PNG_Color.png",
-        "normal_texture":     "models/textures/Rock064_2K-PNG_NormalDX.png",
-        "roughness_texture":  "models/textures/Rock064_2K-PNG_Roughness.png",
-        "occlusion_texture":  "models/textures/Rock064_2K-PNG_AmbientOcclusion.png",
+        "normal_texture": "models/textures/Rock064_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/Rock064_2K-PNG_Roughness.png",
+        "occlusion_texture": "models/textures/Rock064_2K-PNG_AmbientOcclusion.png",
         "roughness_factor": 0.9
       }
     },
     {
       "id": "torus_knot_right",
-      "enabled": true,
+      "enabled": false,
       "file": "models/torus_knot.obj",
       "transform": {
         "position": [ 2.0, 0.4, -12.0 ],
@@ -385,15 +432,15 @@
       },
       "material": {
         "base_color_texture": "models/textures/Concrete042C_2K-PNG_Color.png",
-        "normal_texture":     "models/textures/Concrete042C_2K-PNG_NormalDX.png",
-        "roughness_texture":  "models/textures/Concrete042C_2K-PNG_Roughness.png",
-        "occlusion_texture":  "models/textures/Concrete042C_2K-PNG_AmbientOcclusion.png",
+        "normal_texture": "models/textures/Concrete042C_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/Concrete042C_2K-PNG_Roughness.png",
+        "occlusion_texture": "models/textures/Concrete042C_2K-PNG_AmbientOcclusion.png",
         "roughness_factor": 0.95
       }
     },
     {
       "id": "torus_knot_far_right",
-      "enabled": true,
+      "enabled": false,
       "file": "models/torus_knot.obj",
       "transform": {
         "position": [ 4.0, 0.4, -12.0 ],
@@ -401,9 +448,52 @@
       },
       "material": {
         "base_color_texture": "models/textures/PavingStones122_2K-PNG_Color.png",
-        "normal_texture":     "models/textures/PavingStones122_2K-PNG_NormalDX.png",
-        "roughness_texture":  "models/textures/PavingStones122_2K-PNG_Roughness.png",
-        "occlusion_texture":  "models/textures/PavingStones122_2K-PNG_AmbientOcclusion.png",
+        "normal_texture": "models/textures/PavingStones122_2K-PNG_NormalDX.png",
+        "roughness_texture": "models/textures/PavingStones122_2K-PNG_Roughness.png",
+        "occlusion_texture": "models/textures/PavingStones122_2K-PNG_AmbientOcclusion.png",
+        "roughness_factor": 0.8
+      }
+    }
+  ],
+
+  "cloth": [
+    {
+      "id": "cloth_test",
+      "enabled": true,
+      "transform": {
+        "position": [ 0.0, 2.0, 2.0 ],
+        "rotation": [ 0.0, 0.0, 0.0 ],
+        "scale": 0.15
+      },
+      "grid_w": 15,
+      "grid_h": 15,
+      "pin_corners": 15,
+      "mass": 0.1,
+      "structural_compliance": 1e-7,
+      "shear_compliance": 1e-6,
+      "bend_compliance": 1e-4,
+      "damping": 0.98,
+      "xpbd_iterations": 10
+    },
+    {
+      "id": "nascar_flag",
+      "enabled": true,
+      "transform": {
+        "position": [ -2.0, 5.0, 2.0 ],
+        "rotation": [ -60.0, 0.0, 0.0 ],
+        "scale": 0.15
+      },
+      "grid_w": 30,
+      "grid_h": 20,
+      "pin_corners": 64,
+      "mass": 0.05,
+      "structural_compliance": 1e-7,
+      "shear_compliance": 1e-6,
+      "bend_compliance": 1e-4,
+      "damping": 0.98,
+      "xpbd_iterations": 10,
+      "material": {
+        "base_color_texture": "models/textures/NASCAR_Flag.png",
         "roughness_factor": 0.8
       }
     }

@@ -29,6 +29,7 @@ list(APPEND ENGINE_SOURCES
     "src/scene/scene.cpp"
     "src/scene/scene_loader.cpp"
     "src/camera/camera.cpp"
+    "src/animation/animation_system.cpp"
 )
 list(REMOVE_DUPLICATES ENGINE_SOURCES)
 
@@ -49,6 +50,9 @@ list(APPEND ENGINE_HEADERS
     "include/mars_engine/scene/scene_loader.h"
     "include/mars_engine/scene/scene.h"
     "include/mars_engine/camera/camera.h"
+    "include/mars_engine/animation/skeleton.h"
+    "include/mars_engine/animation/animation_clip.h"
+    "include/mars_engine/animation/animation_system.h"
 )
 list(REMOVE_DUPLICATES ENGINE_HEADERS)
 

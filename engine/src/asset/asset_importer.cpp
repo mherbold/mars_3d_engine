@@ -3,7 +3,10 @@
 // MARS 3D Engine — Assimp-based model importer implementation
 // =============================================================================
 
+#include "mars_engine/engine_api.h"
 #include "mars_engine/asset/asset_importer.h"
+#include "mars_engine/animation/skeleton.h"
+#include "mars_engine/animation/animation_clip.h"
 
 #pragma warning(push, 0)
 #include <assimp/Importer.hpp>
@@ -14,9 +17,9 @@
 #include <stdexcept>
 #include <filesystem>
 #include <format>
-#include <print>
 #include <cassert>
 #include <algorithm>
+#include <functional>
 
 namespace mars
 {
@@ -219,7 +222,7 @@ std::optional<ModelAsset> AssetImporter::import(const std::string& file_path) co
 
     if (!fs::exists(file_path))
     {
-        std::println(stderr, "[AssetImporter] File not found: {}", file_path);
+        MARS_LOG("[AssetImporter] File not found: {}", file_path);
         return std::nullopt;
     }
 
@@ -238,7 +241,7 @@ std::optional<ModelAsset> AssetImporter::import(const std::string& file_path) co
     const aiScene* scene = importer.ReadFile(file_path, flags);
     if (!scene || scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE || !scene->mRootNode)
     {
-        std::println(stderr, "[AssetImporter] Failed to load '{}': {}", file_path, importer.GetErrorString());
+        MARS_LOG("[AssetImporter] Failed to load '{}': {}", file_path, importer.GetErrorString());
         return std::nullopt;
     }
 
@@ -281,13 +284,208 @@ std::optional<ModelAsset> AssetImporter::import(const std::string& file_path) co
         }
     }
 
-    std::println("[AssetImporter] Loaded '{}': {} mesh(es), {} material(s), {} vertices total",
+    MARS_LOG("[AssetImporter] Loaded '{}': {} mesh(es), {} material(s), {} vertices total",
         file_path,
         asset.meshes.size(),
         asset.materials.size(),
         [&]() { size_t n = 0; for (auto& m : asset.meshes) n += m.vertices.size(); return n; }());
 
     return asset;
+}
+
+// ---------------------------------------------------------------------------
+// import_skeleton
+// ---------------------------------------------------------------------------
+std::optional<Skeleton> AssetImporter::import_skeleton(const std::string& file_path) const
+{
+    namespace fs = std::filesystem;
+
+    if (!fs::exists(file_path))
+    {
+        MARS_LOG("[AssetImporter] File not found: {}", file_path);
+        return std::nullopt;
+    }
+
+    Assimp::Importer importer;
+    const aiScene* scene = importer.ReadFile(file_path,
+        aiProcess_Triangulate | aiProcess_LimitBoneWeights);
+    if (!scene || !scene->mRootNode)
+    {
+        MARS_LOG("[AssetImporter] Failed to load '{}': {}", file_path, importer.GetErrorString());
+        return std::nullopt;
+    }
+
+    // Collect all unique bone names across all meshes.
+    std::vector<const aiBone*> all_bones;
+    for (uint32_t mi = 0; mi < scene->mNumMeshes; ++mi)
+    {
+        const aiMesh* mesh = scene->mMeshes[mi];
+        for (uint32_t bi = 0; bi < mesh->mNumBones; ++bi)
+            all_bones.push_back(mesh->mBones[bi]);
+    }
+
+    if (all_bones.empty())
+    {
+        MARS_LOG("[AssetImporter] No skeletal data found in '{}'", file_path);
+        return std::nullopt;
+    }
+
+    // Build a name -> index map from the node hierarchy.
+    // We use the first mesh's bone list to seed the skeleton.
+    Skeleton skeleton;
+    skeleton.name = fs::path(file_path).stem().string();
+
+    // Helper: find a node by name in the scene hierarchy.
+    std::function<const aiNode*(const aiNode*, const std::string&)> find_node;
+    find_node = [&](const aiNode* node, const std::string& name) -> const aiNode*
+    {
+        if (std::string(node->mName.C_Str()) == name) return node;
+        for (uint32_t c = 0; c < node->mNumChildren; ++c)
+        {
+            if (auto* r = find_node(node->mChildren[c], name)) return r;
+        }
+        return nullptr;
+    };
+
+    // Deduplicate bone names preserving first-seen order.
+    std::vector<std::string> bone_names;
+    for (const aiBone* b : all_bones)
+    {
+        std::string n = b->mName.C_Str();
+        if (skeleton.find_bone_index(n) < 0)
+        {
+            Bone bone;
+            bone.name = n;
+
+            // Inverse bind pose from Assimp.
+            // aiMatrix4x4 is row-major: a=row0, b=row1, c=row2, d=row3
+            //                           1=col0, 2=col1, 3=col2, 4=col3
+            const aiMatrix4x4& m = b->mOffsetMatrix;
+            bone.inverse_bind_pose = {
+                m.a1, m.a2, m.a3, m.a4,
+                m.b1, m.b2, m.b3, m.b4,
+                m.c1, m.c2, m.c3, m.c4,
+                m.d1, m.d2, m.d3, m.d4
+            };
+
+            // Local transform from the scene node (if found).
+            if (const aiNode* node = find_node(scene->mRootNode, n))
+            {
+                const aiMatrix4x4& lm = node->mTransformation;
+                bone.local_transform = {
+                    lm.a1, lm.a2, lm.a3, lm.a4,
+                    lm.b1, lm.b2, lm.b3, lm.b4,
+                    lm.c1, lm.c2, lm.c3, lm.c4,
+                    lm.d1, lm.d2, lm.d3, lm.d4
+                };
+            }
+
+            bone_names.push_back(n);
+            skeleton.bones.push_back(std::move(bone));
+        }
+    }
+
+    // Resolve parent indices using the scene node hierarchy.
+    for (auto& bone : skeleton.bones)
+    {
+        const aiNode* node = find_node(scene->mRootNode, bone.name);
+        if (node && node->mParent)
+        {
+            bone.parent_index = skeleton.find_bone_index(node->mParent->mName.C_Str());
+        }
+    }
+
+    MARS_LOG("[AssetImporter] Loaded skeleton from '{}': {} bones", file_path, skeleton.bones.size());
+    return skeleton;
+}
+
+// ---------------------------------------------------------------------------
+// import_animations
+// ---------------------------------------------------------------------------
+std::vector<AnimationClip> AssetImporter::import_animations(const std::string& file_path) const
+{
+    namespace fs = std::filesystem;
+
+    if (!fs::exists(file_path))
+    {
+        MARS_LOG("[AssetImporter] File not found: {}", file_path);
+        return {};
+    }
+
+    Assimp::Importer importer;
+    const aiScene* scene = importer.ReadFile(file_path, aiProcess_Triangulate);
+    if (!scene || !scene->mRootNode)
+    {
+        MARS_LOG("[AssetImporter] Failed to load '{}': {}", file_path, importer.GetErrorString());
+        return {};
+    }
+
+    if (scene->mNumAnimations == 0)
+    {
+        MARS_LOG("[AssetImporter] No animations found in '{}'", file_path);
+        return {};
+    }
+
+    std::vector<AnimationClip> clips;
+    clips.reserve(scene->mNumAnimations);
+
+    for (uint32_t ai_idx = 0; ai_idx < scene->mNumAnimations; ++ai_idx)
+    {
+        const aiAnimation* anim = scene->mAnimations[ai_idx];
+        AnimationClip clip;
+        clip.name             = anim->mName.C_Str();
+        clip.ticks_per_second = static_cast<float>(anim->mTicksPerSecond > 0.0
+                                    ? anim->mTicksPerSecond : 30.0);
+        clip.duration         = static_cast<float>(anim->mDuration) / clip.ticks_per_second;
+
+        clip.channels.reserve(anim->mNumChannels);
+        for (uint32_t ci = 0; ci < anim->mNumChannels; ++ci)
+        {
+            const aiNodeAnim* ch = anim->mChannels[ci];
+            BoneChannel channel;
+            channel.bone_name = ch->mNodeName.C_Str();
+
+            channel.position_keys.reserve(ch->mNumPositionKeys);
+            for (uint32_t k = 0; k < ch->mNumPositionKeys; ++k)
+            {
+                PositionKey pk;
+                pk.time  = static_cast<float>(ch->mPositionKeys[k].mTime) / clip.ticks_per_second;
+                pk.value = { ch->mPositionKeys[k].mValue.x,
+                             ch->mPositionKeys[k].mValue.y,
+                             ch->mPositionKeys[k].mValue.z };
+                channel.position_keys.push_back(pk);
+            }
+
+            channel.rotation_keys.reserve(ch->mNumRotationKeys);
+            for (uint32_t k = 0; k < ch->mNumRotationKeys; ++k)
+            {
+                RotationKey rk;
+                rk.time  = static_cast<float>(ch->mRotationKeys[k].mTime) / clip.ticks_per_second;
+                rk.value = { ch->mRotationKeys[k].mValue.x,
+                             ch->mRotationKeys[k].mValue.y,
+                             ch->mRotationKeys[k].mValue.z,
+                             ch->mRotationKeys[k].mValue.w };
+                channel.rotation_keys.push_back(rk);
+            }
+
+            channel.scale_keys.reserve(ch->mNumScalingKeys);
+            for (uint32_t k = 0; k < ch->mNumScalingKeys; ++k)
+            {
+                ScaleKey sk;
+                sk.time  = static_cast<float>(ch->mScalingKeys[k].mTime) / clip.ticks_per_second;
+                // Use X component as uniform scale.
+                sk.value = ch->mScalingKeys[k].mValue.x;
+                channel.scale_keys.push_back(sk);
+            }
+
+            clip.channels.push_back(std::move(channel));
+        }
+
+        clips.push_back(std::move(clip));
+    }
+
+    MARS_LOG("[AssetImporter] Loaded {} animation(s) from '{}'", clips.size(), file_path);
+    return clips;
 }
 
 } // namespace mars
