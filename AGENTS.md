@@ -176,3 +176,17 @@ These rules were established through extensive debugging and must all hold simul
 | **Identity clip matrices when MVs include camera motion** | Set `sl::Constants::clipToPrevClip` and `prevClipToClip` to identity `float4x4(1,…)` whenever `cameraMotionIncluded = eTrue`. Passing real previous-frame matrices doubles the camera motion. |
 | **`prev_view_proj` seeded on frame 0** | In `Renderer::set_camera()`, on the first call initialise `cam.prev_view_proj = curr_view_proj` to produce zero motion vectors on frame 0 and prevent NaN/Inf in DLSS-RR's history buffer. |
 | **Render ≠ Display resolution** | Path-tracer noisy-color, MVs, depth, and AOVs are allocated at **render resolution** (DLSS input). Denoised output UAV is allocated at **display resolution** (DLSS output). Never mix the two sizes in the same allocation path. |
+
+---
+
+## M10 — Ecosystem Architectural Decisions (Locked)
+
+These decisions were locked before implementation began and must not be changed without explicit user approval.
+
+| Decision | Rule |
+|---|---|
+| **Octahedral impostors, not flat billboards** | LOD 3 (> 600 m) uses octahedral impostors with per-texel depth offset. Flat camera-facing billboards are prohibited — they produce wrong depth in reflections, incorrect self-shadowing, and bad grazing-angle appearance in a pure path tracer. |
+| **LOD transition = stochastic dither only** | Never alpha-blend two LOD levels simultaneously. Use `Hash01(instanceId, pixelId, sampleIndex)` to stochastically select one tier per ray. Blue-noise hash for primary rays; hashed instance/sample for secondary; temporally scrambled; denoiser resolves. Dual-LOD alpha blending causes double energy, RT visibility weirdness, and shadow/reflection mismatch. |
+| **Alpha foliage = Opacity Micromaps (OMM, DXR 1.2)** | All alpha-tested leaf/card geometry (LOD 0-2) must use pre-baked DXR 1.2 OMMs to avoid AnyHit shader cost. Fallback to AnyHit alpha test only when OMM is not supported by the device. |
+| **No rasterization in ecosystem rendering** | All LOD tiers are path-traced only. Impostors are procedural AABB TLAS entries with custom intersection shaders. No G-buffer, no raster shadow maps. |
+| **SpeedTree ORCA v2 asset convention** | Texture layout: BaseColor (RGB=colour, A=opacity), Specular (R=occlusion, G=roughness, B=metalness), Normal (DirectX Y-up). Assets: Boston Fern, European Linden, Hedge, Japanese Maple, Red Maple Young, White Oak (all with HighPoly + LowPoly FBX + DDS textures). |

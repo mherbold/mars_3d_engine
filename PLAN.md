@@ -1,4 +1,4 @@
-# PLAN.md — MARS 3D Engine: High-Level Implementation Plan
+﻿# PLAN.md — MARS 3D Engine: High-Level Implementation Plan
 
 > **Target hardware:** NVIDIA RTX 4000 / 5000 series (or equivalent AMD RDNA 3/4)  
 > **Graphics API:** DirectX 12 + DirectX Raytracing (DXR) — no legacy fallback  
@@ -324,16 +324,165 @@ Meshes are stored as interleaved vertex buffers (position | normal | tangent | u
 
 ---
 
-## 10. Procedural Ecosystem (Vegetation & Trees)
+## 10. Procedural Ecosystem (Vegetation and Trees)
+
+### SpeedTree Asset Compatibility
+The engine targets compatibility with SpeedTree ORCA v2 assets (NVIDIA Open Research Content Archive).
+Each species ships with:
+- HighPoly/ - full-detail FBX mesh (used for near LOD)
+- LowPoly/ - reduced FBX mesh (used for mid LOD / OMM cards)
+- Textures/ - DDS textures using the GGX PBR channel convention:
+  - BaseColor - RGB = base colour, A = Opacity mask (foliage alpha cutout)
+  - Specular - R = Occlusion, G = Roughness, B = Metalness
+  - Normal - DirectX convention (Y-up, right-handed tangent space)
+
+Free assets on hand: Boston Fern, European Linden, Hedge, Japanese Maple, Red Maple Young, White Oak.
+
+---
+
+### LOD Tiers
+
+| Tier | Distance | Representation | Alpha Handling |
+|---|---|---|---|
+| LOD 0 - Near | < ~50 m | HighPoly FBX mesh (full geometry, alpha-tested leaves/cards) | Opacity Micromaps (OMM, DXR 1.2) - hardware alpha-test; no AnyHit shader invoked |
+| LOD 1 - Mid | 50-200 m | LowPoly FBX mesh (simplified cards) | Opacity Micromaps (OMM) |
+| LOD 2 - Far cluster | 200-600 m | Simplified alpha cards (generated offline per species) | Opacity Micromaps (OMM) |
+| LOD 3 - Impostor | > 600 m | Octahedral impostor with packed depth + opacity | Procedural TLAS geometry; depth parallax corrects reflections/shadows/grazing |
+
+---
+
+### Octahedral Impostors (LOD 3)
+Far-distance trees use octahedral impostors, not flat camera-facing billboards. Pure flat alpha cards produce visible artifacts in a path tracer: wrong depth in reflections, incorrect self-shadowing, bad appearance at grazing angles. Octahedral impostors fix this:
+
+- Pre-bake a hemispherical grid of view directions onto an octahedral atlas (e.g. 16x16 views) storing radiance/BaseColor+Opacity and per-texel encoded depth offset from the impostor centre plane.
+- At ray hit time the intersection shader reconstructs the approximate surface normal and position from the stored depth, enabling a per-ray parallax correction - the ray effectively pierces the volume at the right depth, giving correct reflections, correct shadow termination, and correct appearance at grazing angles.
+- The impostor is registered as a procedural AABB primitive in the TLAS with a custom intersection shader; no rasterization is involved.
+
+---
+
+### LOD Transition - Stochastic Dither (no alpha blending)
+The transition between any two LOD tiers uses stochastic (noise-based) selection, not alpha blending of the full mesh. Alpha-blending two LOD levels simultaneously causes double energy, ray-tracing visibility weirdness (both BLAS entries visible simultaneously), and shadow/reflection mismatch.
+
+Instead, each ray independently selects one LOD tier using a stable per-instance, per-pixel hash:
+
+- Primary visibility rays: blue-noise pixel hash for low-discrepancy screen coverage.
+- Secondary rays (reflections, GI): hashed instance + sample index (no screen-space coherence needed).
+- Temporal scrambling: scramble the hash seed per-frame with a low-amplitude counter so the stochastic selection integrates over time; DLSS/denoiser resolves the blend.
+
+Example: float h = Hash01(instanceId, pixelId, sampleIndex); bool useHigherLod = (h >= lodT);
+
+---
+
+### Alpha Foliage - Opacity Micromaps (OMM)
+For all LOD tiers that use alpha-tested leaf/card geometry, the engine uses DXR 1.2 Opacity Micromaps to avoid expensive AnyHit shader invocations per ray:
+
+- OMMs encode per-micro-triangle opacity states (Opaque / Transparent / Unknown) into a compact bitmask attached to the BLAS.
+- The BVH traversal hardware uses the OMM to skip transparent micro-triangles or promote opaque ones, without entering the AnyHit shader.
+- Unknown micro-triangles fall through to AnyHit as normal (safety net for sub-texel detail).
+- OMMs are baked offline per mesh + BaseColor alpha channel during asset conditioning, stored alongside the BLAS.
+
+OMM is the canonical modern D3D12/DXR 1.2 answer. Fallback (hardware without OMM support): AnyHit shader performing manual alpha test.
+
+---
+
+### Wind Animation
+
+Wind deformation is implemented as a hierarchical three-layer GPU compute model. The current implementation is in `engine/shaders/vegetation_wind.hlsl`, dispatched per-species per-frame by `Renderer::update()` via `PathTracer::dispatch_vegetation_wind()`.
+
+#### Layer 1 — Primary Trunk Bend
+The trunk is modelled as a fixed-base cantilever beam under a distributed horizontal load. Displacement follows the analytic beam deflection curve:
+
+```
+d(h) = (3h² − h³) / 2
+```
+
+This enforces zero displacement *and* zero slope at the root (`h = 0`), so the trunk curves continuously rather than rotating rigidly at the base. Maximum displacement is at the crown (`h = 1`).
+
+The driving amplitude is **not** the instantaneous wind speed. Instead it is `trunk_envelope`, the output of a CPU-side damped second-order spring oscillator (per-species):
+
+```
+ẍ + 2ζω₀ẋ + ω₀²x = ω₀² · wind_t_target
+
+ω₀   = 2π × 0.22 Hz   →   ~4.5 s natural period (large tree resonance)
+ζ    = 0.28            →   lightly underdamped (~1-2 overshoots before settling)
+```
+
+This gives the trunk realistic mass-like inertia: it builds up over ~3-4 s when a gust arrives, overshoots slightly, then decays slowly when the wind subsides. **Trunks are slow to react to wind changes.**
+
+The oscillator is integrated with semi-implicit Euler each frame using `m_last_delta_time`. The result is clamped to `[0, 1.5]` before upload to the shader as a `float` constant.
+
+#### Layer 2 — Branch Sway
+Branches respond to localised wind drag and turbulence. Motion is computed procedurally using **four inharmonic sinusoids** at different frequencies and vertex-position-seeded spatial phases, summed to approximate the stochastic, aperiodic patterns real branches exhibit under wind.
+
+Two orthogonal displacement components are produced:
+- **Along-wind**: primary + three harmonics at irrational frequency ratios (2.20, 3.67, ~1.13×, ~1.73× of a fast time axis)
+- **Cross-wind**: two independent harmonics (2.81, 4.11× of the slow axis), uncorrelated from along-wind
+
+Each vertex's world-space XZ position seeds its own unique phase offset, so adjacent branches are never in synchrony. The combined oscillators never exactly repeat (irrational frequency ratios), giving each branch a distinct, turbulent character.
+
+Branches use `wind_t_raw` (instantaneous normalised wind speed) so their amplitude responds within one frame — **faster than the trunk but slower than leaves**. Because the trunk lags via the spring, branches visibly lead the trunk on a gust: the correct hierarchical order.
+
+#### Layer 3 — Leaf Detail Bending
+Individual leaf vertices ripple and flutter using two uncorrelated high-frequency oscillators mixed with unequal weights to break periodicity (~9.5 Hz and ~14.3 Hz; ratio is near-but-not-exactly 2:3). Each vertex's world-position seeds a unique phase so every leaf appears to flutter independently.
+
+Displacement has three components:
+- **XZ tangential flutter** — the leaf swinging across the wind
+- **Y vertical ripple** — the leaf tilting up and down as it flutters
+- A `sqrt` wind-response curve keeps leaves visibly alive in calm air (floor at `wind_t_raw + 0.15`)
+
+A spatial mask (`h > 0.55` AND `off_axis > 0.5`) restricts flutter to upper-canopy off-axis vertices, preventing trunk geometry from vibrating. **Leaves react almost instantly to wind changes.**
+
+#### Phase Variation (Anti-Synchrony)
+To prevent multiple tree species from animating in synchronised lockstep, a **per-species pseudorandom phase offset** is derived on the CPU using a golden-ratio Knuth integer hash of the species index and passed to the shader as `wind_phase_offset`. This ensures all three time arguments (`t_slow`, `t_fast`) are phase-shifted independently per species.
+
+Within a single tree mesh, all three layers derive additional spatial phase variation from vertex world-position coordinates, individually differentiating branches and leaves without any per-instance CPU cost.
+
+#### CPU Wind Evaluation (WindDesc)
+The global wind vector fed to all systems (`m_wind_current`) is produced by a three-layer oscillator on the CPU:
+1. **Gust layer** — sinusoidal speed modulation at `gust_frequency` with strength `gust_strength`
+2. **Direction wander** — sinusoidal rotation of the base wind direction by ±`direction_wander_angle`°
+3. **Micro-turbulence** — small per-axis sinusoidal offsets at `micro_frequency`
+
+The output is then passed through a **frame-rate-independent one-pole IIR smoother**:
+```
+tau   = -1 / (60 × ln(response_smoothing))
+alpha = 1 − exp(−dt / tau)
+output += alpha × (target − output)
+```
+This smooths rapid gust transitions for cloth and other consumers without affecting the vegetation spring (which has its own inertia model).
+
+#### GPU Pipeline
+- Deformation is dispatched per-species per-frame (one dispatch per mesh submesh)
+- Deformed vertices are written to a species-shared GPU output buffer (the "skinned vertex buffer")
+- A compact `float3` prev-position buffer is updated before each deform pass so the path-tracing closest-hit shader can compute per-vertex motion vectors for DLSS/denoiser temporal reprojection
+- BLAS refit is issued immediately after each UAV barrier on the output buffer
+- TLAS is rebuilt once per frame after all BLAS refits complete
+
+#### Summary Table
+
+| Layer | Geometry target | Frequency | Response speed | Amplitude driver |
+|---|---|---|---|---|
+| 1 — Trunk bend | All vertices, weighted by `d(h)` | ~0.22 Hz (≈ 4.5 s period) | Slow (~3-4 s buildup via spring) | `trunk_envelope` (CPU spring output) |
+| 2 — Branch sway | Off-axis, canopy-height vertices | 2.2 – 4.1 Hz (4 harmonics) | Fast (1 frame) | `wind_t_raw` (instantaneous) |
+| 3 — Leaf flutter | Upper-canopy off-axis vertices only | ~9.5 and ~14.3 Hz (2 oscillators) | Near-instant (1 frame) | `wind_t_raw` with `sqrt` curve |
+
+---
+
+### Summary Table
 
 | Feature | Approach |
 |---|---|
 | Placement | GPU-driven: compute shader reads density map, emits instance transforms into a GPU instance buffer |
-| LOD | GPU-driven: a second compute pass reads instance transforms, estimates projected solid angle, and writes each instance’s LOD level and BLAS index into the draw indirect args buffer; no CPU readback required |
-| Impostor billboards | Far-distance: pre-baked multi-angle radiance cards sampled during ray traversal (no rasterization GBuffer) |
-| Wind animation | Compute shader: Bezier trunk/branch bend driven by wind vector; updated vertex positions written back before BLAS refit each frame |
-| Intersection | BLAS per species (instanced); TLAS updated each frame for dynamic instances |
-| Culling | GPU-driven: a compute prepass marks out-of-frustum and beyond-max-distance instances as inactive in the instance buffer before TLAS construction; no Hi-Z (no rasterized depth buffer exists) |
+| LOD selection | GPU-driven compute pass: estimates projected solid angle per instance, writes LOD level + BLAS index; no CPU readback |
+| LOD transition | Stochastic dither - per-ray hash selects one LOD tier; denoiser resolves; no simultaneous dual-LOD alpha blend |
+| Near/mid foliage (LOD 0-1) | SpeedTree HighPoly/LowPoly FBX + alpha cards + Opacity Micromaps (OMM, DXR 1.2) |
+| Far cluster foliage (LOD 2) | Simplified alpha cards + Opacity Micromaps |
+| Far impostor (LOD 3) | Octahedral impostor (16x16 view grid) with packed depth; procedural AABB in TLAS; parallax-corrected intersection |
+| Alpha handling | OMM (primary); AnyHit alpha test (OMM-unavailable fallback) |
+| Wind animation | Three-layer hierarchical compute shader (trunk cantilever bend driven by CPU spring, stochastic branch sway via 4-harmonic inharmonic sinusoids, dual-oscillator leaf flutter); BLAS refit + prev-pos snapshot each frame for motion vectors |
+| BLAS/TLAS | BLAS per species (instanced); TLAS updated each frame for dynamic wind instances |
+| Culling | GPU-driven: frustum + max-distance cull in compute prepass before TLAS construction; no Hi-Z (no raster depth buffer) |
+| Asset compatibility | SpeedTree ORCA v2 - FBX meshes, DDS textures (BaseColor/Specular/Normal), GGX PBR channel convention |
 
 ---
 

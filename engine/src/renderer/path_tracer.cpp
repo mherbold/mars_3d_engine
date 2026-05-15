@@ -10,6 +10,7 @@
 
 #include <stdexcept>
 #include <algorithm>
+#include <cmath>
 #include <format>
 #include <fstream>
 #include <vector>
@@ -172,6 +173,9 @@ void PathTracer::init(DeviceContext& ctx,
     create_blit_pipeline(ctx);
     create_skinning_pipeline(ctx);
     create_cloth_pipeline(ctx);
+    create_vegetation_placement_pipeline(ctx);
+    create_vegetation_lod_pipeline(ctx);
+    create_vegetation_wind_pipeline(ctx);
     create_shader_tables(ctx);
     create_output_textures(ctx);
     create_cb_ring(ctx);
@@ -602,6 +606,407 @@ void PathTracer::dispatch_cloth_sim(ID3D12GraphicsCommandList6* cmd_list,
 }
 
 // ---------------------------------------------------------------------------
+// create_vegetation_placement_pipeline
+// Compute pipeline that reads a density map texture and writes vegetation
+// instance data to a structured buffer with an atomic counter.
+// ---------------------------------------------------------------------------
+void PathTracer::create_vegetation_placement_pipeline(DeviceContext& ctx)
+{
+    auto* device = ctx.device();
+
+    {
+        // 16 root constants (PlacementConstants packed as DWORDs)
+        CD3DX12_ROOT_PARAMETER1 params[2]{};
+        params[0].InitAsConstants(16, 0, 0, D3D12_SHADER_VISIBILITY_ALL);
+
+        static constexpr UINT k_unbounded = UINT_MAX;
+        static constexpr D3D12_DESCRIPTOR_RANGE_FLAGS k_volatile =
+            D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE |
+            D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+
+        // vegetation_placement.hlsl uses:
+        //   t0, space0 — g_Textures[]              (SRV: density map)
+        //   u0, space0 — g_RWBuffersU32[]          (UAV: atomic counter)
+        //   u0, space1 — g_RWInstanceBuffers[]     (UAV: instance buffer)
+        CD3DX12_DESCRIPTOR_RANGE1 ranges[3]{};
+        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, k_unbounded, 0, 0, k_volatile, 0); // t0, space0
+        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, k_unbounded, 0, 0, k_volatile, 0); // u0, space0
+        ranges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, k_unbounded, 0, 1, k_volatile, 0); // u0, space1
+        params[1].InitAsDescriptorTable(3, ranges, D3D12_SHADER_VISIBILITY_ALL);
+
+        // Static linear-clamp sampler for the density map at s0.
+        CD3DX12_STATIC_SAMPLER_DESC static_sampler(
+            0,                                          // shader register
+            D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+
+        CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rs_desc;
+        rs_desc.Init_1_1(2, params, 1, &static_sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
+        ComPtr<ID3DBlob> rs_blob, err_blob;
+        throw_if_failed(
+            D3DX12SerializeVersionedRootSignature(&rs_desc,
+                D3D_ROOT_SIGNATURE_VERSION_1_1, &rs_blob, &err_blob),
+            "PathTracer: serialize vegetation placement root signature failed");
+        throw_if_failed(
+            device->CreateRootSignature(0,
+                rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(),
+                IID_PPV_ARGS(&m_vegetation_placement_root_sig)),
+            "PathTracer: create vegetation placement root signature failed");
+        m_vegetation_placement_root_sig->SetName(L"MARS::PathTracer::VegetationPlacementRootSig");
+    }
+
+    auto dxil = load_dxil_blob(L"vegetation_placement.dxil");
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
+    pso_desc.pRootSignature = m_vegetation_placement_root_sig.Get();
+    pso_desc.CS             = { dxil.data(), dxil.size() };
+
+    throw_if_failed(
+        device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&m_vegetation_placement_pso)),
+        "PathTracer: create vegetation placement compute PSO failed");
+    m_vegetation_placement_pso->SetName(L"MARS::PathTracer::VegetationPlacementPSO");
+
+    MARS_LOG("[PathTracer] Vegetation placement compute pipeline created");
+}
+
+// ---------------------------------------------------------------------------
+// dispatch_vegetation_placement
+// Runs the GPU-driven vegetation placement compute shader. Reads the density
+// map and writes instances to the ecosystem instance buffer + atomic counter.
+//
+// The caller is responsible for:
+//   - Setting the bindless heap on the command list before calling
+//   - Allocating ecosystem.instance_buffer_uav and instance counter buffer
+//   - Setting up density_map_srv to point to a valid R8 texture
+// ---------------------------------------------------------------------------
+void PathTracer::dispatch_vegetation_placement(ID3D12GraphicsCommandList6* cmd_list,
+                                                EcosystemDesc&              ecosystem)
+{
+    if (!ecosystem.enabled || ecosystem.species.empty())
+        return;
+
+    if (ecosystem.density_map_srv == UINT32_MAX || 
+        ecosystem.instance_buffer_uav == UINT32_MAX)
+    {
+        MARS_LOG("[PathTracer] dispatch_vegetation_placement: ecosystem GPU resources not set up");
+        return;
+    }
+
+    static bool s_logged = false;
+    if (!s_logged)
+    {
+        s_logged = true;
+        MARS_LOG("[PathTracer] dispatch_vegetation_placement: density_srv={} instance_uav={} max_instances={} species_count={}",
+                 ecosystem.density_map_srv, ecosystem.instance_buffer_uav,
+                 ecosystem.max_instances, ecosystem.species.size());
+    }
+
+    cmd_list->SetComputeRootSignature(m_vegetation_placement_root_sig.Get());
+    cmd_list->SetPipelineState(m_vegetation_placement_pso.Get());
+    cmd_list->SetComputeRootDescriptorTable(1, m_bindless_heap_gpu_start);
+
+    // PlacementConstants HLSL layout (16 DWORDs):
+    //   [0..2]  world_min (float3)
+    //   [3]     placement_y (float)
+    //   [4..6]  world_max (float3)
+    //   [7]     max_instances (uint)
+    //   [8]     density_multiplier (float)
+    //   [9]     species_count (uint)
+    //   [10]    density_map_srv (uint)
+    //   [11]    instance_buffer_uav (uint)
+    //   [12]    instance_counter_uav (uint)
+    //   [13]    grid_resolution (uint)
+    //   [14]    random_seed (uint)
+    //   [15]    _pad0
+    //
+    // Size the candidate grid to roughly match max_instances. The placement
+    // shader uses InterlockedAdd to claim instance slots, which is order-
+    // dependent: if many more cells pass the spawn test than max_instances
+    // permits, the "winning" cells vary between runs and the placed
+    // instances appear in different positions each launch. Picking
+    // grid_resolution ≈ sqrt(max_instances) ensures the number of candidate
+    // spawn sites is on the order of max_instances, so even at density=1.0
+    // the InterlockedAdd cap is rarely exceeded and placement is stable
+    // (and, at max_instances == 1, fully deterministic).
+    uint32_t grid_resolution = static_cast<uint32_t>(
+        std::ceil(std::sqrt(static_cast<double>(std::max(1u, ecosystem.max_instances)))));
+    grid_resolution = std::clamp(grid_resolution, 1u, 256u);
+
+    union { float f; uint32_t u; } u;
+    uint32_t c[16]{};
+    u.f = ecosystem.world_min.x; c[0] = u.u;
+    u.f = ecosystem.world_min.y; c[1] = u.u;
+    u.f = ecosystem.world_min.z; c[2] = u.u;
+    u.f = ecosystem.placement_y; c[3] = u.u;
+    u.f = ecosystem.world_max.x; c[4] = u.u;
+    u.f = ecosystem.world_max.y; c[5] = u.u;
+    u.f = ecosystem.world_max.z; c[6] = u.u;
+    c[7] = ecosystem.max_instances;
+    u.f = ecosystem.density_multiplier; c[8] = u.u;
+    c[9]  = static_cast<uint32_t>(ecosystem.species.size());
+    c[10] = ecosystem.density_map_srv;
+    c[11] = ecosystem.instance_buffer_uav;
+    c[12] = ecosystem.instance_counter_uav;
+    c[13] = grid_resolution;
+    // Keep random_seed stable across the (one-shot) placement dispatch so
+    // the same seed is used every launch — combined with a small candidate
+    // grid this makes the resulting layout fully reproducible.
+    c[14] = ecosystem.random_seed;
+    c[15] = 0;                         // _pad0
+    cmd_list->SetComputeRoot32BitConstants(0, 16, c, 0);
+
+    const uint32_t dispatch_xy = (grid_resolution + 7) / 8; // 8x8 thread groups
+    cmd_list->Dispatch(dispatch_xy, dispatch_xy, 1);
+}
+
+// ---------------------------------------------------------------------------
+// create_vegetation_lod_pipeline
+// Compute pipeline that reads vegetation instances + a per-species LOD-distance
+// table and updates each instance's `current_lod` based on camera distance.
+// ---------------------------------------------------------------------------
+void PathTracer::create_vegetation_lod_pipeline(DeviceContext& ctx)
+{
+    auto* device = ctx.device();
+
+    {
+        // 12 root constants (LodSelectionConstants packed as DWORDs)
+        CD3DX12_ROOT_PARAMETER1 params[2]{};
+        params[0].InitAsConstants(12, 0, 0, D3D12_SHADER_VISIBILITY_ALL);
+
+        static constexpr UINT k_unbounded = UINT_MAX;
+        static constexpr D3D12_DESCRIPTOR_RANGE_FLAGS k_volatile =
+            D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE |
+            D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+
+        // vegetation_lod_selection.hlsl uses:
+        //   u0, space1 — g_RWInstanceBuffers[]   (UAV: instance buffer, read+write)
+        //   t0, space2 — g_SpeciesBuffers[]      (SRV: per-species LOD distances)
+        CD3DX12_DESCRIPTOR_RANGE1 ranges[2]{};
+        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, k_unbounded, 0, 1, k_volatile, 0);
+        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, k_unbounded, 0, 2, k_volatile, 0);
+        params[1].InitAsDescriptorTable(2, ranges, D3D12_SHADER_VISIBILITY_ALL);
+
+        CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rs_desc;
+        rs_desc.Init_1_1(2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
+        ComPtr<ID3DBlob> rs_blob, err_blob;
+        throw_if_failed(
+            D3DX12SerializeVersionedRootSignature(&rs_desc,
+                D3D_ROOT_SIGNATURE_VERSION_1_1, &rs_blob, &err_blob),
+            "PathTracer: serialize vegetation LOD root signature failed");
+        throw_if_failed(
+            device->CreateRootSignature(0,
+                rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(),
+                IID_PPV_ARGS(&m_vegetation_lod_root_sig)),
+            "PathTracer: create vegetation LOD root signature failed");
+        m_vegetation_lod_root_sig->SetName(L"MARS::PathTracer::VegetationLodRootSig");
+    }
+
+    auto dxil = load_dxil_blob(L"vegetation_lod_selection.dxil");
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
+    pso_desc.pRootSignature = m_vegetation_lod_root_sig.Get();
+    pso_desc.CS             = { dxil.data(), dxil.size() };
+
+    throw_if_failed(
+        device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&m_vegetation_lod_pso)),
+        "PathTracer: create vegetation LOD compute PSO failed");
+    m_vegetation_lod_pso->SetName(L"MARS::PathTracer::VegetationLodPSO");
+
+    MARS_LOG("[PathTracer] Vegetation LOD selection compute pipeline created");
+}
+
+// ---------------------------------------------------------------------------
+// dispatch_vegetation_lod_selection
+// Per-frame LOD update for all placed vegetation instances. Reads instance
+// world positions, compares against the camera, and writes a new LOD tier
+// + dither offset back into the instance buffer.
+//
+// `frame_index` is used to vary the per-frame dither jitter so transitions
+// look animated rather than static.
+// ---------------------------------------------------------------------------
+void PathTracer::dispatch_vegetation_lod_selection(ID3D12GraphicsCommandList6* cmd_list,
+                                                    EcosystemDesc&              ecosystem,
+                                                    const Vec3&                 camera_position,
+                                                    uint32_t                    frame_index)
+{
+    if (!ecosystem.enabled || ecosystem.species.empty() || ecosystem.instance_count == 0)
+        return;
+
+    if (ecosystem.instance_buffer_uav == UINT32_MAX ||
+        ecosystem.species_buffer_srv  == UINT32_MAX)
+    {
+        MARS_LOG("[PathTracer] dispatch_vegetation_lod_selection: ecosystem GPU resources not set up");
+        return;
+    }
+
+    cmd_list->SetComputeRootSignature(m_vegetation_lod_root_sig.Get());
+    cmd_list->SetPipelineState(m_vegetation_lod_pso.Get());
+    cmd_list->SetComputeRootDescriptorTable(1, m_bindless_heap_gpu_start);
+
+    // LodSelectionConstants HLSL layout (12 DWORDs):
+    //   [0..2]  camera_position (float3)
+    //   [3]     instance_count (uint)
+    //   [4]     species_count (uint)
+    //   [5]     instance_buffer_uav (uint)
+    //   [6]     species_buffer_srv (uint)
+    //   [7]     frame_jitter_seed (uint)
+    //   [8]     dither_band_meters (float)
+    //   [9..11] _pad
+    union { float f; uint32_t u; } u;
+    uint32_t c[12]{};
+    u.f = camera_position.x; c[0] = u.u;
+    u.f = camera_position.y; c[1] = u.u;
+    u.f = camera_position.z; c[2] = u.u;
+    c[3]  = ecosystem.instance_count;
+    c[4]  = static_cast<uint32_t>(ecosystem.species.size());
+    c[5]  = ecosystem.instance_buffer_uav;
+    c[6]  = ecosystem.species_buffer_srv;
+    c[7]  = frame_index;
+    u.f = ecosystem.lod_dither_band_meters; c[8] = u.u;
+    cmd_list->SetComputeRoot32BitConstants(0, 12, c, 0);
+
+    const uint32_t group_count = (ecosystem.instance_count + 63u) / 64u;
+    cmd_list->Dispatch(group_count, 1, 1);
+
+    // UAV barrier so subsequent passes see the updated LOD values.
+    auto uav_barrier = CD3DX12_RESOURCE_BARRIER::UAV(nullptr);
+    cmd_list->ResourceBarrier(1, &uav_barrier);
+}
+
+// ---------------------------------------------------------------------------
+// create_vegetation_wind_pipeline
+// Compute pipeline that deforms a static rest-pose vegetation mesh into a
+// wind-driven output vertex buffer suitable for refittable BLAS consumption.
+// Uses the same bindless byte-address-buffer layout as the skinning pass so
+// the existing refit_blas() path can be reused on the output buffer.
+// ---------------------------------------------------------------------------
+void PathTracer::create_vegetation_wind_pipeline(DeviceContext& ctx)
+{
+    auto* device = ctx.device();
+
+    {
+        // 16 root constants (WindConstants packed as DWORDs)
+        CD3DX12_ROOT_PARAMETER1 params[2]{};
+        params[0].InitAsConstants(16, 0, 0, D3D12_SHADER_VISIBILITY_ALL);
+
+        static constexpr UINT k_unbounded = UINT_MAX;
+        static constexpr D3D12_DESCRIPTOR_RANGE_FLAGS k_volatile =
+            D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE |
+            D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+
+        // vegetation_wind.hlsl uses (matches skinning layout):
+        //   t0, space1 — g_Buffers[]        (SRV: source ByteAddressBuffer)
+        //   u0, space3 — g_OutputBuffers[]  (UAV: deformed RWByteAddressBuffer)
+        CD3DX12_DESCRIPTOR_RANGE1 ranges[2]{};
+        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, k_unbounded, 0, 1, k_volatile, 0);
+        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, k_unbounded, 0, 3, k_volatile, 0);
+        params[1].InitAsDescriptorTable(2, ranges, D3D12_SHADER_VISIBILITY_ALL);
+
+        CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rs_desc;
+        rs_desc.Init_1_1(2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
+        ComPtr<ID3DBlob> rs_blob, err_blob;
+        throw_if_failed(
+            D3DX12SerializeVersionedRootSignature(&rs_desc,
+                D3D_ROOT_SIGNATURE_VERSION_1_1, &rs_blob, &err_blob),
+            "PathTracer: serialize vegetation wind root signature failed");
+        throw_if_failed(
+            device->CreateRootSignature(0,
+                rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(),
+                IID_PPV_ARGS(&m_vegetation_wind_root_sig)),
+            "PathTracer: create vegetation wind root signature failed");
+        m_vegetation_wind_root_sig->SetName(L"MARS::PathTracer::VegetationWindRootSig");
+    }
+
+    auto dxil = load_dxil_blob(L"vegetation_wind.dxil");
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
+    pso_desc.pRootSignature = m_vegetation_wind_root_sig.Get();
+    pso_desc.CS             = { dxil.data(), dxil.size() };
+
+    throw_if_failed(
+        device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&m_vegetation_wind_pso)),
+        "PathTracer: create vegetation wind compute PSO failed");
+    m_vegetation_wind_pso->SetName(L"MARS::PathTracer::VegetationWindPSO");
+
+    MARS_LOG("[PathTracer] Vegetation wind compute pipeline created");
+}
+
+// ---------------------------------------------------------------------------
+// dispatch_vegetation_wind
+// Deform a single vegetation mesh into the supplied output vertex buffer.
+// Caller is responsible for issuing a UAV barrier on the output buffer and
+// invoking refit_blas() on the species' refittable BLAS afterwards.
+// ---------------------------------------------------------------------------
+void PathTracer::dispatch_vegetation_wind(ID3D12GraphicsCommandList6* cmd_list,
+                                          uint32_t       vertex_count,
+                                          uint32_t       source_vertex_srv,
+                                          uint32_t       output_vertex_uav,
+                                          uint32_t       prev_pos_uav,
+                                          float          mesh_min_y,
+                                          float          mesh_height,
+                                          const Vec3&    wind_direction,
+                                          float          wind_strength,
+                                          float          time_seconds,
+                                          float          wind_phase_offset,
+                                          float          primary_bend,
+                                          float          secondary_sway,
+                                          float          leaf_flutter,
+                                          float          trunk_envelope)
+{
+    if (vertex_count == 0 ||
+        source_vertex_srv == UINT32_MAX ||
+        output_vertex_uav == UINT32_MAX)
+        return;
+
+    cmd_list->SetComputeRootSignature(m_vegetation_wind_root_sig.Get());
+    cmd_list->SetPipelineState(m_vegetation_wind_pso.Get());
+    cmd_list->SetComputeRootDescriptorTable(1, m_bindless_heap_gpu_start);
+
+    // WindConstants HLSL layout (16 DWORDs):
+    //   [0]     vertex_count
+    //   [1]     source_vertex_buffer_srv
+    //   [2]     output_vertex_buffer_uav
+    //   [3]     mesh_min_y
+    //   [4..6]  wind_direction
+    //   [7]     wind_strength
+    //   [8]     time_seconds
+    //   [9]     wind_phase_offset
+    //   [10]    primary_bend
+    //   [11]    secondary_sway
+    //   [12]    leaf_flutter
+    //   [13]    mesh_height
+    //   [14]    prev_pos_buffer_uav
+    //   [15]    trunk_envelope  (spring-mass oscillator output, replaces raw wind_t in Layer 1)
+    union { float f; uint32_t u; } u;
+    uint32_t c[16]{};
+    c[0] = vertex_count;
+    c[1] = source_vertex_srv;
+    c[2] = output_vertex_uav;
+    u.f = mesh_min_y;        c[3]  = u.u;
+    u.f = wind_direction.x;  c[4]  = u.u;
+    u.f = wind_direction.y;  c[5]  = u.u;
+    u.f = wind_direction.z;  c[6]  = u.u;
+    u.f = wind_strength;     c[7]  = u.u;
+    u.f = time_seconds;      c[8]  = u.u;
+    u.f = wind_phase_offset; c[9]  = u.u;
+    u.f = primary_bend;      c[10] = u.u;
+    u.f = secondary_sway;    c[11] = u.u;
+    u.f = leaf_flutter;      c[12] = u.u;
+    u.f = mesh_height;       c[13] = u.u;
+    c[14] = prev_pos_uav;
+    u.f = trunk_envelope;    c[15] = u.u;
+    cmd_list->SetComputeRoot32BitConstants(0, 16, c, 0);
+
+    const uint32_t group_count = (vertex_count + 63u) / 64u;
+    cmd_list->Dispatch(group_count, 1, 1);
+}
+
+// ---------------------------------------------------------------------------
 // create_rtpso
 // Loads path_trace.dxil, builds the DXR pipeline state object.
 // ---------------------------------------------------------------------------
@@ -743,14 +1148,25 @@ void PathTracer::create_rtpso(DeviceContext& ctx)
     // Export all entry points (RayGen, ClosestHit, Miss, ShadowMiss)
     lib->DefineExport(L"RayGen");
     lib->DefineExport(L"ClosestHit");
+    lib->DefineExport(L"AnyHit_Primary");
     lib->DefineExport(L"Miss");
     lib->DefineExport(L"ShadowMiss");
+    lib->DefineExport(L"Intersection_Impostor");
+    lib->DefineExport(L"ClosestHit_Impostor");
 
     // Hit group subobject (primary)
     auto* hg = so_desc.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
     hg->SetClosestHitShaderImport(L"ClosestHit");
+    hg->SetAnyHitShaderImport(L"AnyHit_Primary");
     hg->SetHitGroupExport(L"HitGroup_Primary");
     hg->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
+
+    // Hit group subobject (octahedral impostor — procedural AABB BLAS)
+    auto* hg_imp = so_desc.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
+    hg_imp->SetIntersectionShaderImport(L"Intersection_Impostor");
+    hg_imp->SetClosestHitShaderImport(L"ClosestHit_Impostor");
+    hg_imp->SetHitGroupExport(L"HitGroup_Impostor");
+    hg_imp->SetHitGroupType(D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE);
 
     // Shader config: payload = float3 radiance + float hit_t + uint missed + uint depth + float3 throughput + float3 sec_normal
     // Total: 12 + 4 + 4 + 4 + 12 + 12 = 48 bytes (C++ layout).
@@ -761,7 +1177,7 @@ void PathTracer::create_rtpso(DeviceContext& ctx)
     auto* shader_cfg = so_desc.CreateSubobject<CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT>();
     shader_cfg->Config(
         56,                // payload size: 56 bytes (matches compiled HLSL Miss shader)
-        sizeof(float) * 2);                   // attribute size (barycentrics)
+        sizeof(float) * 4);                   // attribute size: max(barycentrics=8, ImpostorAttr=16)
 
     // Pipeline config: max recursion depth 3 (primary + up to 2 GI bounces; shadow is a separate non-recursive dispatch)
     auto* pipe_cfg = so_desc.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG_SUBOBJECT>();
@@ -778,9 +1194,13 @@ void PathTracer::create_rtpso(DeviceContext& ctx)
     lrs_assoc->SetSubobjectToAssociate(*lrs);
     lrs_assoc->AddExport(L"RayGen");
     lrs_assoc->AddExport(L"ClosestHit");
+    lrs_assoc->AddExport(L"AnyHit_Primary");
     lrs_assoc->AddExport(L"Miss");
     lrs_assoc->AddExport(L"ShadowMiss");
     lrs_assoc->AddExport(L"HitGroup_Primary");
+    lrs_assoc->AddExport(L"Intersection_Impostor");
+    lrs_assoc->AddExport(L"ClosestHit_Impostor");
+    lrs_assoc->AddExport(L"HitGroup_Impostor");
 
     // ---- 4. Create RTPSO ----------------------------------------------------
     throw_if_failed(
@@ -807,8 +1227,9 @@ void PathTracer::create_shader_tables(DeviceContext& ctx)
     uint64_t miss_size   = align_up(k_miss_record_stride * miss_count,
                                     D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT);
 
-    // Hit group table: 1 record (HitGroup_Primary)
-    uint64_t hitgroup_size = align_up(k_hitgroup_record_stride,
+    // Hit group table: 2 records (HitGroup_Primary, HitGroup_Impostor)
+    uint32_t hitgroup_count = 2;
+    uint64_t hitgroup_size = align_up(k_hitgroup_record_stride * hitgroup_count,
                                       D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT);
 
     auto fill_table = [&](uint64_t size, const wchar_t* name,
@@ -842,6 +1263,9 @@ void PathTracer::create_shader_tables(DeviceContext& ctx)
                                &m_hitgroup_table_alloc, &m_hitgroup_table);
     memcpy(hg_ptr,
            m_rtpso_props->GetShaderIdentifier(L"HitGroup_Primary"),
+           k_shader_id_size);
+    memcpy(static_cast<uint8_t*>(hg_ptr) + k_hitgroup_record_stride,
+           m_rtpso_props->GetShaderIdentifier(L"HitGroup_Impostor"),
            k_shader_id_size);
 }
 
@@ -1225,13 +1649,19 @@ void PathTracer::resize_output(DeviceContext& ctx,
 // build_blas
 uint32_t PathTracer::build_blas(DeviceContext& ctx,
                                  const GpuMeshBuffer& mesh,
-                                 bool allow_update)
+                                 bool allow_update,
+                                 bool opaque)
 {
     auto* device = ctx.device();
 
     D3D12_RAYTRACING_GEOMETRY_DESC geom_desc{};
     geom_desc.Type                                 = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-    geom_desc.Flags                                = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+    // For alpha-tested geometry (e.g. SpeedTree leaf cards), the geometry
+    // must NOT be flagged opaque or the any-hit shader is never invoked and
+    // the path tracer cannot discard sub-texel transparent regions.
+    geom_desc.Flags                                = opaque
+                                                       ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE
+                                                       : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
     geom_desc.Triangles.VertexBuffer.StartAddress  = mesh.vertex_buffer_view().BufferLocation;
     geom_desc.Triangles.VertexBuffer.StrideInBytes = sizeof(Vertex); // full interleaved vertex stride
     geom_desc.Triangles.VertexFormat               = DXGI_FORMAT_R32G32B32_FLOAT;
@@ -1348,13 +1778,22 @@ uint32_t PathTracer::build_blas(DeviceContext& ctx,
 // Like build_blas but keeps a persistent scratch buffer and uses ALLOW_UPDATE
 // so the BLAS can be refitted each frame after GPU skinning.
 // ---------------------------------------------------------------------------
-uint32_t PathTracer::build_skinned_blas(DeviceContext& ctx, const GpuMeshBuffer& mesh)
+uint32_t PathTracer::build_skinned_blas(DeviceContext& ctx, const GpuMeshBuffer& mesh, bool opaque)
 {
     auto* device = ctx.device();
 
+    // The skinned/deformed vertex buffer must already be allocated by the
+    // caller (e.g. via GpuMeshBuffer::enable_skinning). Without it the
+    // geometry descriptor below would dereference a null resource pointer.
+    if (!mesh.skinned_vertex_buffer())
+        throw std::runtime_error(
+            "PathTracer::build_skinned_blas: mesh has no skinned vertex buffer "
+            "(call GpuMeshBuffer::enable_skinning or enable_wind_deform first)");
+
     D3D12_RAYTRACING_GEOMETRY_DESC geom_desc{};
     geom_desc.Type                                 = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-    geom_desc.Flags                                = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+    geom_desc.Flags                                = opaque ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE
+                                                            : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
     geom_desc.Triangles.VertexBuffer.StartAddress  = mesh.skinned_vertex_buffer()->GetGPUVirtualAddress();
     geom_desc.Triangles.VertexBuffer.StrideInBytes = sizeof(Vertex);
     geom_desc.Triangles.VertexFormat               = DXGI_FORMAT_R32G32B32_FLOAT;
@@ -1368,8 +1807,7 @@ uint32_t PathTracer::build_skinned_blas(DeviceContext& ctx, const GpuMeshBuffer&
     inputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
     inputs.NumDescs       = 1;
     inputs.pGeometryDescs = &geom_desc;
-    inputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE |
-                            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
+    inputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
 
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuild{};
     device->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &prebuild);
@@ -1443,16 +1881,305 @@ uint32_t PathTracer::build_skinned_blas(DeviceContext& ctx, const GpuMeshBuffer&
     }
 
     BlasEntry entry{};
-    entry.alloc         = result_alloc;
-    entry.resource      = result;
-    entry.scratch_alloc = scratch_alloc;
-    entry.scratch       = scratch;
-    entry.allow_update  = true;
-    entry.vertex_count  = mesh.vertex_count();
-    entry.index_count   = mesh.index_count();
+    entry.alloc            = result_alloc;
+    entry.resource         = result;
+    entry.scratch_alloc    = scratch_alloc;
+    entry.scratch          = scratch;
+    entry.allow_update     = true;
+    entry.geometry_opaque  = opaque;
+    entry.vertex_count     = mesh.vertex_count();
+    entry.index_count      = mesh.index_count();
 
     uint32_t index = static_cast<uint32_t>(m_blas_list.size());
     m_blas_list.push_back(entry);
+    return index;
+}
+
+// ---------------------------------------------------------------------------
+// build_vegetation_lod_blas
+// Build an ALLOW_UPDATE BLAS for a single vegetation LOD mesh. The wind
+// compute pass will refit this BLAS each frame using the deformed vertex
+// buffer produced by dispatch_vegetation_wind(). Geometry layout is the
+// engine's standard triangle mesh, so we delegate to build_skinned_blas()
+// which already implements the persistent-scratch + ALLOW_UPDATE flow.
+// ---------------------------------------------------------------------------
+uint32_t PathTracer::build_vegetation_lod_blas(DeviceContext& ctx,
+                                                const GpuMeshBuffer& mesh,
+                                                bool opaque)
+{
+    const uint32_t blas_index = build_skinned_blas(ctx, mesh, opaque);
+    MARS_LOG("[PathTracer] build_vegetation_lod_blas: blas_index={} vtx={} idx={}",
+             blas_index, mesh.vertex_count(), mesh.index_count());
+    return blas_index;
+}
+
+// ---------------------------------------------------------------------------
+// build_vegetation_model_blas
+// Build a static BLAS over every submesh of a vegetation LOD model. SpeedTree
+// FBX exports break a single tree into many submeshes (trunk / branches /
+// leaves / fronds), so the BLAS must include all of them or the rendered
+// geometry will look like a degenerate spike of whichever submesh happened
+// to be ordered first.
+// ---------------------------------------------------------------------------
+uint32_t PathTracer::build_vegetation_model_blas(DeviceContext& ctx,
+                                                  const std::vector<GpuMeshBuffer>& meshes)
+{
+    auto* device = ctx.device();
+
+    std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geom_descs;
+    geom_descs.reserve(meshes.size());
+
+    uint64_t total_vtx = 0;
+    uint64_t total_idx = 0;
+
+    for (const auto& mesh : meshes)
+    {
+        if (mesh.vertex_count() == 0 || mesh.index_count() == 0)
+            continue;
+
+        D3D12_RAYTRACING_GEOMETRY_DESC gd{};
+        gd.Type                                 = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+        gd.Flags                                = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+        gd.Triangles.VertexBuffer.StartAddress  = mesh.vertex_buffer_view().BufferLocation;
+        gd.Triangles.VertexBuffer.StrideInBytes = sizeof(Vertex);
+        gd.Triangles.VertexFormat               = DXGI_FORMAT_R32G32B32_FLOAT;
+        gd.Triangles.VertexCount                = mesh.vertex_count();
+        gd.Triangles.IndexBuffer                = mesh.index_buffer_view().BufferLocation;
+        gd.Triangles.IndexFormat                = DXGI_FORMAT_R32_UINT;
+        gd.Triangles.IndexCount                 = mesh.index_count();
+        geom_descs.push_back(gd);
+
+        total_vtx += mesh.vertex_count();
+        total_idx += mesh.index_count();
+    }
+
+    if (geom_descs.empty())
+    {
+        MARS_LOG("[PathTracer] build_vegetation_model_blas: no valid submeshes");
+        return UINT32_MAX;
+    }
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
+    inputs.Type           = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    inputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    inputs.NumDescs       = static_cast<UINT>(geom_descs.size());
+    inputs.pGeometryDescs = geom_descs.data();
+    inputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuild{};
+    device->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &prebuild);
+
+    D3D12MA::ALLOCATION_DESC ad{}; ad.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12MA::Allocation* scratch_alloc = nullptr;
+    ID3D12Resource*      scratch       = nullptr;
+    {
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width            = prebuild.ScratchDataSizeInBytes;
+        bd.Height           = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        throw_if_failed(m_allocator->CreateResource(&ad, &bd,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, &scratch_alloc, IID_PPV_ARGS(&scratch)),
+            "VegetationModelBLAS: create scratch failed");
+    }
+
+    D3D12MA::Allocation* result_alloc = nullptr;
+    ID3D12Resource*      result       = nullptr;
+    {
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width            = align_up(prebuild.ResultDataMaxSizeInBytes,
+                                       D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+        bd.Height           = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+                              D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE;
+        throw_if_failed(m_allocator->CreateResource(&ad, &bd,
+            D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr,
+            &result_alloc, IID_PPV_ARGS(&result)),
+            "VegetationModelBLAS: create result failed");
+    }
+
+    {
+        ComPtr<ID3D12CommandAllocator>     alloc_cmd;
+        ComPtr<ID3D12GraphicsCommandList6> cmd;
+        throw_if_failed(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        IID_PPV_ARGS(&alloc_cmd)), "VegetationModelBLAS: CreateCommandAllocator failed");
+        throw_if_failed(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        alloc_cmd.Get(), nullptr, IID_PPV_ARGS(&cmd)), "VegetationModelBLAS: CreateCommandList failed");
+
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC build_desc{};
+        build_desc.Inputs                           = inputs;
+        build_desc.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+        build_desc.DestAccelerationStructureData    = result->GetGPUVirtualAddress();
+
+        cmd->BuildRaytracingAccelerationStructure(&build_desc, 0, nullptr);
+
+        D3D12_RESOURCE_BARRIER uav_barrier{};
+        uav_barrier.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        uav_barrier.UAV.pResource = result;
+        cmd->ResourceBarrier(1, &uav_barrier);
+        cmd->Close();
+
+        ID3D12CommandList* lists[] = { cmd.Get() };
+        ctx.direct_queue()->ExecuteCommandLists(1, lists);
+        ctx.flush_gpu();
+    }
+
+    // Scratch is not needed past the build (no ALLOW_UPDATE).
+    scratch_alloc->Release();
+    (void)scratch;
+
+    BlasEntry entry{};
+    entry.alloc        = result_alloc;
+    entry.resource     = result;
+    entry.allow_update = false;
+
+    uint32_t index = static_cast<uint32_t>(m_blas_list.size());
+    m_blas_list.push_back(entry);
+
+    MARS_LOG("[PathTracer] build_vegetation_model_blas: blas_index={} submeshes={} total_vtx={} total_idx={}",
+             index, geom_descs.size(), total_vtx, total_idx);
+    return index;
+}
+
+// ---------------------------------------------------------------------------
+// build_vegetation_impostor_blas
+// Build a procedural-AABB BLAS for the Impostor LOD. A single AABB primitive
+// is uploaded; the path tracer's custom intersection shader is responsible
+// for sampling the octahedral impostor atlas and producing the final hit.
+// ---------------------------------------------------------------------------
+uint32_t PathTracer::build_vegetation_impostor_blas(DeviceContext& ctx,
+                                                     const Vec3& aabb_min,
+                                                     const Vec3& aabb_max)
+{
+    auto* device = ctx.device();
+
+    // ---- Upload the single AABB into a tiny default-heap buffer -----------
+    D3D12_RAYTRACING_AABB aabb{};
+    aabb.MinX = aabb_min.x; aabb.MinY = aabb_min.y; aabb.MinZ = aabb_min.z;
+    aabb.MaxX = aabb_max.x; aabb.MaxY = aabb_max.y; aabb.MaxZ = aabb_max.z;
+
+    D3D12MA::Allocation* aabb_alloc = nullptr;
+    ID3D12Resource*      aabb_buf   = nullptr;
+    {
+        D3D12MA::ALLOCATION_DESC ad{}; ad.HeapType = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width            = sizeof(D3D12_RAYTRACING_AABB);
+        bd.Height           = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        throw_if_failed(m_allocator->CreateResource(&ad, &bd,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            &aabb_alloc, IID_PPV_ARGS(&aabb_buf)),
+            "ImpostorBLAS: create AABB upload buffer failed");
+
+        void* mapped = nullptr;
+        throw_if_failed(aabb_buf->Map(0, nullptr, &mapped), "ImpostorBLAS: Map failed");
+        std::memcpy(mapped, &aabb, sizeof(aabb));
+        aabb_buf->Unmap(0, nullptr);
+    }
+
+    D3D12_RAYTRACING_GEOMETRY_DESC geom_desc{};
+    geom_desc.Type  = D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE_AABBS;
+    geom_desc.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+    geom_desc.AABBs.AABBCount               = 1;
+    geom_desc.AABBs.AABBs.StartAddress      = aabb_buf->GetGPUVirtualAddress();
+    geom_desc.AABBs.AABBs.StrideInBytes     = sizeof(D3D12_RAYTRACING_AABB);
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
+    inputs.Type           = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    inputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    inputs.NumDescs       = 1;
+    inputs.pGeometryDescs = &geom_desc;
+    inputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuild{};
+    device->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &prebuild);
+
+    // ---- Scratch ----------------------------------------------------------
+    D3D12MA::Allocation* scratch_alloc = nullptr;
+    ID3D12Resource*      scratch       = nullptr;
+    {
+        D3D12MA::ALLOCATION_DESC ad{}; ad.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width            = prebuild.ScratchDataSizeInBytes;
+        bd.Height           = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        throw_if_failed(m_allocator->CreateResource(&ad, &bd,
+            D3D12_RESOURCE_STATE_COMMON, nullptr,
+            &scratch_alloc, IID_PPV_ARGS(&scratch)),
+            "ImpostorBLAS: scratch alloc failed");
+    }
+
+    // ---- Result -----------------------------------------------------------
+    D3D12MA::Allocation* result_alloc = nullptr;
+    ID3D12Resource*      result       = nullptr;
+    {
+        D3D12MA::ALLOCATION_DESC ad{}; ad.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width            = align_up(prebuild.ResultDataMaxSizeInBytes,
+                                       D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+        bd.Height           = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+                              D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE;
+        throw_if_failed(m_allocator->CreateResource(&ad, &bd,
+            D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr,
+            &result_alloc, IID_PPV_ARGS(&result)),
+            "ImpostorBLAS: result alloc failed");
+    }
+
+    // ---- Build ------------------------------------------------------------
+    {
+        ComPtr<ID3D12CommandAllocator>     alloc_cmd;
+        ComPtr<ID3D12GraphicsCommandList6> cmd;
+        throw_if_failed(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        IID_PPV_ARGS(&alloc_cmd)), "ImpostorBLAS: CreateCommandAllocator failed");
+        throw_if_failed(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        alloc_cmd.Get(), nullptr, IID_PPV_ARGS(&cmd)),
+                        "ImpostorBLAS: CreateCommandList failed");
+
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC bd{};
+        bd.Inputs                           = inputs;
+        bd.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+        bd.DestAccelerationStructureData    = result->GetGPUVirtualAddress();
+        cmd->BuildRaytracingAccelerationStructure(&bd, 0, nullptr);
+
+        D3D12_RESOURCE_BARRIER uav_barrier{};
+        uav_barrier.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        uav_barrier.UAV.pResource = result;
+        cmd->ResourceBarrier(1, &uav_barrier);
+
+        cmd->Close();
+        ID3D12CommandList* lists[] = { cmd.Get() };
+        ctx.direct_queue()->ExecuteCommandLists(1, lists);
+        ctx.flush_gpu();
+    }
+
+    // Scratch + upload buffer are no longer needed; release them.
+    scratch_alloc->Release();
+    aabb_alloc->Release();
+
+    BlasEntry entry{};
+    entry.alloc        = result_alloc;
+    entry.resource     = result;
+    entry.allow_update = false;
+    entry.vertex_count = 0;
+    entry.index_count  = 0;
+    entry.is_impostor  = true;
+
+    const uint32_t index = static_cast<uint32_t>(m_blas_list.size());
+    m_blas_list.push_back(entry);
+
+    MARS_LOG("[PathTracer] build_vegetation_impostor_blas: blas_index={} aabb=({} {} {})-({} {} {})",
+             index, aabb_min.x, aabb_min.y, aabb_min.z, aabb_max.x, aabb_max.y, aabb_max.z);
+
     return index;
 }
 
@@ -1473,7 +2200,9 @@ void PathTracer::refit_blas(DeviceContext& /*ctx*/,
 
     D3D12_RAYTRACING_GEOMETRY_DESC geom_desc{};
     geom_desc.Type                                 = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-    geom_desc.Flags                                = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+    geom_desc.Flags                                = entry.geometry_opaque
+                                                       ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE
+                                                       : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
     geom_desc.Triangles.VertexBuffer.StartAddress  = mesh.skinned_vertex_buffer()->GetGPUVirtualAddress();
     geom_desc.Triangles.VertexBuffer.StrideInBytes = sizeof(Vertex);
     geom_desc.Triangles.VertexFormat               = DXGI_FORMAT_R32G32B32_FLOAT;
@@ -1665,7 +2394,8 @@ void PathTracer::build_tlas(DeviceContext& ctx,
 
         d.InstanceID                          = i;
         d.InstanceMask                        = 0xFF;
-        d.InstanceContributionToHitGroupIndex = 0;
+        d.InstanceContributionToHitGroupIndex =
+            m_blas_list[inst.blas_index].is_impostor ? 1u : 0u;
         d.Flags                               = D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
         d.AccelerationStructure               = m_blas_list[inst.blas_index].resource->GetGPUVirtualAddress();
 
@@ -1993,7 +2723,7 @@ void PathTracer::trace(ID3D12GraphicsCommandList6* cmd_list,
 
     // Hit group
     rays.HitGroupTable.StartAddress  = m_hitgroup_table->GetGPUVirtualAddress();
-    rays.HitGroupTable.SizeInBytes   = k_hitgroup_record_stride;
+    rays.HitGroupTable.SizeInBytes   = k_hitgroup_record_stride * 2;
     rays.HitGroupTable.StrideInBytes = k_hitgroup_record_stride;
 
     rays.Width  = out.width;

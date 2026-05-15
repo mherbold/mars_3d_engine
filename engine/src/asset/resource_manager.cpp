@@ -64,14 +64,15 @@ void ResourceManager::shutdown()
 // ---------------------------------------------------------------------------
 // load_model
 // ---------------------------------------------------------------------------
-uint32_t ResourceManager::load_model(DeviceContext& ctx, const std::string& file_path)
+uint32_t ResourceManager::load_model(DeviceContext& ctx, const std::string& file_path,
+                                     bool pre_transform_vertices)
 {
     // Return cached index if already loaded.
     auto it = m_model_cache.find(file_path);
     if (it != m_model_cache.end())
         return it->second;
 
-    auto cpu_asset = m_importer.import(file_path);
+    auto cpu_asset = m_importer.import(file_path, pre_transform_vertices);
     if (!cpu_asset)
     {
         MARS_LOG("[ResourceManager] load_model failed for '{}'", file_path);
@@ -84,15 +85,22 @@ uint32_t ResourceManager::load_model(DeviceContext& ctx, const std::string& file
 
     // Upload each mesh primitive.
     gpu_model.mesh_buffers.reserve(cpu_asset->meshes.size());
+    gpu_model.mesh_material_indices.reserve(cpu_asset->meshes.size());
     for (const auto& mesh : cpu_asset->meshes)
     {
         GpuMeshBuffer buf;
         buf.upload(ctx, m_allocator, mesh);
         gpu_model.mesh_buffers.push_back(std::move(buf));
+        gpu_model.mesh_material_indices.push_back(mesh.material_index);
     }
 
-    // Load material textures (base colour only for now; others follow the same pattern).
+    // Preserve CPU-side materials so callers (renderer) can read factors/flags.
+    gpu_model.materials = cpu_asset->materials;
+
+    // Load material textures (base colour, normal, metallic-roughness).
     gpu_model.texture_slots.reserve(cpu_asset->materials.size());
+    gpu_model.normal_slots.reserve(cpu_asset->materials.size());
+    gpu_model.mr_slots.reserve(cpu_asset->materials.size());
     for (const auto& mat : cpu_asset->materials)
     {
         if (!mat.base_color_texture.path.empty())
@@ -108,6 +116,17 @@ uint32_t ResourceManager::load_model(DeviceContext& ctx, const std::string& file
             m_textures.push_back(std::move(fallback));
             gpu_model.texture_slots.push_back(slot);
         }
+
+        gpu_model.normal_slots.push_back(
+            !mat.normal_texture.path.empty()
+                ? load_texture(ctx, mat.normal_texture.path, mat.normal_texture.is_srgb)
+                : UINT32_MAX);
+
+        gpu_model.mr_slots.push_back(
+            !mat.metallic_roughness_texture.path.empty()
+                ? load_texture(ctx, mat.metallic_roughness_texture.path,
+                               mat.metallic_roughness_texture.is_srgb)
+                : UINT32_MAX);
     }
 
     // Import skeleton and animation clips (no-op if the model has none).

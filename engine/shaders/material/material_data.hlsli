@@ -42,6 +42,10 @@ struct GpuInstanceData
     uint     vertex_buffer_srv;          // bindless SRV for vertex StructuredBuffer
     uint     index_buffer_srv;           // bindless SRV for index ByteAddressBuffer
     uint     prev_vertex_buffer_srv;     // previous-frame positions ByteAddressBuffer (cloth); UINT32_MAX = none
+    float    lod_alpha;                  // Stochastic LOD opacity in [0,1] — AnyHit rejects when rand >= lod_alpha
+    uint     impostor_atlas_srv;         // Octahedral impostor atlas SRV slot (LOD 3); UINT32_MAX = not an impostor
+    uint     impostor_view_count;        // View-grid resolution per octahedral axis (e.g. 16 -> 16x16 atlas)
+    float    impostor_half_extent;       // AABB half-extent in metres used by the impostor intersection shader
 };
 
 // Bindless structured buffer containing all materials for this frame

@@ -55,6 +55,14 @@ public:
                         D3D12MA::Allocator* allocator,
                         uint32_t max_bones);
 
+    // Enable GPU wind deformation for this mesh by allocating an output vertex
+    // buffer (UAV + SRV) seeded with the rest-pose data. No bone palette is
+    // allocated. Must be called after upload(). The output slots are the same
+    // skinned_vertex_uav_slot / skinned_vertex_srv_slot / skinned_vertex_buffer()
+    // accessors used by dispatch_vegetation_wind and refit_blas.
+    void enable_wind_deform(DeviceContext& ctx,
+                            D3D12MA::Allocator* allocator);
+
     void destroy();
 
     // ---- Accessors ----------------------------------------------------------
@@ -90,6 +98,13 @@ public:
     // Get the skinned vertex buffer resource (for BLAS refit after skinning)
     ID3D12Resource* skinned_vertex_buffer() const { return m_skinned_vertex_buffer; }
 
+    // Previous-frame wind position buffer: compact float3, stride 12.
+    // Written each frame by the wind compute shader before computing new positions.
+    // Registered as prev_vertex_buffer_srv on the TLAS instance so the closest-hit
+    // shader can compute per-vertex motion vectors for the denoiser/TAA.
+    uint32_t wind_prev_pos_uav_slot() const { return m_wind_prev_pos_uav_slot; }
+    uint32_t wind_prev_pos_srv_slot() const { return m_wind_prev_pos_srv_slot; }
+
     // Upload a bone palette (array of Mat4x4) directly into the mapped UPLOAD bone palette buffer.
     // bone_palette.size() must be <= max_bones passed to enable_skinning().
     void upload_bone_palette(const std::vector<Mat4x4>& bone_palette) const;
@@ -109,13 +124,15 @@ public:
 private:
     D3D12MA::Allocation* m_vertex_alloc = nullptr;
     D3D12MA::Allocation* m_index_alloc  = nullptr;
-    D3D12MA::Allocation* m_skinned_vertex_alloc = nullptr;
-    D3D12MA::Allocation* m_bone_palette_alloc   = nullptr;
+    D3D12MA::Allocation* m_skinned_vertex_alloc   = nullptr;
+    D3D12MA::Allocation* m_bone_palette_alloc     = nullptr;
+    D3D12MA::Allocation* m_wind_prev_pos_alloc    = nullptr;
 
     ID3D12Resource* m_vertex_buffer         = nullptr;
     ID3D12Resource* m_index_buffer          = nullptr;
     ID3D12Resource* m_skinned_vertex_buffer = nullptr;
     ID3D12Resource* m_bone_palette_buffer   = nullptr;
+    ID3D12Resource* m_wind_prev_pos_buffer  = nullptr;
 
     D3D12_VERTEX_BUFFER_VIEW m_vbv = {};
     D3D12_INDEX_BUFFER_VIEW  m_ibv = {};
@@ -124,9 +141,11 @@ private:
     uint32_t m_index_count     = 0;
     uint32_t m_vertex_srv_slot = UINT32_MAX;
     uint32_t m_index_srv_slot  = UINT32_MAX;
-    uint32_t m_skinned_vertex_uav_slot = UINT32_MAX;
-    uint32_t m_skinned_vertex_srv_slot = UINT32_MAX;
-    uint32_t m_bone_palette_srv_slot   = UINT32_MAX;
+    uint32_t m_skinned_vertex_uav_slot  = UINT32_MAX;
+    uint32_t m_skinned_vertex_srv_slot  = UINT32_MAX;
+    uint32_t m_bone_palette_srv_slot    = UINT32_MAX;
+    uint32_t m_wind_prev_pos_uav_slot   = UINT32_MAX;
+    uint32_t m_wind_prev_pos_srv_slot   = UINT32_MAX;
     uint32_t m_max_bones = 0;
     void*    m_bone_palette_mapped_ptr = nullptr;
 
@@ -221,6 +240,93 @@ private:
     uint32_t m_pos_pred_b_uav  = UINT32_MAX;
     uint32_t m_output_vtx_uav  = UINT32_MAX;
     uint32_t m_output_vtx_srv  = UINT32_MAX;
+};
+
+// =============================================================================
+// EcosystemGpuResources
+//
+// GPU-resident structured buffers for the M10 vegetation pipeline:
+//   - Instance buffer (RWStructuredBuffer<VegetationInstanceGpu>, stride=64)
+//   - Atomic counter (RWStructuredBuffer<uint>, single element)
+//   - Species table (StructuredBuffer<SpeciesGpu>, stride=16)
+//
+// All buffers live on the DEFAULT heap and are registered in the bindless
+// CBV/SRV/UAV heap so vegetation_placement.hlsl and vegetation_lod_selection.hlsl
+// can index them through the standard MARS bindless tables.
+// =============================================================================
+class MARS_ENGINE_API EcosystemGpuResources
+{
+public:
+    EcosystemGpuResources()  = default;
+    ~EcosystemGpuResources() { destroy(); }
+
+    EcosystemGpuResources(const EcosystemGpuResources&)            = delete;
+    EcosystemGpuResources& operator=(const EcosystemGpuResources&) = delete;
+
+    EcosystemGpuResources(EcosystemGpuResources&&)            noexcept;
+    EcosystemGpuResources& operator=(EcosystemGpuResources&&) noexcept;
+
+    // Allocate the instance buffer (max_instances * 64 B), atomic counter
+    // (single uint), and species buffer (species_count * 16 B). The species
+    // table is populated from `species_table` and uploaded via the copy queue.
+    // `species_table` must contain `species_count` records, each laid out as
+    // four floats: lod_near_max, lod_mid_max, lod_far_max, max_draw_distance.
+    void create(DeviceContext&      ctx,
+                D3D12MA::Allocator* allocator,
+                uint32_t            max_instances,
+                uint32_t            species_count,
+                const float*        species_table);
+
+    void destroy();
+
+    bool is_valid() const { return m_instance_buffer != nullptr; }
+
+    // Bindless slots ----------------------------------------------------------
+    uint32_t instance_uav() const { return m_instance_uav; }
+    uint32_t instance_srv() const { return m_instance_srv; }
+    uint32_t counter_uav()  const { return m_counter_uav; }
+    uint32_t species_srv()  const { return m_species_srv; }
+
+    // Raw resources -----------------------------------------------------------
+    ID3D12Resource* instance_resource() const { return m_instance_buffer; }
+    ID3D12Resource* counter_resource()  const { return m_counter_buffer; }
+    ID3D12Resource* species_resource()  const { return m_species_buffer; }
+    ID3D12Resource* instance_readback() const { return m_instance_readback; }
+    ID3D12Resource* counter_readback()  const { return m_counter_readback; }
+
+    uint32_t max_instances() const { return m_max_instances; }
+    uint32_t species_count() const { return m_species_count; }
+
+    // Read the atomic counter value back from the readback buffer.
+    // Must be called after a copy from `counter_resource()` to
+    // `counter_readback()` and a GPU flush.
+    uint32_t read_counter() const;
+
+    // Copy `count` `VegetationInstanceGpu` records (64 B each) from the
+    // mapped instance readback buffer into `out` (which must be sized
+    // `count * 64` bytes). Returns the number of bytes copied.
+    uint32_t read_instances(void* out, uint32_t count) const;
+
+private:
+    uint32_t m_max_instances = 0;
+    uint32_t m_species_count = 0;
+
+    D3D12MA::Allocation* m_instance_alloc = nullptr;
+    D3D12MA::Allocation* m_counter_alloc  = nullptr;
+    D3D12MA::Allocation* m_species_alloc  = nullptr;
+    D3D12MA::Allocation* m_instance_readback_alloc = nullptr;
+    D3D12MA::Allocation* m_counter_readback_alloc  = nullptr;
+
+    ID3D12Resource* m_instance_buffer = nullptr;
+    ID3D12Resource* m_counter_buffer  = nullptr;
+    ID3D12Resource* m_species_buffer  = nullptr;
+    ID3D12Resource* m_instance_readback = nullptr;
+    ID3D12Resource* m_counter_readback  = nullptr;
+
+    uint32_t m_instance_uav = UINT32_MAX;
+    uint32_t m_instance_srv = UINT32_MAX;
+    uint32_t m_counter_uav  = UINT32_MAX;
+    uint32_t m_species_srv  = UINT32_MAX;
 };
 
 

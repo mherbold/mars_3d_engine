@@ -105,6 +105,8 @@ public:
     const SkyboxDesc&                      skybox()         const { return m_skybox; }
     Vec3                                   wind()           const { return m_wind; }
     const WindDesc&                        wind_desc()      const { return m_wind_desc; }
+    const EcosystemDesc&                   ecosystem()      const { return m_ecosystem; }
+    EcosystemDesc&                         ecosystem()            { return m_ecosystem; }
 
     bool is_loaded() const { return m_loaded; }
 
@@ -120,6 +122,7 @@ private:
     SkyboxDesc                      m_skybox;
     Vec3                            m_wind      = {};
     WindDesc                        m_wind_desc = {};
+    EcosystemDesc                   m_ecosystem = {};
     bool                            m_loaded = false;
 };
 

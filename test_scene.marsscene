@@ -459,7 +459,7 @@
   "cloth": [
     {
       "id": "cloth_test",
-      "enabled": true,
+      "enabled": false,
       "transform": {
         "position": [ 0.0, 2.0, 2.0 ],
         "rotation": [ 0.0, 0.0, 0.0 ],
@@ -497,5 +497,30 @@
         "roughness_factor": 0.8
       }
     }
-  ]
+  ],
+
+  "ecosystem": {
+    "enabled": true,
+    "density_map": "models/vegetation/density_white_4x4.png",
+    "world_min": [ -1.0, 0.0, -2.0 ],
+    "world_max": [  1.0, 0.0,  0.0 ],
+    "placement_y": 0.0,
+    "density_multiplier": 1.0,
+    "max_instances": 1,
+    "frustum_cull_margin": 50.0,
+    "species": [
+      {
+        "name": "European Linden",
+        "asset_path": "models/vegetation/European_Linden",
+        "lod_near_max": 50.0,
+        "lod_mid_max": 200.0,
+        "lod_far_max": 600.0,
+        "max_draw_distance": 2000.0,
+        "wind_primary_bend": 0.5,
+        "wind_secondary_sway": 0.3,
+        "wind_leaf_flutter": 0.2,
+        "spawn_weight": 1.0
+      }
+    ]
+  }
 }

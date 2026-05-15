@@ -516,6 +516,83 @@ bool SceneLoader::load(const std::string& file_path,
         }
     }
 
+    // ---- Ecosystem ----------------------------------------------------------
+    if (s.contains("ecosystem"))
+    {
+        const json& je = s["ecosystem"];
+
+        scene.m_ecosystem.enabled = je.value("enabled", false);
+
+        if (scene.m_ecosystem.enabled)
+        {
+            MARS_LOG("[SceneLoader] Parsing ecosystem configuration...");
+
+            // Density map
+            if (je.contains("density_map"))
+            {
+                scene.m_ecosystem.density_map_path = resolve_path(base_dir, 
+                    je["density_map"].get<std::string>());
+            }
+
+            // World bounds
+            if (je.contains("world_min"))
+                scene.m_ecosystem.world_min = json_vec3(je["world_min"], 
+                    { -1000.0f, 0.0f, -1000.0f });
+            if (je.contains("world_max"))
+                scene.m_ecosystem.world_max = json_vec3(je["world_max"], 
+                    { 1000.0f, 0.0f, 1000.0f });
+
+            scene.m_ecosystem.placement_y = je.value("placement_y", 0.0f);
+
+            // Density settings
+            scene.m_ecosystem.density_multiplier = je.value("density_multiplier", 1.0f);
+            scene.m_ecosystem.max_instances = je.value("max_instances", 10000u);
+            scene.m_ecosystem.frustum_cull_margin = je.value("frustum_cull_margin", 50.0f);
+
+            // Species
+            if (je.contains("species"))
+            {
+                for (const auto& jsp : je["species"])
+                {
+                    SpeciesDesc species;
+                    species.name = jsp.value("name", "");
+
+                    if (jsp.contains("asset_path"))
+                    {
+                        species.asset_path = resolve_path(base_dir, 
+                            jsp["asset_path"].get<std::string>());
+                    }
+
+                    // LOD distances
+                    species.lod_near_max = jsp.value("lod_near_max", 50.0f);
+                    species.lod_mid_max = jsp.value("lod_mid_max", 200.0f);
+                    species.lod_far_max = jsp.value("lod_far_max", 600.0f);
+                    species.max_draw_distance = jsp.value("max_draw_distance", 2000.0f);
+
+                    // Wind parameters
+                    species.wind_primary_bend = jsp.value("wind_primary_bend", 0.5f);
+                    species.wind_secondary_sway = jsp.value("wind_secondary_sway", 0.3f);
+                    species.wind_leaf_flutter = jsp.value("wind_leaf_flutter", 0.2f);
+
+                    // Spawn weight
+                    species.spawn_weight = jsp.value("spawn_weight", 1.0f);
+
+                    scene.m_ecosystem.species.push_back(species);
+
+                    MARS_LOG("[SceneLoader]   Species '{}': asset='{}', LOD={{{}m,{}m,{}m}}, wind={{bend:{:.2f}, sway:{:.2f}, flutter:{:.2f}}}",
+                        species.name, species.asset_path, 
+                        species.lod_near_max, species.lod_mid_max, species.lod_far_max,
+                        species.wind_primary_bend, species.wind_secondary_sway, species.wind_leaf_flutter);
+                }
+            }
+
+            MARS_LOG("[SceneLoader] Ecosystem: {} species, density_map='{}', max_instances={}",
+                scene.m_ecosystem.species.size(),
+                scene.m_ecosystem.density_map_path.empty() ? "<none>" : scene.m_ecosystem.density_map_path,
+                scene.m_ecosystem.max_instances);
+        }
+    }
+
     MARS_LOG("[SceneLoader] Scene '{}' loaded: {} model(s), {} rigid node(s), {} cloth(s), {} light(s), {} camera(s){} ",
                  scene_name, models_loaded, rigid_loaded, cloth_loaded, scene.m_lights.size(), scene.m_cameras.size(),
                  models_failed > 0

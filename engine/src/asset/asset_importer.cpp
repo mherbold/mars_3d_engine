@@ -12,6 +12,7 @@
 #include <assimp/Importer.hpp>
 #include <assimp/scene.h>
 #include <assimp/postprocess.h>
+#include <assimp/GltfMaterial.h>
 #pragma warning(pop)
 
 #include <stdexcept>
@@ -19,7 +20,9 @@
 #include <format>
 #include <cassert>
 #include <algorithm>
+#include <cctype>
 #include <functional>
+#include <string_view>
 
 namespace mars
 {
@@ -88,6 +91,26 @@ MaterialData AssetImporter::process_material(ImportContext& ctx, uint32_t mat_in
     ai_mat->Get(AI_MATKEY_TWOSIDED, two_sided);
     mat.double_sided = two_sided != 0;
 
+    // Alpha mode — set alpha_masked + alpha_cutoff for cutout materials.
+    //
+    // Sources, in order of preference:
+    //   1. glTF: AI_MATKEY_GLTF_ALPHAMODE == "MASK" (+ AI_MATKEY_GLTF_ALPHACUTOFF)
+    //   2. Generic Assimp opacity < 1.0 with a binary alpha texture
+    //   3. Name heuristic — SpeedTree FBX exports do not carry an alpha-mode
+    //      property, so we fall back to matching the material or texture name
+    //      against the conventional leaf/frond/branch-cap atlas tokens. These
+    //      cards are pre-multiplied-alpha cutouts in every SpeedTree export.
+    aiString alpha_mode;
+    if (ai_mat->Get(AI_MATKEY_GLTF_ALPHAMODE, alpha_mode) == AI_SUCCESS)
+    {
+        std::string m = alpha_mode.C_Str();
+        if (m == "MASK" || m == "BLEND") // both end up using cutout in this path tracer
+            mat.alpha_masked = true;
+    }
+    float gltf_cutoff = 0.5f;
+    if (ai_mat->Get(AI_MATKEY_GLTF_ALPHACUTOFF, gltf_cutoff) == AI_SUCCESS)
+        mat.alpha_cutoff = gltf_cutoff;
+
     // Textures
     aiString tex_path;
     auto resolve = [&](const aiString& p, bool srgb) -> TextureRef
@@ -101,6 +124,41 @@ MaterialData AssetImporter::process_material(ImportContext& ctx, uint32_t mat_in
     if (ai_mat->GetTexture(aiTextureType_BASE_COLOR, 0, &tex_path) == AI_SUCCESS ||
         ai_mat->GetTexture(aiTextureType_DIFFUSE,    0, &tex_path) == AI_SUCCESS)
         mat.base_color_texture = resolve(tex_path, true);
+
+    // SpeedTree / generic name heuristic for alpha-tested foliage cards.
+    if (!mat.alpha_masked)
+    {
+        auto contains_ci = [](const std::string& s, std::string_view needle) {
+            if (s.size() < needle.size()) return false;
+            for (size_t i = 0; i + needle.size() <= s.size(); ++i)
+            {
+                bool ok = true;
+                for (size_t j = 0; j < needle.size(); ++j)
+                {
+                    char a = static_cast<char>(std::tolower(static_cast<unsigned char>(s[i + j])));
+                    char b = static_cast<char>(std::tolower(static_cast<unsigned char>(needle[j])));
+                    if (a != b) { ok = false; break; }
+                }
+                if (ok) return true;
+            }
+            return false;
+        };
+        const std::string& bc = mat.base_color_texture.path;
+        static constexpr std::string_view k_leaf_tokens[] = {
+            "leaves", "leaf", "frond", "fronds",
+            "atlas", "billboard", "facing", "card"
+        };
+        for (auto tok : k_leaf_tokens)
+        {
+            if (contains_ci(mat.name, tok) || contains_ci(bc, tok))
+            {
+                mat.alpha_masked = true;
+                // Leaf cards are visible from both faces.
+                mat.double_sided = true;
+                break;
+            }
+        }
+    }
 
     if (ai_mat->GetTexture(aiTextureType_NORMALS, 0, &tex_path) == AI_SUCCESS ||
         ai_mat->GetTexture(aiTextureType_HEIGHT,  0, &tex_path) == AI_SUCCESS)
@@ -216,7 +274,8 @@ void AssetImporter::process_node(ImportContext& ctx, const void* ai_node_ptr)
 // ---------------------------------------------------------------------------
 // import
 // ---------------------------------------------------------------------------
-std::optional<ModelAsset> AssetImporter::import(const std::string& file_path) const
+std::optional<ModelAsset> AssetImporter::import(const std::string& file_path,
+                                                bool pre_transform_vertices) const
 {
     namespace fs = std::filesystem;
 
@@ -228,7 +287,14 @@ std::optional<ModelAsset> AssetImporter::import(const std::string& file_path) co
 
     Assimp::Importer importer;
 
-    const unsigned int flags =
+    // Ensure UnitScaleFactor (FBX cm -> m, etc.) is honoured when we ask
+    // Assimp to bake transforms into vertex positions.
+    if (pre_transform_vertices)
+    {
+        importer.SetPropertyFloat(AI_CONFIG_GLOBAL_SCALE_FACTOR_KEY, 1.0f);
+    }
+
+    unsigned int flags =
         aiProcess_Triangulate            |   // all faces become triangles
         aiProcess_JoinIdenticalVertices  |   // merge duplicate verts
         aiProcess_GenSmoothNormals       |   // generate normals if absent
@@ -237,6 +303,16 @@ std::optional<ModelAsset> AssetImporter::import(const std::string& file_path) co
         aiProcess_LimitBoneWeights       |   // max 4 bone influences per vertex
         aiProcess_ImproveCacheLocality   |   // Forsyth vertex-cache optimisation
         aiProcess_RemoveRedundantMaterials;
+
+    if (pre_transform_vertices)
+    {
+        // Bake every node's accumulated transform into the mesh vertices so the
+        // model is in a single, flat coordinate space at world-scale. Also apply
+        // the source file's global UnitScaleFactor (FBX cm -> m).
+        // NOTE: aiProcess_PreTransformVertices is incompatible with bone /
+        // skeletal data, which is why this path is opt-in.
+        flags |= aiProcess_PreTransformVertices | aiProcess_GlobalScale;
+    }
 
     const aiScene* scene = importer.ReadFile(file_path, flags);
     if (!scene || scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE || !scene->mRootNode)
@@ -267,6 +343,14 @@ std::optional<ModelAsset> AssetImporter::import(const std::string& file_path) co
     ctx.asset    = &asset;
 
     process_node(ctx, scene->mRootNode);
+
+    // NOTE: we deliberately keep submeshes separate even when
+    // pre_transform_vertices is set. Vegetation FBXs (SpeedTree) split a tree
+    // into bark / branches / leaves / fronds submeshes, each with its own
+    // material. The renderer registers one TLAS instance per submesh so each
+    // gets the correct texture; merging here would force every submesh to
+    // share the first submesh's material and the tree would render
+    // single-coloured.
 
     // Compute overall model AABB.
     bool first = true;
@@ -486,6 +570,147 @@ std::vector<AnimationClip> AssetImporter::import_animations(const std::string& f
 
     MARS_LOG("[AssetImporter] Loaded {} animation(s) from '{}'", clips.size(), file_path);
     return clips;
+}
+
+// ---------------------------------------------------------------------------
+// import_vegetation_species
+// ---------------------------------------------------------------------------
+std::vector<ModelAsset> AssetImporter::import_vegetation_species(const std::string& species_path) const
+{
+    namespace fs = std::filesystem;
+
+    MARS_LOG("[AssetImporter] Loading vegetation species from '{}'", species_path);
+
+    std::vector<ModelAsset> lods;
+    lods.reserve(3); // HighPoly, LowPoly, FarCluster (Impostor is separate)
+
+    // Build expected paths
+    const fs::path base(species_path);
+    const std::string species_name = base.filename().string();
+
+    // Try to find the .fbx files in HighPoly/ and LowPoly/ subdirectories
+    // SpeedTree ORCA assets use the species name as the FBX filename
+    const fs::path high_poly_dir = base / "HighPoly";
+    const fs::path low_poly_dir  = base / "LowPoly";
+    const fs::path textures_dir  = base / "Textures";
+
+    // Find the first .fbx file in each directory (some species have multiple LODs)
+    auto find_first_fbx = [](const fs::path& dir) -> std::string
+    {
+        if (!fs::exists(dir) || !fs::is_directory(dir))
+            return {};
+
+        for (const auto& entry : fs::directory_iterator(dir))
+        {
+            if (entry.is_regular_file() && entry.path().extension() == ".fbx")
+                return entry.path().string();
+        }
+        return {};
+    };
+
+    const std::string high_poly_fbx = find_first_fbx(high_poly_dir);
+    const std::string low_poly_fbx  = find_first_fbx(low_poly_dir);
+
+    if (high_poly_fbx.empty())
+    {
+        MARS_LOG("[AssetImporter] ERROR: No .fbx found in '{}/HighPoly/'", species_path);
+        return {};
+    }
+
+    if (low_poly_fbx.empty())
+    {
+        MARS_LOG("[AssetImporter] ERROR: No .fbx found in '{}/LowPoly/'", species_path);
+        return {};
+    }
+
+    // Texture paths (SpeedTree ORCA v2 convention)
+    const std::string base_color_tex = (textures_dir / "BaseColor.dds").string();
+    const std::string specular_tex   = (textures_dir / "Specular.dds").string();
+    const std::string normal_tex     = (textures_dir / "Normal.dds").string();
+
+    // Verify textures exist
+    bool has_textures = fs::exists(base_color_tex) && 
+                        fs::exists(specular_tex) && 
+                        fs::exists(normal_tex);
+
+    if (!has_textures)
+    {
+        MARS_LOG("[AssetImporter] WARNING: Not all expected textures found in '{}/Textures/'", species_path);
+        MARS_LOG("[AssetImporter]   Expected: BaseColor.dds, Specular.dds, Normal.dds");
+    }
+
+    // Helper to override SpeedTree textures on imported materials
+    auto apply_speedtree_textures = [&](ModelAsset& asset)
+    {
+        if (!has_textures) return;
+
+        for (auto& mat : asset.materials)
+        {
+            // SpeedTree ORCA uses a specific texture layout:
+            //   BaseColor.dds: RGB = base color, A = opacity mask
+            //   Specular.dds:  R = occlusion, G = roughness, B = metalness (packed ORM)
+            //   Normal.dds:    RGB = tangent-space normal (DirectX convention, Y-up)
+
+            mat.base_color_texture.path   = base_color_tex;
+            mat.base_color_texture.is_srgb = true;
+
+            mat.metallic_roughness_texture.path   = specular_tex; // ORM packed
+            mat.metallic_roughness_texture.is_srgb = false;
+
+            mat.occlusion_texture.path   = specular_tex; // R channel = occlusion
+            mat.occlusion_texture.is_srgb = false;
+
+            mat.normal_texture.path   = normal_tex;
+            mat.normal_texture.is_srgb = false;
+        }
+    };
+
+    // LOD 0: HighPoly
+    {
+        // Vegetation FBXs (SpeedTree ORCA) contain many independently-placed
+        // submeshes (trunk / branches / leaves / fronds) whose final positions
+        // are encoded in per-node transforms. They are also exported in
+        // centimetres. Bake both into the vertex positions during import.
+        auto high_asset = import(high_poly_fbx, /*pre_transform_vertices=*/true);
+        if (!high_asset.has_value())
+        {
+            MARS_LOG("[AssetImporter] ERROR: Failed to import HighPoly mesh from '{}'", high_poly_fbx);
+            return {};
+        }
+
+        apply_speedtree_textures(high_asset.value());
+        lods.push_back(std::move(high_asset.value()));
+        MARS_LOG("[AssetImporter]   LOD 0 (Near): {} meshes, {} vertices", 
+            lods[0].meshes.size(), 
+            lods[0].meshes.empty() ? 0 : lods[0].meshes[0].vertices.size());
+    }
+
+    // LOD 1: LowPoly
+    {
+        auto low_asset = import(low_poly_fbx, /*pre_transform_vertices=*/true);
+        if (!low_asset.has_value())
+        {
+            MARS_LOG("[AssetImporter] ERROR: Failed to import LowPoly mesh from '{}'", low_poly_fbx);
+            return {};
+        }
+
+        apply_speedtree_textures(low_asset.value());
+        lods.push_back(std::move(low_asset.value()));
+        MARS_LOG("[AssetImporter]   LOD 1 (Mid): {} meshes, {} vertices", 
+            lods[1].meshes.size(), 
+            lods[1].meshes.empty() ? 0 : lods[1].meshes[0].vertices.size());
+    }
+
+    // LOD 2: FarCluster — for now, reuse LowPoly (in the future, we'd load a separate simplified mesh)
+    {
+        lods.push_back(lods[1]); // Copy LowPoly asset
+        MARS_LOG("[AssetImporter]   LOD 2 (FarCluster): reusing LowPoly mesh");
+    }
+
+    // LOD 3: Impostor — handled separately (octahedral atlas baked offline)
+
+    MARS_LOG("[AssetImporter] Vegetation species '{}' loaded: {} LOD tiers", species_name, lods.size());
+    return lods;
 }
 
 } // namespace mars

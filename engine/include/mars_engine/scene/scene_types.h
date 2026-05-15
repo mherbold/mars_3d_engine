@@ -256,4 +256,105 @@ struct ClothInstance
     uint32_t    index_count     = 0;
 };
 
+// =============================================================================
+// VegetationLOD — LOD tier enumeration for vegetation rendering
+// =============================================================================
+enum class VegetationLOD : uint8_t
+{
+    Near       = 0,  // < ~50 m   — HighPoly FBX mesh, full geometry with OMM alpha
+    Mid        = 1,  // 50-200 m  — LowPoly FBX mesh, simplified cards with OMM
+    FarCluster = 2,  // 200-600 m — Simplified alpha cards with OMM
+    Impostor   = 3,  // > 600 m   — Octahedral impostor (procedural AABB + depth atlas)
+
+    Count
+};
+
+// =============================================================================
+// SpeciesDesc — description of one vegetation species (e.g., "Oak Tree")
+// Loaded from the ecosystem config in .marsscene
+// =============================================================================
+struct SpeciesDesc
+{
+    std::string name;                   // "European Linden", "Boston Fern", etc.
+    std::string asset_path;             // Base path to the species folder (contains HighPoly/, LowPoly/, Textures/)
+
+    // LOD distance thresholds (in meters)
+    float lod_near_max      = 50.0f;    // LOD 0 → 1 transition
+    float lod_mid_max       = 200.0f;   // LOD 1 → 2 transition
+    float lod_far_max       = 600.0f;   // LOD 2 → 3 transition
+    float max_draw_distance = 2000.0f;  // Beyond this, don't draw at all
+
+    // Wind animation parameters
+    float wind_primary_bend   = 0.5f;   // Primary trunk/branch bend strength
+    float wind_secondary_sway = 0.3f;   // Secondary branch sway multiplier
+    float wind_leaf_flutter   = 0.2f;   // Leaf/foliage micro-movement
+
+    // Relative spawn weight (for multi-species density maps)
+    float spawn_weight = 1.0f;
+
+    // GPU resources (filled by asset loader, not parsed from JSON)
+    // Each LOD tier has its own set of BLASes — one per submesh of the
+    // imported model (SpeedTree assets split trees into bark / branches /
+    // leaves / fronds submeshes, each with its own material). For Impostor
+    // (LOD 3) there's a single procedural-AABB BLAS in submesh slot 0.
+    std::vector<uint32_t> blas_indices[static_cast<size_t>(VegetationLOD::Count)];
+    // Material slot per submesh per LOD; parallel to blas_indices.
+    std::vector<uint32_t> material_indices[static_cast<size_t>(VegetationLOD::Count)];
+    uint32_t model_indices[static_cast<size_t>(VegetationLOD::Count)] = { UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX };
+
+    // Octahedral impostor atlas texture (LOD 3)
+    uint32_t impostor_atlas_srv = UINT32_MAX;  // Bindless SRV slot for packed radiance+depth atlas
+};
+
+// =============================================================================
+// VegetationInstance — a single vegetation instance placed in the world
+// Created by the GPU placement compute shader or manually specified in the scene
+// =============================================================================
+struct VegetationInstance
+{
+    Transform   transform;              // World-space position, rotation, scale
+    uint32_t    species_index = 0;      // Index into EcosystemDesc::species array
+    VegetationLOD current_lod = VegetationLOD::Near;
+    uint32_t    tlas_instance = UINT32_MAX;  // PathTracer TLAS slot
+
+    // Wind animation state (per-instance phase offset for variety)
+    float       wind_phase_offset = 0.0f;
+};
+
+// =============================================================================
+// EcosystemDesc — top-level ecosystem configuration from .marsscene
+// =============================================================================
+struct EcosystemDesc
+{
+    bool        enabled = false;
+    std::string density_map_path;       // Single-channel R8 texture (pixel intensity = spawn density)
+
+    // World-space bounding region for ecosystem placement
+    Vec3        world_min    = { -1000.0f, 0.0f, -1000.0f };
+    Vec3        world_max    = {  1000.0f, 0.0f,  1000.0f };
+    float       placement_y  = 0.0f;    // Y-coordinate for all vegetation (ground plane)
+
+    // Density control
+    float       density_multiplier = 1.0f;  // Global density scale (instances per m²)
+    uint32_t    max_instances = 10000;      // Hard cap on total instance count
+
+    // Culling distances
+    float       frustum_cull_margin = 50.0f;  // Extend frustum by this many meters (avoid pop-in)
+
+    // Species list
+    std::vector<SpeciesDesc> species;
+
+    // Runtime CPU-side mirror of GPU-placed instances (filled after readback)
+    std::vector<VegetationInstance> instances;
+
+    // GPU resources (filled at runtime)
+    uint32_t    density_map_srv = UINT32_MAX;      // Bindless SRV slot for density texture
+    uint32_t    instance_buffer_uav = UINT32_MAX;  // Structured buffer for VegetationInstance data
+    uint32_t    instance_counter_uav = UINT32_MAX; // Bindless UAV slot for atomic instance counter (R32_UINT)
+    uint32_t    species_buffer_srv = UINT32_MAX;   // Bindless SRV slot for per-species LOD distances (SpeciesGpu[])
+    uint32_t    instance_count = 0;                // Actual number of instances spawned
+    uint32_t    random_seed = 0xC0FFEEu;           // Incremented each placement dispatch for variety
+    float       lod_dither_band_meters = 8.0f;     // Width of the dithered LOD-transition band
+};
+
 } // namespace mars

@@ -48,6 +48,10 @@ struct CpuInstanceData
     uint32_t vertex_buffer_srv       = UINT32_MAX;
     uint32_t index_buffer_srv        = UINT32_MAX;
     uint32_t prev_vertex_buffer_srv  = UINT32_MAX; // previous-frame vertex positions (cloth); UINT32_MAX = none
+    float    lod_alpha               = 1.0f;       // Stochastic LOD opacity in [0,1]; AnyHit rejects when rand >= lod_alpha
+    uint32_t impostor_atlas_srv      = UINT32_MAX; // Octahedral impostor atlas (LOD3); UINT32_MAX = not an impostor
+    uint32_t impostor_view_count     = 16;         // View-grid resolution per octahedral axis (e.g. 16 -> 16x16 atlas)
+    float    impostor_half_extent    = 1.0f;       // AABB half-extent in metres; used by the intersection shader
 };
 
 struct CpuMaterialData
@@ -108,7 +112,8 @@ public:
     // ---------------------------------------------------------------------------
     uint32_t build_blas(DeviceContext& ctx,
                         const GpuMeshBuffer& mesh,
-                        bool allow_update = false);
+                        bool allow_update = false,
+                        bool opaque = true);
 
     // Upload instance and material structured buffers and register their
     // bindless SRV slots so shaders can fetch per-instance/material data.
@@ -219,7 +224,7 @@ public:
     // Build a BLAS that supports incremental refit (ALLOW_UPDATE flag).
     // The returned index should be used with refit_blas() each frame.
     // ---------------------------------------------------------------------------
-    uint32_t build_skinned_blas(DeviceContext& ctx, const GpuMeshBuffer& mesh);
+    uint32_t build_skinned_blas(DeviceContext& ctx, const GpuMeshBuffer& mesh, bool opaque = true);
 
     // Refit a previously built skinned BLAS using the mesh's skinned vertex buffer
     // (populated by dispatch_skinning). Must be called before build_tlas().
@@ -227,6 +232,38 @@ public:
                     ID3D12GraphicsCommandList6* cmd_list,
                     uint32_t blas_index,
                     const GpuMeshBuffer& mesh);
+
+    // ---------------------------------------------------------------------------
+    // Vegetation BLAS management
+    // Build the refittable BLAS set for every vegetation species in the scene.
+    // For each species:
+    //   - LOD Near / Mid / FarCluster get an ALLOW_UPDATE BLAS so the wind
+    //     compute pass can refit them per frame.
+    //   - LOD Impostor uses a procedural AABB BLAS (single unit-cube AABB) so
+    //     the path tracer can intersect it with a custom intersection shader.
+    //
+    // Fills out species.blas_indices[]. Assumes species.model_indices[] are
+    // already populated by AssetImporter::import_vegetation_species() and that
+    // the engine has uploaded GpuMeshBuffers for each LOD model.
+    // ---------------------------------------------------------------------------
+    uint32_t build_vegetation_lod_blas(DeviceContext& ctx,
+                                       const GpuMeshBuffer& mesh,
+                                       bool opaque = true);
+
+    // Build a static BLAS over ALL submeshes of a vegetation LOD model in a
+    // single acceleration structure. SpeedTree FBX assets consist of many
+    // independently-placed submeshes (trunk / branches / leaves / fronds);
+    // building only mesh_buffers.front() would render an incomplete tree.
+    // This variant should be preferred when there is no wind compute pass to
+    // refit a per-submesh skinned BLAS.
+    uint32_t build_vegetation_model_blas(DeviceContext& ctx,
+                                         const std::vector<GpuMeshBuffer>& meshes);
+
+    // Build a procedural-AABB BLAS for the Impostor LOD (a single unit AABB
+    // expanded to the species' bounding box). Returns the BLAS index.
+    uint32_t build_vegetation_impostor_blas(DeviceContext& ctx,
+                                            const Vec3& aabb_min,
+                                            const Vec3& aabb_max);
 
     // Overload for cloth: refit using an explicit vertex resource (the cloth
     // output vertex buffer written by dispatch_cloth_sim).
@@ -255,6 +292,44 @@ public:
                             const Vec3&                wind,
                             float                      delta_time);
 
+    // ---------------------------------------------------------------------------
+    // Ecosystem / vegetation
+    // Dispatch GPU-driven vegetation instance placement from a density map.
+    // Populates the ecosystem GPU instance buffer and atomic counter.
+    // Call once at scene load (or when density map changes).
+    // ---------------------------------------------------------------------------
+    void dispatch_vegetation_placement(ID3D12GraphicsCommandList6* cmd_list,
+                                       EcosystemDesc&              ecosystem);
+
+    // Dispatch per-instance LOD selection. Reads the placed instance buffer and
+    // the camera position, then writes the resulting VegetationLOD tier and a
+    // stochastic dither value back into each instance for use by the path tracer.
+    // Call once per frame after placement, before the path-trace dispatch.
+    void dispatch_vegetation_lod_selection(ID3D12GraphicsCommandList6* cmd_list,
+                                           EcosystemDesc&              ecosystem,
+                                           const Vec3&                 camera_position,
+                                           uint32_t                    frame_index);
+
+    // Apply wind deformation to a single species mesh. Reads the rest-pose
+    // vertex buffer (source_vertex_srv) and writes a deformed copy to
+    // output_vertex_uav. Caller is responsible for issuing a UAV barrier and
+    // calling refit_blas() on the species' refittable BLAS afterwards.
+    void dispatch_vegetation_wind(ID3D12GraphicsCommandList6* cmd_list,
+                                  uint32_t       vertex_count,
+                                  uint32_t       source_vertex_srv,
+                                  uint32_t       output_vertex_uav,
+                                  uint32_t       prev_pos_uav,
+                                  float          mesh_min_y,
+                                  float          mesh_height,
+                                  const Vec3&    wind_direction,
+                                  float          wind_strength,
+                                  float          time_seconds,
+                                  float          wind_phase_offset,
+                                  float          primary_bend,
+                                  float          secondary_sway,
+                                  float          leaf_flutter,
+                                  float          trunk_envelope);
+
 private:
     // --- Helpers -------------------------------------------------------------
     void create_allocator(DeviceContext& ctx);
@@ -266,6 +341,9 @@ private:
     void create_blit_pipeline(DeviceContext& ctx);
     void create_skinning_pipeline(DeviceContext& ctx);
     void create_cloth_pipeline(DeviceContext& ctx);
+    void create_vegetation_placement_pipeline(DeviceContext& ctx);
+    void create_vegetation_lod_pipeline(DeviceContext& ctx);
+    void create_vegetation_wind_pipeline(DeviceContext& ctx);
 
     void release_output_textures();
 
@@ -304,9 +382,12 @@ private:
         // Only set for skinned (allow-update) BLASes — needed for refit each frame.
         D3D12MA::Allocation* scratch_alloc  = nullptr;
         ID3D12Resource*      scratch        = nullptr;
-        bool                 allow_update   = false;
-        uint32_t             vertex_count   = 0;
-        uint32_t             index_count    = 0;
+        bool                 allow_update     = false;
+        bool                 geometry_opaque  = true;   // false for alpha-masked leaf/frond submeshes
+        uint32_t             vertex_count     = 0;
+        uint32_t             index_count      = 0;
+        // Octahedral impostor procedural BLAS — routed to HitGroup_Impostor in the TLAS.
+        bool                 is_impostor      = false;
     };
     std::vector<BlasEntry> m_blas_list;
 
@@ -402,6 +483,18 @@ private:
     // --- Cloth simulation compute pipeline --------------------------------
     ComPtr<ID3D12RootSignature> m_cloth_root_sig;
     ComPtr<ID3D12PipelineState> m_cloth_pso;
+
+    // --- Vegetation placement compute pipeline ----------------------------
+    ComPtr<ID3D12RootSignature> m_vegetation_placement_root_sig;
+    ComPtr<ID3D12PipelineState> m_vegetation_placement_pso;
+
+    // --- Vegetation LOD selection compute pipeline ------------------------
+    ComPtr<ID3D12RootSignature> m_vegetation_lod_root_sig;
+    ComPtr<ID3D12PipelineState> m_vegetation_lod_pso;
+
+    // --- Vegetation wind deformation compute pipeline ---------------------
+    ComPtr<ID3D12RootSignature> m_vegetation_wind_root_sig;
+    ComPtr<ID3D12PipelineState> m_vegetation_wind_pso;
 
     // --- Scene instance / material structured buffers -----------------------
     D3D12MA::Allocation* m_instance_data_alloc   = nullptr;

@@ -363,7 +363,148 @@ void GpuMeshBuffer::enable_skinning(DeviceContext& ctx, D3D12MA::Allocator* allo
 }
 
 // ---------------------------------------------------------------------------
-// GpuMeshBuffer::upload_bone_palette
+// GpuMeshBuffer::enable_wind_deform
+// Allocates only the output vertex buffer (UAV + SRV) needed for GPU wind
+// deformation. No bone palette is created. The output is exposed via the
+// same skinned_vertex_uav_slot / skinned_vertex_srv_slot / skinned_vertex_buffer()
+// accessors so dispatch_vegetation_wind() and refit_blas() can be used
+// without any additional code paths.
+// ---------------------------------------------------------------------------
+void GpuMeshBuffer::enable_wind_deform(DeviceContext& ctx, D3D12MA::Allocator* allocator)
+{
+    if (!m_vertex_buffer)
+        throw std::runtime_error("GpuMeshBuffer::enable_wind_deform: vertex buffer not uploaded yet");
+
+    if (m_skinned_vertex_buffer)
+        return; // already allocated (e.g. enable_skinning was called first)
+
+    const uint64_t vb_size = static_cast<uint64_t>(m_vertex_count) * sizeof(Vertex);
+
+    // ---- Create DEFAULT-heap output vertex buffer (UAV target) ----
+    {
+        D3D12MA::ALLOCATION_DESC alloc_desc{};
+        alloc_desc.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+
+        D3D12_RESOURCE_DESC buf_desc = CD3DX12_RESOURCE_DESC::Buffer(
+            vb_size, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+        throw_if_failed(
+            allocator->CreateResource(
+                &alloc_desc,
+                &buf_desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                nullptr,
+                &m_skinned_vertex_alloc,
+                IID_PPV_ARGS(&m_skinned_vertex_buffer)),
+            "D3D12MA: CreateResource (wind output vertex buffer) failed");
+
+        m_skinned_vertex_buffer->SetName(L"GpuMeshBuffer::WindOutputVertexBuffer");
+
+        // Seed with rest-pose data so the first frame before any wind dispatch
+        // renders correctly.
+        copy_buffer(ctx, m_skinned_vertex_buffer, m_vertex_buffer, vb_size);
+    }
+
+    // ---- Register UAV in the bindless heap (RWByteAddressBuffer) ----
+    m_skinned_vertex_uav_slot = ctx.allocate_bindless_slot();
+    {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc{};
+        uav_desc.Format              = DXGI_FORMAT_R32_TYPELESS;
+        uav_desc.ViewDimension       = D3D12_UAV_DIMENSION_BUFFER;
+        uav_desc.Buffer.FirstElement = 0;
+        uav_desc.Buffer.NumElements  = static_cast<UINT>(vb_size / 4);
+        uav_desc.Buffer.Flags        = D3D12_BUFFER_UAV_FLAG_RAW;
+
+        D3D12_CPU_DESCRIPTOR_HANDLE uav_cpu =
+            ctx.bindless_heap()->GetCPUDescriptorHandleForHeapStart();
+        uav_cpu.ptr += static_cast<SIZE_T>(m_skinned_vertex_uav_slot) * ctx.bindless_descriptor_size();
+        ctx.device()->CreateUnorderedAccessView(m_skinned_vertex_buffer, nullptr, &uav_desc, uav_cpu);
+    }
+
+    // ---- Register SRV in the bindless heap (ByteAddressBuffer) ----
+    m_skinned_vertex_srv_slot = ctx.allocate_bindless_slot();
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+        srv_desc.Format                  = DXGI_FORMAT_R32_TYPELESS;
+        srv_desc.ViewDimension           = D3D12_SRV_DIMENSION_BUFFER;
+        srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv_desc.Buffer.FirstElement     = 0;
+        srv_desc.Buffer.NumElements      = static_cast<UINT>(vb_size / 4);
+        srv_desc.Buffer.Flags            = D3D12_BUFFER_SRV_FLAG_RAW;
+
+        D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu =
+            ctx.bindless_heap()->GetCPUDescriptorHandleForHeapStart();
+        srv_cpu.ptr += static_cast<SIZE_T>(m_skinned_vertex_srv_slot) * ctx.bindless_descriptor_size();
+        ctx.device()->CreateShaderResourceView(m_skinned_vertex_buffer, &srv_desc, srv_cpu);
+    }
+
+    // ---- Allocate compact float3 prev-position buffer (stride 12) ----
+    // This holds last frame's deformed positions so the closest-hit shader can
+    // compute per-vertex motion vectors for the denoiser / TAA reprojection.
+    // The wind compute shader writes the current output position here before
+    // overwriting it with the new deformed position.
+    {
+        const uint64_t prev_size = static_cast<uint64_t>(m_vertex_count) * sizeof(float) * 3;
+
+        D3D12MA::ALLOCATION_DESC alloc_desc{};
+        alloc_desc.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+
+        D3D12_RESOURCE_DESC buf_desc = CD3DX12_RESOURCE_DESC::Buffer(
+            prev_size, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+        throw_if_failed(
+            allocator->CreateResource(
+                &alloc_desc,
+                &buf_desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                nullptr,
+                &m_wind_prev_pos_alloc,
+                IID_PPV_ARGS(&m_wind_prev_pos_buffer)),
+            "D3D12MA: CreateResource (wind prev-pos buffer) failed");
+        m_wind_prev_pos_buffer->SetName(L"GpuMeshBuffer::WindPrevPosBuffer");
+
+        // Seed with rest-pose positions (float3 extracted from Vertex) so the
+        // very first frame gets zero object-motion vectors instead of garbage.
+        // We copy via a staging buffer: read rest-pose float3 strides from the
+        // vertex buffer is complex, so we just zero-fill — the denoiser handles
+        // the first frame gracefully with near-zero object motion.
+        // (The second frame onward the shader provides correct prev positions.)
+
+        // UAV slot
+        m_wind_prev_pos_uav_slot = ctx.allocate_bindless_slot();
+        {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc{};
+            uav_desc.Format              = DXGI_FORMAT_R32_TYPELESS;
+            uav_desc.ViewDimension       = D3D12_UAV_DIMENSION_BUFFER;
+            uav_desc.Buffer.FirstElement = 0;
+            uav_desc.Buffer.NumElements  = static_cast<UINT>(prev_size / 4);
+            uav_desc.Buffer.Flags        = D3D12_BUFFER_UAV_FLAG_RAW;
+
+            D3D12_CPU_DESCRIPTOR_HANDLE uav_cpu =
+                ctx.bindless_heap()->GetCPUDescriptorHandleForHeapStart();
+            uav_cpu.ptr += static_cast<SIZE_T>(m_wind_prev_pos_uav_slot) * ctx.bindless_descriptor_size();
+            ctx.device()->CreateUnorderedAccessView(m_wind_prev_pos_buffer, nullptr, &uav_desc, uav_cpu);
+        }
+
+        // SRV slot
+        m_wind_prev_pos_srv_slot = ctx.allocate_bindless_slot();
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+            srv_desc.Format                  = DXGI_FORMAT_R32_TYPELESS;
+            srv_desc.ViewDimension           = D3D12_SRV_DIMENSION_BUFFER;
+            srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv_desc.Buffer.FirstElement     = 0;
+            srv_desc.Buffer.NumElements      = static_cast<UINT>(prev_size / 4);
+            srv_desc.Buffer.Flags            = D3D12_BUFFER_SRV_FLAG_RAW;
+
+            D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu =
+                ctx.bindless_heap()->GetCPUDescriptorHandleForHeapStart();
+            srv_cpu.ptr += static_cast<SIZE_T>(m_wind_prev_pos_srv_slot) * ctx.bindless_descriptor_size();
+            ctx.device()->CreateShaderResourceView(m_wind_prev_pos_buffer, &srv_desc, srv_cpu);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 void GpuMeshBuffer::upload_bone_palette(const std::vector<Mat4x4>& bone_palette) const
 {
@@ -381,25 +522,29 @@ void GpuMeshBuffer::destroy()
     if (m_vertex_buffer) { m_vertex_buffer->Release(); m_vertex_buffer = nullptr; }
     if (m_index_buffer)  { m_index_buffer->Release();  m_index_buffer  = nullptr; }
     if (m_skinned_vertex_buffer) { m_skinned_vertex_buffer->Release(); m_skinned_vertex_buffer = nullptr; }
+    if (m_wind_prev_pos_buffer)  { m_wind_prev_pos_buffer->Release();  m_wind_prev_pos_buffer  = nullptr; }
     if (m_bone_palette_buffer)
     {
         if (m_bone_palette_mapped_ptr) { m_bone_palette_buffer->Unmap(0, nullptr); m_bone_palette_mapped_ptr = nullptr; }
         m_bone_palette_buffer->Release();
         m_bone_palette_buffer = nullptr;
     }
-    if (m_vertex_alloc)  { m_vertex_alloc->Release();  m_vertex_alloc  = nullptr; }
-    if (m_index_alloc)   { m_index_alloc->Release();   m_index_alloc   = nullptr; }
-    if (m_skinned_vertex_alloc) { m_skinned_vertex_alloc->Release(); m_skinned_vertex_alloc = nullptr; }
-    if (m_bone_palette_alloc)   { m_bone_palette_alloc->Release();   m_bone_palette_alloc   = nullptr; }
+    if (m_vertex_alloc)          { m_vertex_alloc->Release();          m_vertex_alloc          = nullptr; }
+    if (m_index_alloc)           { m_index_alloc->Release();           m_index_alloc           = nullptr; }
+    if (m_skinned_vertex_alloc)  { m_skinned_vertex_alloc->Release();  m_skinned_vertex_alloc  = nullptr; }
+    if (m_wind_prev_pos_alloc)   { m_wind_prev_pos_alloc->Release();   m_wind_prev_pos_alloc   = nullptr; }
+    if (m_bone_palette_alloc)    { m_bone_palette_alloc->Release();    m_bone_palette_alloc    = nullptr; }
     m_vbv = {};
     m_ibv = {};
     m_vertex_count    = 0;
     m_index_count     = 0;
     m_vertex_srv_slot = UINT32_MAX;
     m_index_srv_slot  = UINT32_MAX;
-    m_skinned_vertex_uav_slot = UINT32_MAX;
-    m_skinned_vertex_srv_slot = UINT32_MAX;
-    m_bone_palette_srv_slot   = UINT32_MAX;
+    m_skinned_vertex_uav_slot  = UINT32_MAX;
+    m_skinned_vertex_srv_slot  = UINT32_MAX;
+    m_bone_palette_srv_slot    = UINT32_MAX;
+    m_wind_prev_pos_uav_slot   = UINT32_MAX;
+    m_wind_prev_pos_srv_slot   = UINT32_MAX;
     m_max_bones = 0;
     m_bone_palette_mapped_ptr = nullptr;
 }
@@ -412,10 +557,12 @@ GpuMeshBuffer::GpuMeshBuffer(GpuMeshBuffer&& o) noexcept
     , m_index_alloc(o.m_index_alloc)
     , m_skinned_vertex_alloc(o.m_skinned_vertex_alloc)
     , m_bone_palette_alloc(o.m_bone_palette_alloc)
+    , m_wind_prev_pos_alloc(o.m_wind_prev_pos_alloc)
     , m_vertex_buffer(o.m_vertex_buffer)
     , m_index_buffer(o.m_index_buffer)
     , m_skinned_vertex_buffer(o.m_skinned_vertex_buffer)
     , m_bone_palette_buffer(o.m_bone_palette_buffer)
+    , m_wind_prev_pos_buffer(o.m_wind_prev_pos_buffer)
     , m_vbv(o.m_vbv)
     , m_ibv(o.m_ibv)
     , m_vertex_count(o.m_vertex_count)
@@ -425,25 +572,31 @@ GpuMeshBuffer::GpuMeshBuffer(GpuMeshBuffer&& o) noexcept
     , m_skinned_vertex_uav_slot(o.m_skinned_vertex_uav_slot)
     , m_skinned_vertex_srv_slot(o.m_skinned_vertex_srv_slot)
     , m_bone_palette_srv_slot(o.m_bone_palette_srv_slot)
+    , m_wind_prev_pos_uav_slot(o.m_wind_prev_pos_uav_slot)
+    , m_wind_prev_pos_srv_slot(o.m_wind_prev_pos_srv_slot)
     , m_max_bones(o.m_max_bones)
     , m_bone_palette_mapped_ptr(o.m_bone_palette_mapped_ptr)
     , m_bounds(o.m_bounds)
 {
     o.m_vertex_alloc  = nullptr;
     o.m_index_alloc   = nullptr;
-    o.m_skinned_vertex_alloc = nullptr;
-    o.m_bone_palette_alloc   = nullptr;
+    o.m_skinned_vertex_alloc  = nullptr;
+    o.m_bone_palette_alloc    = nullptr;
+    o.m_wind_prev_pos_alloc   = nullptr;
     o.m_vertex_buffer = nullptr;
     o.m_index_buffer  = nullptr;
-    o.m_skinned_vertex_buffer = nullptr;
-    o.m_bone_palette_buffer   = nullptr;
+    o.m_skinned_vertex_buffer  = nullptr;
+    o.m_bone_palette_buffer    = nullptr;
+    o.m_wind_prev_pos_buffer   = nullptr;
     o.m_vertex_count  = 0;
     o.m_index_count   = 0;
     o.m_vertex_srv_slot = UINT32_MAX;
     o.m_index_srv_slot  = UINT32_MAX;
-    o.m_skinned_vertex_uav_slot = UINT32_MAX;
-    o.m_skinned_vertex_srv_slot = UINT32_MAX;
-    o.m_bone_palette_srv_slot   = UINT32_MAX;
+    o.m_skinned_vertex_uav_slot  = UINT32_MAX;
+    o.m_skinned_vertex_srv_slot  = UINT32_MAX;
+    o.m_bone_palette_srv_slot    = UINT32_MAX;
+    o.m_wind_prev_pos_uav_slot   = UINT32_MAX;
+    o.m_wind_prev_pos_srv_slot   = UINT32_MAX;
     o.m_max_bones = 0;
     o.m_bone_palette_mapped_ptr = nullptr;
 }
@@ -738,6 +891,233 @@ ClothGpuResources::ClothGpuResources(ClothGpuResources&& o) noexcept
 ClothGpuResources& ClothGpuResources::operator=(ClothGpuResources&& o) noexcept
 {
     if (this != &o) { destroy(); new (this) ClothGpuResources(std::move(o)); }
+    return *this;
+}
+
+// ===========================================================================
+// EcosystemGpuResources
+// ===========================================================================
+namespace {
+
+// Strides must mirror the HLSL structs in vegetation_placement.hlsl and
+// vegetation_lod_selection.hlsl.
+constexpr uint32_t k_vegetation_instance_stride = 64u; // VegetationInstanceGpu
+constexpr uint32_t k_species_gpu_stride         = 16u; // SpeciesGpu (4 floats)
+
+static uint32_t register_structured_uav(DeviceContext& ctx, ID3D12Resource* res,
+                                        uint32_t num_elements, uint32_t stride)
+{
+    uint32_t slot = ctx.allocate_bindless_slot();
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc{};
+    uav_desc.Format                     = DXGI_FORMAT_UNKNOWN;
+    uav_desc.ViewDimension              = D3D12_UAV_DIMENSION_BUFFER;
+    uav_desc.Buffer.FirstElement        = 0;
+    uav_desc.Buffer.NumElements         = num_elements;
+    uav_desc.Buffer.StructureByteStride = stride;
+    uav_desc.Buffer.Flags               = D3D12_BUFFER_UAV_FLAG_NONE;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE h = ctx.bindless_heap()->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += static_cast<SIZE_T>(slot) * ctx.bindless_descriptor_size();
+    ctx.device()->CreateUnorderedAccessView(res, nullptr, &uav_desc, h);
+    return slot;
+}
+
+static uint32_t register_structured_srv(DeviceContext& ctx, ID3D12Resource* res,
+                                        uint32_t num_elements, uint32_t stride)
+{
+    uint32_t slot = ctx.allocate_bindless_slot();
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+    srv_desc.Format                     = DXGI_FORMAT_UNKNOWN;
+    srv_desc.ViewDimension              = D3D12_SRV_DIMENSION_BUFFER;
+    srv_desc.Shader4ComponentMapping    = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv_desc.Buffer.FirstElement        = 0;
+    srv_desc.Buffer.NumElements         = num_elements;
+    srv_desc.Buffer.StructureByteStride = stride;
+    srv_desc.Buffer.Flags               = D3D12_BUFFER_SRV_FLAG_NONE;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE h = ctx.bindless_heap()->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += static_cast<SIZE_T>(slot) * ctx.bindless_descriptor_size();
+    ctx.device()->CreateShaderResourceView(res, &srv_desc, h);
+    return slot;
+}
+
+} // anonymous
+
+void EcosystemGpuResources::create(DeviceContext&      ctx,
+                                   D3D12MA::Allocator* allocator,
+                                   uint32_t            max_instances,
+                                   uint32_t            species_count,
+                                   const float*        species_table)
+{
+    m_max_instances = max_instances;
+    m_species_count = species_count;
+
+    D3D12MA::ALLOCATION_DESC alloc_desc{};
+    alloc_desc.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+
+    // ---- Instance buffer (RWStructuredBuffer<VegetationInstanceGpu>) -------
+    {
+        const uint64_t byte_size = static_cast<uint64_t>(max_instances) *
+                                   k_vegetation_instance_stride;
+        D3D12_RESOURCE_DESC buf_desc = CD3DX12_RESOURCE_DESC::Buffer(
+            byte_size, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        throw_if_failed(
+            allocator->CreateResource(&alloc_desc, &buf_desc,
+                D3D12_RESOURCE_STATE_COMMON, nullptr,
+                &m_instance_alloc, IID_PPV_ARGS(&m_instance_buffer)),
+            "Ecosystem: CreateResource (instance buffer) failed");
+        m_instance_buffer->SetName(L"Ecosystem::InstanceBuffer");
+        m_instance_uav = register_structured_uav(ctx, m_instance_buffer,
+            max_instances, k_vegetation_instance_stride);
+        m_instance_srv = register_structured_srv(ctx, m_instance_buffer,
+            max_instances, k_vegetation_instance_stride);
+    }
+
+    // ---- Atomic counter (RWStructuredBuffer<uint>, single element) ---------
+    {
+        const uint64_t byte_size = 4u;
+        D3D12_RESOURCE_DESC buf_desc = CD3DX12_RESOURCE_DESC::Buffer(
+            byte_size, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        throw_if_failed(
+            allocator->CreateResource(&alloc_desc, &buf_desc,
+                D3D12_RESOURCE_STATE_COMMON, nullptr,
+                &m_counter_alloc, IID_PPV_ARGS(&m_counter_buffer)),
+            "Ecosystem: CreateResource (counter buffer) failed");
+        m_counter_buffer->SetName(L"Ecosystem::InstanceCounter");
+
+        // Zero-initialise the counter via the copy queue.
+        const uint32_t zero = 0u;
+        upload_buffer(ctx, allocator, m_counter_buffer, &zero, byte_size);
+
+        m_counter_uav = register_structured_uav(ctx, m_counter_buffer, 1u, 4u);
+    }
+
+    // ---- Readback buffers (CPU-visible) ------------------------------------
+    {
+        D3D12MA::ALLOCATION_DESC rb_alloc_desc{};
+        rb_alloc_desc.HeapType = D3D12_HEAP_TYPE_READBACK;
+
+        // Counter readback (4 bytes)
+        {
+            D3D12_RESOURCE_DESC buf_desc = CD3DX12_RESOURCE_DESC::Buffer(4u);
+            throw_if_failed(
+                allocator->CreateResource(&rb_alloc_desc, &buf_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                    &m_counter_readback_alloc, IID_PPV_ARGS(&m_counter_readback)),
+                "Ecosystem: CreateResource (counter readback) failed");
+            m_counter_readback->SetName(L"Ecosystem::CounterReadback");
+        }
+
+        // Instance readback (full instance buffer size)
+        {
+            const uint64_t byte_size = static_cast<uint64_t>(max_instances) *
+                                       k_vegetation_instance_stride;
+            D3D12_RESOURCE_DESC buf_desc = CD3DX12_RESOURCE_DESC::Buffer(byte_size);
+            throw_if_failed(
+                allocator->CreateResource(&rb_alloc_desc, &buf_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                    &m_instance_readback_alloc, IID_PPV_ARGS(&m_instance_readback)),
+                "Ecosystem: CreateResource (instance readback) failed");
+            m_instance_readback->SetName(L"Ecosystem::InstanceReadback");
+        }
+    }
+
+    // ---- Species table (StructuredBuffer<SpeciesGpu>) ----------------------
+    if (species_count > 0 && species_table)
+    {
+        const uint64_t byte_size = static_cast<uint64_t>(species_count) *
+                                   k_species_gpu_stride;
+        D3D12_RESOURCE_DESC buf_desc = CD3DX12_RESOURCE_DESC::Buffer(byte_size);
+        throw_if_failed(
+            allocator->CreateResource(&alloc_desc, &buf_desc,
+                D3D12_RESOURCE_STATE_COMMON, nullptr,
+                &m_species_alloc, IID_PPV_ARGS(&m_species_buffer)),
+            "Ecosystem: CreateResource (species buffer) failed");
+        m_species_buffer->SetName(L"Ecosystem::SpeciesBuffer");
+
+        upload_buffer(ctx, allocator, m_species_buffer, species_table, byte_size);
+
+        m_species_srv = register_structured_srv(ctx, m_species_buffer,
+            species_count, k_species_gpu_stride);
+    }
+}
+
+void EcosystemGpuResources::destroy()
+{
+    auto rel = [](D3D12MA::Allocation*& a, ID3D12Resource*& r)
+    {
+        if (r) { r->Release(); r = nullptr; }
+        if (a) { a->Release(); a = nullptr; }
+    };
+    rel(m_instance_alloc, m_instance_buffer);
+    rel(m_counter_alloc,  m_counter_buffer);
+    rel(m_species_alloc,  m_species_buffer);
+    rel(m_instance_readback_alloc, m_instance_readback);
+    rel(m_counter_readback_alloc,  m_counter_readback);
+    m_instance_uav = m_instance_srv = UINT32_MAX;
+    m_counter_uav  = m_species_srv  = UINT32_MAX;
+    m_max_instances = 0;
+    m_species_count = 0;
+}
+
+uint32_t EcosystemGpuResources::read_counter() const
+{
+    if (!m_counter_readback) return 0;
+    uint32_t value = 0;
+    D3D12_RANGE read_range{ 0, 4 };
+    void* mapped = nullptr;
+    if (SUCCEEDED(m_counter_readback->Map(0, &read_range, &mapped)) && mapped)
+    {
+        memcpy(&value, mapped, sizeof(value));
+        D3D12_RANGE no_write{ 0, 0 };
+        m_counter_readback->Unmap(0, &no_write);
+    }
+    return value;
+}
+
+uint32_t EcosystemGpuResources::read_instances(void* out, uint32_t count) const
+{
+    if (!m_instance_readback || !out || count == 0) return 0;
+    const uint32_t safe_count = (count > m_max_instances) ? m_max_instances : count;
+    const uint64_t byte_size  = static_cast<uint64_t>(safe_count) *
+                                k_vegetation_instance_stride;
+    D3D12_RANGE read_range{ 0, static_cast<SIZE_T>(byte_size) };
+    void* mapped = nullptr;
+    if (SUCCEEDED(m_instance_readback->Map(0, &read_range, &mapped)) && mapped)
+    {
+        memcpy(out, mapped, byte_size);
+        D3D12_RANGE no_write{ 0, 0 };
+        m_instance_readback->Unmap(0, &no_write);
+    }
+    return static_cast<uint32_t>(byte_size);
+}
+
+EcosystemGpuResources::EcosystemGpuResources(EcosystemGpuResources&& o) noexcept
+    : m_max_instances(o.m_max_instances), m_species_count(o.m_species_count)
+    , m_instance_alloc(o.m_instance_alloc), m_counter_alloc(o.m_counter_alloc)
+    , m_species_alloc(o.m_species_alloc)
+    , m_instance_readback_alloc(o.m_instance_readback_alloc)
+    , m_counter_readback_alloc(o.m_counter_readback_alloc)
+    , m_instance_buffer(o.m_instance_buffer), m_counter_buffer(o.m_counter_buffer)
+    , m_species_buffer(o.m_species_buffer)
+    , m_instance_readback(o.m_instance_readback)
+    , m_counter_readback(o.m_counter_readback)
+    , m_instance_uav(o.m_instance_uav), m_instance_srv(o.m_instance_srv)
+    , m_counter_uav(o.m_counter_uav),   m_species_srv(o.m_species_srv)
+{
+    o.m_max_instances = 0;
+    o.m_species_count = 0;
+    o.m_instance_alloc = o.m_counter_alloc = o.m_species_alloc = nullptr;
+    o.m_instance_readback_alloc = o.m_counter_readback_alloc = nullptr;
+    o.m_instance_buffer = o.m_counter_buffer = o.m_species_buffer = nullptr;
+    o.m_instance_readback = o.m_counter_readback = nullptr;
+    o.m_instance_uav = o.m_instance_srv = UINT32_MAX;
+    o.m_counter_uav  = o.m_species_srv  = UINT32_MAX;
+}
+
+EcosystemGpuResources& EcosystemGpuResources::operator=(EcosystemGpuResources&& o) noexcept
+{
+    if (this != &o) { destroy(); new (this) EcosystemGpuResources(std::move(o)); }
     return *this;
 }
 

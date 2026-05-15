@@ -21,6 +21,9 @@ set(HLSL_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/gi/restir_gi.hlsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/skinning.hlsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/cloth_sim.hlsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/vegetation_placement.hlsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/vegetation_lod_selection.hlsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/vegetation_wind.hlsl"
 )
 
 # HLSLI headers — listed so they appear in the IDE; not compiled individually

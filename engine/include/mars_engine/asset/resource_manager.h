@@ -43,7 +43,11 @@ struct GpuModel
 {
     std::string                    name;
     std::vector<GpuMeshBuffer>     mesh_buffers;  // parallel to ModelAsset::meshes
+    std::vector<uint32_t>          mesh_material_indices; // material index per mesh (parallel to mesh_buffers)
     std::vector<uint32_t>          texture_slots;  // SRV slot per material base-colour texture
+    std::vector<uint32_t>          normal_slots;   // SRV slot per material normal texture (UINT32_MAX if none)
+    std::vector<uint32_t>          mr_slots;       // SRV slot per material metallic-roughness texture (UINT32_MAX if none)
+    std::vector<MaterialData>      materials;      // CPU-side material parameters (factors, flags)
     AABB                           bounds = {};
 
     // Skeletal animation data (empty if the model has no skeleton).
@@ -73,7 +77,8 @@ public:
 
     // Load a 3D model from disk and upload it to the GPU.
     // Returns the index of the GpuModel in the internal list, or UINT32_MAX on failure.
-    uint32_t load_model(DeviceContext& ctx, const std::string& file_path);
+    uint32_t load_model(DeviceContext& ctx, const std::string& file_path,
+                        bool pre_transform_vertices = false);
 
     // Load a texture from disk and upload it to the GPU.
     // Returns the bindless SRV slot, or UINT32_MAX on failure.

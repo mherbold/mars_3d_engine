@@ -33,7 +33,7 @@ M9 (Animation System) is complete, including GPU cloth simulation for waving fla
 | M7 | ReSTIR DI + real G-buffer AOV writes | ✅ | FrameConstants extended with 4 AOV UAV slots; path_tracer.cpp root signature expanded (spaces 5–8); AOV textures allocated and filled each frame; ClosestHit writes real diffuse albedo / specular F0 / world normals / roughness to DLSS-RR G-buffer; ReSTIR DI direct lighting via RIS + shadow ray replaces the old flat NdotL; restir_di.hlsli contains shared reservoir math; DXR-dependent helpers (RIS_GenerateCandidates, ReservoirShade + shadow TraceRay) live in path_trace.hlsl; verified: dxc -T lib_6_3 compiles with -WX clean |
 | M8 | ReSTIR GI — multi-bounce global illumination | ✅ | GI implemented as BRDF-importance-sampled MC estimator with configurable bounce depth (`gi_bounce_count`; 0=off, 1=single, 2=two-bounce). Russian Roulette path termination at depth >= 1. RTPSO max recursion = 3. Reservoir-based temporal/spatial reuse removed after debugging — see Notes. DLSS-RR denoises the noisy indirect signal. |
 | M9 | Animation system + skeletal mesh rendering | ✅ | Cloth sim: canonical XPBD solver (INTEGRATE → CONSTRAIN×N → FINALIZE), 3-position-state buffers, implicit velocity, compliance-based constraints, `final_srv` inversion bug fixed. Animated wind: `WindDesc` layered oscillator (gust + direction wander + micro + IIR smoother), parsed from `.marsscene`. |
-| M10 | Ecosystem / vegetation + wind | 🔲 Not started |
+| M10 | Ecosystem / vegetation + wind | 🔲 Not started | Octahedral impostors (not flat billboards); stochastic LOD dither (no alpha blend); DXR 1.2 OMM for alpha foliage; SpeedTree ORCA v2 asset compatibility (Boston Fern, European Linden, Hedge, Japanese Maple, Red Maple Young, White Oak). |
 | M11 | Particle system | 🔲 Not started |
 | M12 | Weather system (rain, clouds, fog) | 🔲 Not started |
 | M13 | Decal system (tire tracks, skid marks) | 🔲 Not started |
@@ -163,12 +163,33 @@ M9 (Animation System) is complete, including GPU cloth simulation for waving fla
 - ✅ ~~FABRIK IK solver for foot placement~~ (removed from scope — pit crew animations are pre-baked)
 
 ### M10 — Procedural Ecosystem / Vegetation + Wind
-- 🔲 GPU-driven instance placement compute shader (reads density map)
-- 🔲 GPU-driven LOD selection compute pass (projected solid angle → BLAS index)
-- 🔲 Impostor billboard pre-bake and ray-traversal sampling
-- 🔲 Wind compute shader: Bezier trunk/branch bend → vertex position write-back
+
+#### Asset Pipeline
+- 🟡 SpeedTree ORCA v2 FBX import: HighPoly and LowPoly meshes per species, SpeedTree texture channel convention (BaseColor RGBA, Specular ORM, Normal DX) — `AssetImporter::import_vegetation_species()` implemented; `Renderer::setup_ecosystem()` scans HighPoly/LowPoly directories and loads each LOD via `ResourceManager::load_model()`
+- 🔲 Offline OMM bake: per-mesh + BaseColor alpha channel → DXR 1.2 Opacity Micromap bitmasks stored alongside BLAS
+- 🔲 Offline octahedral impostor bake: 16x16 view grid → packed radiance + depth atlas per species
+
+#### Runtime Placement & Culling
+- 🟡 GPU-driven instance placement compute shader (reads density map, emits instance transforms) — `vegetation_placement.hlsl` + `PathTracer::dispatch_vegetation_placement()` implemented; `EcosystemGpuResources` allocates instance/counter/species GPU buffers plus CPU readback buffers (`engine/include/mars_engine/asset/gpu_mesh_buffer.h`); `Renderer::place_and_register_vegetation()` runs placement synchronously at scene-load, reads back the atomic counter + instance records, appends each placed instance as a `CpuInstanceData` + `PathTracer::set_instance()` TLAS entry, and mirrors them into `EcosystemDesc::instances`; remaining: GPU frustum cull prepass + per-frame TLAS update for moving instances
+- 🔲 GPU frustum + max-distance cull prepass (marks inactive instances before TLAS construction; no Hi-Z)
+
+#### LOD System
+- 🟡 GPU-driven LOD selection compute pass (projected solid angle per instance → LOD level + BLAS index; no CPU readback) — `vegetation_lod_selection.hlsl` + `PathTracer::dispatch_vegetation_lod_selection()` implemented; `Renderer::dispatch_ecosystem()` runs per-frame LOD selection
+- ✅ Stochastic LOD dither: per-ray Hash01(instanceId, pixelId, sampleIndex) selects one LOD tier — no simultaneous dual-LOD alpha blend; blue-noise for primary rays, hashed instance/sample noise for secondary, temporal scrambling for denoiser convergence — implemented in `path_trace.hlsl` `AnyHit_Primary`
+
+#### Foliage Alpha (Opacity Micromaps)
+- 🔲 DXR 1.2 OMM integration: attach pre-baked OMM bitmasks to BLAS build for LOD 0-2 alpha-tested foliage
+- ✅ AnyHit alpha-test fallback path for hardware without OMM support — stochastic AnyHit LOD-dither path in `path_trace.hlsl`
+
+#### Octahedral Impostors (LOD 3)
+- 🟡 Procedural AABB TLAS entry per far impostor instance — `PathTracer::build_vegetation_impostor_blas()` implemented and called from `Renderer::setup_ecosystem()` per species; impostor BLAS is selected dynamically once per-frame LOD selection promotes an instance to LOD3 (placement currently registers all instances at Near LOD)
+- ✅ Custom intersection shader: octahedral UV lookup, depth-offset parallax correction, reconstructed surface normal and hit position — `Intersection_Impostor` / `ClosestHit_Impostor` in `path_trace.hlsl`
+- ✅ Correct reflections, shadows, and grazing angles via per-ray depth reconstruction (not flat billboard)
+
+#### Wind & BLAS
+- 🟡 Wind compute shader: Bezier trunk/branch bend driven by WindDesc global wind vector; per-vertex bend weights from SpeedTree UV/colour channel — `vegetation_wind.hlsl` + `PathTracer::dispatch_vegetation_wind()` implemented; per-species output vertex buffer allocation and per-frame dispatch wiring still pending
+- 🟡 BLAS refit each frame for wind-deformed meshes (no full rebuild) — `PathTracer::build_vegetation_lod_blas()` builds ALLOW_UPDATE BLAS per LOD; refit invocation pending wind dispatch wiring
 - 🔲 Per-frame TLAS update for dynamic vegetation instances
-- 🔲 GPU frustum culling prepass (no Hi-Z / no rasterized depth)
 
 ### M11 — Particle System
 - 🔲 GPU compute particle simulation (Append/Consume buffers, up to 1M particles)

@@ -452,6 +452,81 @@ void ShadowMiss(inout ShadowPayload payload)
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// [shader("anyhit")]  AnyHit_Primary — stochastic LOD dithering + alpha cutout
+// For vegetation (and any other instance using LOD cross-fade), the per-LOD
+// instance carries an opacity weight `lod_alpha` in [0, 1]. A hash of the
+// pixel + frame + primitive id is compared to this weight: when the sample
+// exceeds the weight the hit is ignored (IgnoreHit()), causing the ray to
+// "see through" that LOD probabilistically. Two overlapping LODs with
+// complementary weights (a and 1-a) therefore produce a noise-free temporal
+// cross-fade once the denoiser/accumulator integrates several frames, which
+// is much cheaper than alpha-blending parallel LODs at hit time.
+// Instances that do not opt in keep lod_alpha == 1.0 and always accept.
+//
+// In addition, materials flagged as alpha-masked (bit 1 of mat.flags) perform
+// a per-texel alpha cutout against mat.alpha_cutoff. This is how SpeedTree
+// leaf / frond cards are rendered: the alpha channel of the base-color
+// texture is a binary mask, and texels with alpha < cutoff are discarded so
+// the underlying geometry (and shadows) can show through the card's empty
+// regions. Because the same hit group is bound for shadow rays (the primary
+// TraceRay call shares contribution index 0 with the shadow trace), this
+// any-hit shader runs for both primary and shadow rays — making cutout
+// leaves cast correctly punched-out shadows without any extra plumbing.
+//
+// Note on pre-multiplied alpha: SpeedTree atlases store color values that
+// have already been multiplied by alpha. For *cutout* rendering this does
+// not change the discard decision (still alpha < cutoff), and the closest-
+// hit shader samples the same texture so the leaf color also matches.
+// ---------------------------------------------------------------------------
+[shader("anyhit")]
+void AnyHit_Primary(inout PrimaryPayload payload, in BuiltInTriangleIntersectionAttributes attr)
+{
+    GpuInstanceData inst = g_InstanceBuffer[g_Frame.instance_buffer_slot][InstanceIndex()];
+    GpuMaterialData mat  = FetchMaterial(g_Frame.material_buffer_slot, inst.material_index);
+
+    // ---- Alpha cutout (SpeedTree-style foliage cards) ----------------------
+    // Performed first because it is a hard reject and cheaper than a hash.
+    const bool alpha_masked = (mat.flags & 0x2u) != 0u;
+    if (alpha_masked && mat.base_color_tex != 0xFFFFFFFFu)
+    {
+        TriangleVertices tri = FetchInterpolatedVertex(InstanceIndex(),
+                                                       PrimitiveIndex(),
+                                                       attr.barycentrics);
+        float a = SampleTextureLevel0(mat.base_color_tex, tri.uv).a
+                  * mat.base_color_factor.a;
+        if (a < mat.alpha_cutoff)
+        {
+            IgnoreHit();
+            return;
+        }
+    }
+
+    // Fast path: fully opaque instances accept the hit unconditionally.
+    if (inst.lod_alpha >= 1.0f)
+        return;
+
+    // Fully transparent instances reject unconditionally.
+    if (inst.lod_alpha <= 0.0f)
+    {
+        IgnoreHit();
+        return;
+    }
+
+    // Per-pixel + per-frame + per-primitive hash, so neighbouring pixels make
+    // independent decisions and the dither pattern animates frame-to-frame
+    // (the denoiser then integrates it into a smooth cross-fade).
+    uint2 px    = DispatchRaysIndex().xy;
+    uint  seed  = PcgSeed(px, g_Frame.frame_index)
+                  + InstanceIndex() * 83492791u
+                  + PrimitiveIndex() * 19349663u;
+    float r     = PcgRand(seed);
+
+    if (r >= inst.lod_alpha)
+        IgnoreHit();
+}
+
+// ---------------------------------------------------------------------------
 // [shader("closesthit")]  ClosestHit — basic PBR shading (single directional light)
 // ---------------------------------------------------------------------------
 [shader("closesthit")]
@@ -731,4 +806,158 @@ void ClosestHit(inout PrimaryPayload payload, in BuiltInTriangleIntersectionAttr
     payload.hit_t      = RayTCurrent();
     payload.missed     = 0u;
     payload.sec_normal = N;
+}
+
+// ===========================================================================
+// Octahedral impostor — procedural-AABB BLAS + custom intersection
+//
+// LOD 3 vegetation is drawn as a procedural AABB primitive in the TLAS. The
+// box bounds the species silhouette and stores an octahedral atlas of view-
+// dependent radiance + packed depth. At intersection time we:
+//   1. Compute the slab-test entry/exit of the ray against the AABB in
+//      object space (axis-aligned, centred at origin, half-extent =
+//      inst.impostor_half_extent).
+//   2. Pick the impostor plane perpendicular to the dominant axis of the
+//      view direction, evaluate the parallax-corrected entry point on it.
+//   3. Encode the view direction with an octahedral wrap onto the atlas and
+//      sample BaseColor+Opacity (.rgb / .a) and packed depth (encoded into
+//      the green channel of an auxiliary slot or, for the bring-up path
+//      below, just the alpha; the runtime baker may swap in the full packed
+//      atlas without changing this shader).
+//   4. Reject the hit (IgnoreHit()) when opacity falls below the species
+//      alpha cutoff; otherwise ReportHit() with the parallax-adjusted depth.
+//
+// ClosestHit_Impostor consumes the attribute payload and writes radiance /
+// motion / G-buffer slots so the impostor blends seamlessly with triangle
+// LODs already handled by ClosestHit.
+// ===========================================================================
+struct ImpostorAttr
+{
+    float2 atlas_uv;     // sampled atlas texel UV (octahedral encoded)
+    float2 view_dir_xy;  // packed view direction (sign extracted in ClosestHit)
+};
+
+// Octahedral encoding: map a unit vector on the sphere to a [0,1]^2 square.
+float2 OctEncode(float3 n)
+{
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    float2 e = n.xy;
+    if (n.z < 0.0f)
+        e = (1.0f - abs(e.yx)) * float2(n.x >= 0.0f ? 1.0f : -1.0f,
+                                        n.y >= 0.0f ? 1.0f : -1.0f);
+    return e * 0.5f + 0.5f;
+}
+
+// Slab test against an axis-aligned box centred at origin, half-extent he.
+bool IntersectAABB(float3 ro, float3 rd, float he, out float t_near, out float t_far)
+{
+    float3 inv = 1.0f / rd;
+    float3 t0  = (-he.xxx - ro) * inv;
+    float3 t1  = ( he.xxx - ro) * inv;
+    float3 tmin = min(t0, t1);
+    float3 tmax = max(t0, t1);
+    t_near = max(max(tmin.x, tmin.y), tmin.z);
+    t_far  = min(min(tmax.x, tmax.y), tmax.z);
+    return t_far >= max(t_near, 0.0f);
+}
+
+[shader("intersection")]
+void Intersection_Impostor()
+{
+    GpuInstanceData inst = g_InstanceBuffer[g_Frame.instance_buffer_slot][InstanceIndex()];
+
+    // Only true impostor instances have a valid atlas slot. If a non-impostor
+    // BLAS ever ends up routed through this hit group (mis-configuration),
+    // skip silently rather than reading from an invalid SRV.
+    if (inst.impostor_atlas_srv == 0xFFFFFFFFu)
+        return;
+
+    float3 ro = ObjectRayOrigin();
+    float3 rd = ObjectRayDirection();
+
+    float t_near, t_far;
+    if (!IntersectAABB(ro, rd, inst.impostor_half_extent, t_near, t_far))
+        return;
+
+    // Use the front face of the slab as the impostor plane hit.
+    float  t_hit  = max(t_near, RayTMin());
+    if (t_hit > t_far || t_hit > RayTCurrent())
+        return;
+
+    // View direction is the ray direction in object space pointing toward
+    // the camera (i.e. the negated propagation direction). Octahedral
+    // encoding samples the pre-baked view grid.
+    float3 view_dir = normalize(-rd);
+    float2 atlas_uv = OctEncode(view_dir);
+
+    // Quantise to the (impostor_view_count x impostor_view_count) view grid
+    // so each cell corresponds to one baked octahedral view.
+    float  grid  = max(1.0f, (float)inst.impostor_view_count);
+    float2 cell  = floor(atlas_uv * grid) / grid;
+    float2 inner = saturate(atlas_uv * grid - floor(atlas_uv * grid));
+
+    // For the bring-up atlas layout we assume per-cell sub-UVs are simply the
+    // inner barycentric coordinates of the cell; the baker is free to refine
+    // this packing later (the intersection shader contract is just the atlas
+    // slot + uv).
+    float2 sample_uv = cell + inner / grid;
+
+    // Sample opacity from the atlas alpha channel. The full packed-depth
+    // atlas can substitute richer encoding without changing this shader.
+    float4 atlas_sample = g_Textures[inst.impostor_atlas_srv]
+                              .SampleLevel(g_SamplerLinear, sample_uv, 0);
+
+    // Stochastic alpha test (matches the stochastic LOD dither philosophy).
+    if (atlas_sample.a < 0.5f)
+        return;
+
+    ImpostorAttr attr;
+    attr.atlas_uv    = sample_uv;
+    attr.view_dir_xy = view_dir.xy;
+    ReportHit(t_hit, /*hitKind*/ 0u, attr);
+}
+
+[shader("closesthit")]
+void ClosestHit_Impostor(inout PrimaryPayload payload, in ImpostorAttr attr)
+{
+    GpuInstanceData inst = g_InstanceBuffer[g_Frame.instance_buffer_slot][InstanceIndex()];
+
+    // Sample the impostor atlas for radiance / base colour.
+    float4 atlas_sample = g_Textures[inst.impostor_atlas_srv]
+                              .SampleLevel(g_SamplerLinear, attr.atlas_uv, 0);
+    float3 baseColor = atlas_sample.rgb;
+
+    // Reconstruct a world-space hit point and a best-effort normal: octahedral
+    // impostors do not store true geometry, so we approximate the surface
+    // normal by the view direction (camera-facing) which keeps shading stable
+    // for distant LOD3 vegetation without introducing facet artifacts.
+    float3 worldPos = WorldRayOrigin() + WorldRayDirection() * RayTCurrent();
+    float3 V        = (payload.depth == 0u)
+                          ? normalize(g_Frame.camera_pos - worldPos)
+                          : normalize(-WorldRayDirection());
+    float3 N        = V;
+
+    // Direct sun contribution with the basic Lambert response; the full PBR
+    // path is not warranted for distant impostors and would over-darken them.
+    float  NdotL    = saturate(dot(N, normalize(-g_Frame.sun_direction)));
+    float3 direct   = baseColor * g_Frame.sun_color * (g_Frame.sun_intensity * NdotL);
+
+    // Write the minimal G-buffer slots so DLSS/denoiser temporal feedback
+    // remains coherent across LOD transitions.
+    if (payload.depth == 0u)
+    {
+        uint2 pixelIdx = DispatchRaysIndex().xy;
+        if (g_Frame.albedo_uav_slot != 0xFFFFFFFFu)
+            g_AlbedoUAV[g_Frame.albedo_uav_slot][pixelIdx] = float4(baseColor, 1.0f);
+        if (g_Frame.normals_uav_slot != 0xFFFFFFFFu)
+            g_NormalsUAV[g_Frame.normals_uav_slot][pixelIdx] = float4(N * 0.5f + 0.5f, 1.0f);
+        if (g_Frame.roughness_uav_slot != 0xFFFFFFFFu)
+            g_RoughnessUAV[g_Frame.roughness_uav_slot][pixelIdx] = 1.0f;
+    }
+
+    payload.radiance   = direct;
+    payload.hit_t      = RayTCurrent();
+    payload.missed     = 0u;
+    payload.sec_normal = N;
+    payload.motion_vec = float2(0.0f, 0.0f);
 }

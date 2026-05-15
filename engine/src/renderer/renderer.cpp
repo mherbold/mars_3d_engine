@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <format>
 #include <cmath>
+#include <filesystem>
 #include <windows.h>
 
 namespace mars
@@ -128,6 +129,12 @@ void Renderer::shutdown()
     m_denoiser.shutdown();
     m_anim_system.shutdown();
     m_scene.unload();
+    // Release ecosystem GPU buffers BEFORE the resource manager tears down the
+    // D3D12MA allocator. Otherwise these D3D12MA::Allocations outlive their
+    // parent memory block and trip the
+    // "Some allocations were not freed before destruction of this memory block!"
+    // assertion inside D3D12MemAlloc on shutdown.
+    m_ecosystem_gpu.destroy();
     m_resource_mgr.shutdown();
     release_frame_resources();
     m_display_manager.shutdown();
@@ -641,10 +648,19 @@ bool Renderer::load_scene(const std::string& marsscene_path)
 
     MARS_LOG("[Renderer] Total TLAS instances to build: {}", tlas_instance);
 
+    // M10: Bring up ecosystem GPU resources (species LOD BLASes, density
+    // texture, etc.) *before* we build the TLAS so vegetation instances can
+    // be included in the initial TLAS build.
+    setup_ecosystem();
+
     // Build the TLAS and flush.
     throw_if_failed(m_cmd_allocators[0]->Reset(), "CmdAlloc::Reset (load_scene)");
     throw_if_failed(m_cmd_list->Reset(m_cmd_allocators[0].Get(), nullptr),
                     "CmdList::Reset (load_scene)");
+
+    // M10: Run vegetation placement on the GPU, read back placed instances,
+    // and append them to cpu_instances + reserve TLAS slots.
+    place_and_register_vegetation(tlas_instance, cpu_instances, cpu_materials);
 
     rebuild_tlas();
 
@@ -670,6 +686,472 @@ void Renderer::rebuild_tlas()
 }
 
 // ---------------------------------------------------------------------------
+// setup_ecosystem (M10 step-10)
+//
+// Best-effort scene-load-time ecosystem bring-up. This:
+//   - Loads each species' LOD models via ResourceManager::load_model (using
+//     AssetImporter::import_vegetation_species to resolve SpeedTree ORCA v2
+//     layouts).
+//   - Builds a refittable BLAS for each LOD mesh and a procedural-AABB BLAS
+//     for the Impostor LOD.
+//   - Loads the density-map texture via ResourceManager::load_texture and
+//     records its bindless SRV slot on the EcosystemDesc.
+//
+// GPU-buffer allocation for the instance/counter/species tables and TLAS
+// instance reservation are intentionally not performed here — they require
+// dedicated structured-buffer helpers that are not yet part of the engine's
+// public API. The remaining setup paths will be filled in as those helpers
+// land; until then `m_ecosystem_placed` stays false and dispatch_ecosystem()
+// is a no-op.
+// ---------------------------------------------------------------------------
+void Renderer::setup_ecosystem()
+{
+    EcosystemDesc& eco = m_scene.ecosystem();
+    if (!eco.enabled || eco.species.empty())
+    {
+        m_ecosystem_placed = false;
+        m_ecosystem_dirty  = false;
+        return;
+    }
+
+    MARS_LOG("[Renderer] setup_ecosystem: {} species, max_instances={}, density='{}'",
+             eco.species.size(), eco.max_instances, eco.density_map_path);
+
+    // ---- Density map ---------------------------------------------------------
+    if (!eco.density_map_path.empty())
+    {
+        uint32_t slot = m_resource_mgr.load_texture(m_device_ctx, eco.density_map_path,
+                                                    /*is_srgb=*/false);
+        if (slot != UINT32_MAX)
+            eco.density_map_srv = slot;
+        else
+            MARS_LOG("[Renderer] setup_ecosystem: failed to load density map '{}'",
+                     eco.density_map_path);
+    }
+
+    // ---- Species assets + per-LOD BLAS --------------------------------------
+    namespace fs = std::filesystem;
+    auto find_first_fbx = [](const fs::path& dir) -> std::string
+    {
+        if (!fs::exists(dir) || !fs::is_directory(dir)) return {};
+        for (const auto& e : fs::directory_iterator(dir))
+            if (e.is_regular_file() && e.path().extension() == ".fbx")
+                return e.path().string();
+        return {};
+    };
+
+    for (auto& sp : eco.species)
+    {
+        if (sp.asset_path.empty())
+            continue;
+
+        const fs::path base = sp.asset_path;
+        const std::string high_fbx = find_first_fbx(base / "HighPoly");
+        const std::string low_fbx  = find_first_fbx(base / "LowPoly");
+
+        const std::string lod_paths[3] = { high_fbx, low_fbx, low_fbx }; // FarCluster reuses LowPoly
+
+        for (uint32_t li = 0; li < 3u; ++li)
+        {
+            if (lod_paths[li].empty()) continue;
+            // Vegetation FBXs (SpeedTree ORCA) consist of many independently-
+            // placed submeshes (trunk / branches / leaves / fronds) whose final
+            // positions are encoded in per-node transforms, and they are exported
+            // in centimetres. Bake both into the vertex positions so the BLAS is
+            // built in a single, world-scale, flat coordinate space.
+            uint32_t mi = m_resource_mgr.load_model(m_device_ctx, lod_paths[li],
+                                                    /*pre_transform_vertices=*/true);
+            if (mi == UINT32_MAX) continue;
+            sp.model_indices[li] = mi;
+
+            const GpuModel& m = m_resource_mgr.model(mi);
+            if (m.mesh_buffers.empty()) continue;
+
+            // Build one refittable BLAS per submesh. SpeedTree FBX assets split a
+            // tree into many submeshes (bark / branches / leaves / fronds),
+            // each with its own material; registering one TLAS instance per
+            // submesh later lets each one shade with the correct textures.
+            // Each submesh gets an output vertex buffer (UAV) so the per-frame
+            // wind compute pass can deform it and refit the BLAS each frame.
+            //
+            // Leaf / frond submeshes are flagged as non-opaque so the path
+            // tracer's any-hit shader is invoked and can perform per-texel
+            // alpha-cutout rejection. Trunk/branch submeshes stay opaque to
+            // keep the BVH traversal fast on the bulk of the geometry.
+            sp.blas_indices[li].clear();
+            sp.blas_indices[li].reserve(m.mesh_buffers.size());
+            for (size_t mi_idx = 0; mi_idx < m.mesh_buffers.size(); ++mi_idx)
+            {
+                auto& mb = m_resource_mgr.model(mi).mesh_buffers[mi_idx];
+                // Allocate wind deformation output buffer (UAV + SRV).
+                // This seeds the buffer with rest-pose data and registers
+                // the bindless slots used by dispatch_vegetation_wind.
+                mb.enable_wind_deform(m_device_ctx, m_resource_mgr.allocator());
+
+                const uint32_t src_mat = (mi_idx < m.mesh_material_indices.size())
+                                         ? m.mesh_material_indices[mi_idx] : 0u;
+                const bool alpha_masked = (src_mat < m.materials.size())
+                                          && m.materials[src_mat].alpha_masked;
+                sp.blas_indices[li].push_back(
+                    m_path_tracer.build_vegetation_lod_blas(m_device_ctx, mb,
+                                                             /*opaque=*/!alpha_masked));
+            }
+        }
+
+        // Impostor LOD: build a procedural-AABB BLAS using the species' bounds.
+        if (sp.model_indices[0] != UINT32_MAX)
+        {
+            const GpuModel& m0 = m_resource_mgr.model(sp.model_indices[0]);
+            const auto i_idx = static_cast<size_t>(VegetationLOD::Impostor);
+            sp.blas_indices[i_idx].clear();
+            sp.blas_indices[i_idx].push_back(
+                m_path_tracer.build_vegetation_impostor_blas(
+                    m_device_ctx, m0.bounds.min_pt, m0.bounds.max_pt));
+        }
+
+        MARS_LOG("[Renderer]   Species '{}': submeshes/LOD = [{},{},{},{}]",
+                 sp.name,
+                 sp.blas_indices[0].size(), sp.blas_indices[1].size(),
+                 sp.blas_indices[2].size(), sp.blas_indices[3].size());
+    }
+
+    // ---- GPU resources: instance buffer, atomic counter, species table -----
+    // Pack per-species LOD distance thresholds (must match SpeciesGpu in
+    // vegetation_lod_selection.hlsl: 4 floats per species).
+    const uint32_t species_count = static_cast<uint32_t>(eco.species.size());
+    std::vector<float> species_table(static_cast<size_t>(species_count) * 4u);
+    for (uint32_t i = 0; i < species_count; ++i)
+    {
+        species_table[i * 4 + 0] = eco.species[i].lod_near_max;
+        species_table[i * 4 + 1] = eco.species[i].lod_mid_max;
+        species_table[i * 4 + 2] = eco.species[i].lod_far_max;
+        species_table[i * 4 + 3] = eco.species[i].max_draw_distance;
+    }
+
+    m_ecosystem_gpu.destroy();
+    m_ecosystem_gpu.create(m_device_ctx,
+                           m_resource_mgr.allocator(),
+                           eco.max_instances,
+                           species_count,
+                           species_table.data());
+
+    eco.instance_buffer_uav  = m_ecosystem_gpu.instance_uav();
+    eco.instance_counter_uav = m_ecosystem_gpu.counter_uav();
+    eco.species_buffer_srv   = m_ecosystem_gpu.species_srv();
+
+    MARS_LOG("[Renderer] setup_ecosystem: GPU buffers ready (instance_uav={}, counter_uav={}, species_srv={})",
+             eco.instance_buffer_uav, eco.instance_counter_uav, eco.species_buffer_srv);
+
+    m_ecosystem_placed = false;
+    m_ecosystem_dirty  = false;
+}
+
+// ---------------------------------------------------------------------------
+// place_and_register_vegetation (M10)
+//
+// Synchronously runs the GPU placement compute shader, reads back the atomic
+// instance counter and the produced VegetationInstanceGpu records, then
+// appends each placed instance as a TLAS instance and a CpuInstanceData entry.
+// Must be invoked between m_cmd_list reset and rebuild_tlas() in load_scene().
+// ---------------------------------------------------------------------------
+void Renderer::place_and_register_vegetation(uint32_t&                          tlas_instance,
+                                             std::vector<CpuInstanceData>&      cpu_instances,
+                                             std::vector<CpuMaterialData>&      cpu_materials)
+{
+    EcosystemDesc& eco = m_scene.ecosystem();
+    if (!eco.enabled || eco.species.empty())
+        return;
+
+    if (eco.instance_buffer_uav  == UINT32_MAX ||
+        eco.instance_counter_uav == UINT32_MAX ||
+        eco.species_buffer_srv   == UINT32_MAX ||
+        eco.density_map_srv      == UINT32_MAX)
+    {
+        MARS_LOG("[Renderer] place_and_register_vegetation: ecosystem resources not ready, skipping");
+        return;
+    }
+
+    ID3D12Resource* counter_default  = m_ecosystem_gpu.counter_resource();
+    ID3D12Resource* instance_default = m_ecosystem_gpu.instance_resource();
+    ID3D12Resource* counter_readback = m_ecosystem_gpu.counter_readback();
+    ID3D12Resource* instance_readback= m_ecosystem_gpu.instance_readback();
+    if (!counter_default || !instance_default || !counter_readback || !instance_readback)
+        return;
+
+    // Bind the bindless heap so the placement shader can write through it.
+    ID3D12DescriptorHeap* heaps[] = { m_device_ctx.bindless_heap() };
+    m_cmd_list->SetDescriptorHeaps(1, heaps);
+
+    // Counter is in COMMON; dispatch writes via UAV — Common -> UAV is implicit
+    // for buffers, but barrier explicitly to satisfy the validation layer.
+    D3D12_RESOURCE_BARRIER pre[2]{};
+    pre[0] = CD3DX12_RESOURCE_BARRIER::Transition(counter_default,
+                D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    pre[1] = CD3DX12_RESOURCE_BARRIER::Transition(instance_default,
+                D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    m_cmd_list->ResourceBarrier(2, pre);
+
+    // Dispatch placement
+    m_path_tracer.dispatch_vegetation_placement(m_cmd_list.Get(), eco);
+
+    // UAV -> CopySource for readback
+    D3D12_RESOURCE_BARRIER post[2]{};
+    post[0] = CD3DX12_RESOURCE_BARRIER::Transition(counter_default,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    post[1] = CD3DX12_RESOURCE_BARRIER::Transition(instance_default,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    m_cmd_list->ResourceBarrier(2, post);
+
+    m_cmd_list->CopyResource(counter_readback, counter_default);
+
+    const uint64_t instance_bytes = static_cast<uint64_t>(eco.max_instances) * 64ull;
+    m_cmd_list->CopyBufferRegion(instance_readback, 0, instance_default, 0, instance_bytes);
+
+    // Restore the default-heap resources to COMMON so subsequent passes
+    // (LOD selection / wind) can transition them as needed.
+    D3D12_RESOURCE_BARRIER end[2]{};
+    end[0] = CD3DX12_RESOURCE_BARRIER::Transition(counter_default,
+                D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    end[1] = CD3DX12_RESOURCE_BARRIER::Transition(instance_default,
+                D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    m_cmd_list->ResourceBarrier(2, end);
+
+    // Flush so the readback is CPU-visible.
+    throw_if_failed(m_cmd_list->Close(), "CmdList::Close (place_vegetation)");
+    ID3D12CommandList* lists[] = { m_cmd_list.Get() };
+    m_device_ctx.direct_queue()->ExecuteCommandLists(1, lists);
+    m_device_ctx.flush_gpu();
+
+    // Re-open the command list so the caller can continue recording (rebuild_tlas).
+    throw_if_failed(m_cmd_allocators[0]->Reset(), "CmdAlloc::Reset (place_vegetation)");
+    throw_if_failed(m_cmd_list->Reset(m_cmd_allocators[0].Get(), nullptr),
+                    "CmdList::Reset (place_vegetation)");
+
+    // Read back placement results.
+    const uint32_t placed_count_raw = m_ecosystem_gpu.read_counter();
+    const uint32_t placed_count     = std::min(placed_count_raw, eco.max_instances);
+    eco.instance_count = placed_count;
+
+    MARS_LOG("[Renderer] place_and_register_vegetation: GPU reported {} placed instances (clamped to {})",
+             placed_count_raw, placed_count);
+
+    if (placed_count == 0)
+        return;
+
+    struct VegetationInstanceGpu {
+        float    position_scale[4];
+        float    rotation[4];
+        uint32_t species_index;
+        uint32_t current_lod;
+        uint32_t tlas_instance;
+        float    wind_phase_offset;
+        float    lod_dither;
+        uint32_t _pad0;
+        uint32_t _pad1;
+        uint32_t _pad2;
+    };
+    static_assert(sizeof(VegetationInstanceGpu) == 64, "VegetationInstanceGpu must be 64 bytes");
+
+    std::vector<VegetationInstanceGpu> instances(placed_count);
+    m_ecosystem_gpu.read_instances(instances.data(), placed_count);
+
+    // Reserve runtime CPU-side vegetation instance table so dispatch_ecosystem
+    // and later systems can iterate them if needed.
+    eco.instances.clear();
+    eco.instances.reserve(placed_count);
+
+    // ---- Build per-species per-LOD per-submesh material slots ---------------
+    // SpeedTree FBXs split a tree into many submeshes (bark / branches /
+    // leaves / fronds), each with its own material. We allocate one
+    // CpuMaterialData per (species,lod,submesh) and remember the slot in
+    // SpeciesDesc::material_indices so all instances of the same species
+    // share them (cheap; one slot per submesh, not per tree).
+    auto ensure_species_materials = [&](SpeciesDesc& sp)
+    {
+        for (size_t lod = 0; lod < static_cast<size_t>(VegetationLOD::Count); ++lod)
+        {
+            if (!sp.material_indices[lod].empty()) continue;
+            const uint32_t mi = sp.model_indices[lod];
+            if (mi == UINT32_MAX) continue;
+            const GpuModel& gm = m_resource_mgr.model(mi);
+            sp.material_indices[lod].resize(gm.mesh_buffers.size(), 0u);
+
+            for (size_t s = 0; s < gm.mesh_buffers.size(); ++s)
+            {
+                CpuMaterialData mat{};
+                mat.base_color_factor[0] = 1.0f;
+                mat.base_color_factor[1] = 1.0f;
+                mat.base_color_factor[2] = 1.0f;
+                mat.base_color_factor[3] = 1.0f;
+                mat.roughness_factor     = 1.0f;
+                mat.alpha_cutoff         = 0.5f;
+                // Default to opaque double-sided (foliage is double-sided).
+                // The alpha-masked bit is set per-submesh below from the
+                // imported MaterialData::alpha_masked flag — SpeedTree FBX
+                // exports mark leaf/frond cards via material/texture naming,
+                // which the importer's name heuristic detects.
+                mat.flags = 0x1u; // bit0=double_sided
+
+                const uint32_t src_mat = (s < gm.mesh_material_indices.size())
+                                         ? gm.mesh_material_indices[s] : 0u;
+                if (src_mat < gm.texture_slots.size())
+                    mat.base_color_tex = gm.texture_slots[src_mat];
+                if (src_mat < gm.normal_slots.size())
+                    mat.normal_tex = gm.normal_slots[src_mat];
+                if (src_mat < gm.mr_slots.size())
+                    mat.metallic_roughness_tex = gm.mr_slots[src_mat];
+
+                if (src_mat < gm.materials.size())
+                {
+                    const auto& src = gm.materials[src_mat];
+                    mat.base_color_factor[0] = src.base_color_factor.x;
+                    mat.base_color_factor[1] = src.base_color_factor.y;
+                    mat.base_color_factor[2] = src.base_color_factor.z;
+                    mat.base_color_factor[3] = src.base_color_factor.w;
+                    mat.metallic_factor      = src.metallic_factor;
+                    mat.roughness_factor     = src.roughness_factor;
+                    mat.alpha_cutoff         = src.alpha_cutoff;
+                    if (src.double_sided) mat.flags |= 0x1u;
+                    if (src.alpha_masked) mat.flags |= 0x2u; // alpha-tested foliage card
+                }
+
+                sp.material_indices[lod][s] = static_cast<uint32_t>(cpu_materials.size());
+                cpu_materials.push_back(mat);
+            }
+        }
+    };
+
+    for (uint32_t i = 0; i < placed_count; ++i)
+    {
+        const VegetationInstanceGpu& g = instances[i];
+        if (g.species_index >= eco.species.size())
+            continue;
+
+        SpeciesDesc& sp = eco.species[g.species_index];
+        ensure_species_materials(sp);
+
+        // Initial LOD = Near; per-frame compute pass updates it later.
+        const auto lod_idx = static_cast<size_t>(VegetationLOD::Near);
+        if (sp.blas_indices[lod_idx].empty())
+            continue;
+        if (sp.model_indices[lod_idx] == UINT32_MAX)
+            continue;
+
+        // Build a world transform from position+scale+rotation.
+        const Vec3       pos   { g.position_scale[0], g.position_scale[1], g.position_scale[2] };
+        const float      scale = g.position_scale[3];
+        const Quaternion rot   { g.rotation[0], g.rotation[1], g.rotation[2], g.rotation[3] };
+
+        Transform xf;
+        xf.position = pos;
+        xf.rotation = rot;
+        xf.scale    = scale;
+        const Mat4x4 world = xf.to_matrix();
+
+        const GpuModel& m0 = m_resource_mgr.model(sp.model_indices[lod_idx]);
+
+        // Register one TLAS instance per submesh so each gets its own
+        // BLAS, vertex/index SRVs and material (textures).
+        const size_t submesh_count = sp.blas_indices[lod_idx].size();
+        uint32_t first_tlas_for_inst = tlas_instance;
+        for (size_t s = 0; s < submesh_count; ++s)
+        {
+            const uint32_t blas_idx = sp.blas_indices[lod_idx][s];
+            if (blas_idx == UINT32_MAX) continue;
+            if (s >= m0.mesh_buffers.size()) break;
+
+            const uint32_t mat_idx = (s < sp.material_indices[lod_idx].size())
+                                     ? sp.material_indices[lod_idx][s] : 0u;
+
+            CpuInstanceData inst_data{};
+            memcpy(inst_data.world_transform,               world.m, sizeof(world.m));
+            memcpy(inst_data.world_transform_inv_transpose, world.m, sizeof(world.m));
+            inst_data.material_index    = mat_idx;
+            // Use the wind-deformed (skinned output) vertex buffer if one was allocated so
+            // that FetchInterpolatedVertex reads deformed positions/normals/UVs, keeping
+            // shadow ray origins and surface normals consistent with the actual BLAS geometry.
+            // Falls back to the rest-pose buffer for non-wind LODs (e.g., Impostor).
+            inst_data.vertex_buffer_srv = (m0.mesh_buffers[s].skinned_vertex_srv_slot() != UINT32_MAX)
+                                          ? m0.mesh_buffers[s].skinned_vertex_srv_slot()
+                                          : m0.mesh_buffers[s].vertex_srv_slot();
+            inst_data.index_buffer_srv  = m0.mesh_buffers[s].index_srv_slot();
+            // Supply the compact float3 prev-position buffer so the closest-hit shader
+            // can compute per-vertex motion vectors for denoiser / TAA reprojection.
+            // Without this the denoiser sees zero object motion and produces blur/ghosting
+            // on wind-animated trees. The wind compute shader writes last frame's deformed
+            // positions here before computing the new positions each frame.
+            inst_data.prev_vertex_buffer_srv = m0.mesh_buffers[s].wind_prev_pos_srv_slot();
+            cpu_instances.push_back(inst_data);
+
+            m_path_tracer.set_instance(tlas_instance, blas_idx, world, mat_idx);
+            ++tlas_instance;
+        }
+
+        // Record runtime vegetation entry (track the first TLAS slot).
+        VegetationInstance vi{};
+        vi.transform         = xf;
+        vi.species_index     = g.species_index;
+        vi.current_lod       = VegetationLOD::Near;
+        vi.tlas_instance     = first_tlas_for_inst;
+        vi.wind_phase_offset = g.wind_phase_offset;
+        eco.instances.push_back(vi);
+    }
+
+    m_ecosystem_placed = true;
+    m_ecosystem_dirty  = false;
+
+    // Ensure per-species spring oscillators are sized to match (reset to zero).
+    m_species_wind_states.assign(eco.species.size(), SpeciesWindState{});
+
+    MARS_LOG("[Renderer] place_and_register_vegetation: registered {} vegetation TLAS instances (total now {})",
+             eco.instances.size(), tlas_instance);
+
+    (void)cpu_materials;  // unused for now; future per-species materials may need it
+}
+
+// ---------------------------------------------------------------------------
+// dispatch_ecosystem (M10 step-10)
+//
+// Per-frame ecosystem GPU work. Runs vegetation placement once (when
+// instance/counter/species GPU resources are valid), and vegetation LOD
+// selection every frame thereafter. Wind deformation + BLAS refit per LOD
+// will be wired in once the per-species output vertex buffers are allocated.
+// ---------------------------------------------------------------------------
+void Renderer::dispatch_ecosystem()
+{
+    EcosystemDesc& eco = m_scene.ecosystem();
+    if (!eco.enabled || eco.species.empty())
+        return;
+
+    // Required GPU resources for placement / LOD selection. If any are still
+    // unset, ecosystem setup hasn't completed — skip silently.
+    if (eco.instance_buffer_uav  == UINT32_MAX ||
+        eco.instance_counter_uav == UINT32_MAX ||
+        eco.species_buffer_srv   == UINT32_MAX ||
+        eco.density_map_srv      == UINT32_MAX)
+    {
+        return;
+    }
+
+    // One-shot placement.
+    if (!m_ecosystem_placed)
+    {
+        // Placement is now performed synchronously at scene-load time inside
+        // place_and_register_vegetation(); if for some reason it did not run
+        // we still mark the flag here so we don't keep retrying.
+        m_ecosystem_placed = true;
+        m_ecosystem_dirty  = true;
+    }
+
+    // Per-frame LOD selection. Uses the primary output's camera.
+    if (eco.instance_count > 0 && !m_cameras.empty())
+    {
+        m_path_tracer.dispatch_vegetation_lod_selection(
+            m_cmd_list.Get(), eco, m_cameras[0].position, m_frame_index);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // update — advance animation, update rigid-node transforms
 // ---------------------------------------------------------------------------
 void Renderer::update(float delta_time)
@@ -681,6 +1163,7 @@ void Renderer::update(float delta_time)
     // window-move stall).
     static constexpr float k_max_cloth_dt = 1.0f / 15.0f;  // absolute ceiling: discard runaway frames
     m_last_delta_time          = std::min(delta_time, k_max_cloth_dt);
+    m_elapsed_time_seconds    += m_last_delta_time;
     m_cloth_time_accumulator  += m_last_delta_time;
 
     // ---- Animated wind evaluation ------------------------------------------
@@ -732,11 +1215,28 @@ void Renderer::update(float delta_time)
         target.x += micro_amp * std::sin(m_wind_state.micro_phase_x);
         target.z += micro_amp * std::sin(m_wind_state.micro_phase_z);
 
-        // 5. One-pole IIR smoother: output = lerp(target, prev_output, smoothing).
-        float s = std::max(0.0f, std::min(wd.response_smoothing, 0.9999f));
-        m_wind_current.x = target.x + s * (m_wind_current.x - target.x);
-        m_wind_current.y = target.y + s * (m_wind_current.y - target.y);
-        m_wind_current.z = target.z + s * (m_wind_current.z - target.z);
+        // 5. Frame-rate-independent one-pole IIR smoother.
+        //    s_base is the per-frame coefficient at the reference rate of 60 fps.
+        //    The equivalent continuous time-constant is: tau = -1 / (60 * ln(s_base)).
+        //    We then compute the actual per-frame alpha from the real dt so the
+        //    feel is identical at any frame rate.
+        {
+            const float s_base = std::max(0.0f, std::min(wd.response_smoothing, 0.9999f));
+            float alpha;
+            if (s_base < 1e-4f)
+            {
+                alpha = 1.0f; // instant (no smoothing requested)
+            }
+            else
+            {
+                // tau_s [seconds] — derived from 60fps reference; independent of dt.
+                const float tau_s = -1.0f / (60.0f * std::log(s_base));
+                alpha = 1.0f - std::exp(-dt2 / std::max(tau_s, 1e-4f));
+            }
+            m_wind_current.x += alpha * (target.x - m_wind_current.x);
+            m_wind_current.y += alpha * (target.y - m_wind_current.y);
+            m_wind_current.z += alpha * (target.z - m_wind_current.z);
+        }
     }
 
     // Advance all animation states on the CPU.
@@ -823,6 +1323,10 @@ void Renderer::render_frame_path_traced()
     ID3D12DescriptorHeap* heaps[] = { m_device_ctx.bindless_heap() };
     m_cmd_list->SetDescriptorHeaps(1, heaps);
 
+    // M10: Ecosystem per-frame GPU work (vegetation placement / LOD select).
+    // Must run before any TLAS rebuild that consumes ecosystem instances.
+    dispatch_ecosystem();
+
     // ---- GPU skinning pass --------------------------------------------------
     // For each animated scene instance: evaluate bone palette on CPU, upload it,
     // dispatch the skinning compute shader, then refit the BLAS.
@@ -904,8 +1408,143 @@ void Renderer::render_frame_path_traced()
                                  ci.mesh_buffer.index_buffer_resource());
     }
 
+    // ---- GPU vegetation wind deformation + BLAS refit ----------------------
+    // For each active species / LOD / submesh: deform the rest-pose vertex
+    // buffer into the output (wind) buffer via the wind compute shader, issue
+    // a UAV barrier, then refit the refittable BLAS. All placed instances of
+    // the same species share the same BLAS, so one dispatch per submesh is
+    // enough regardless of instance count.
+    bool any_vegetation_wind = false;
+    {
+        EcosystemDesc& eco = m_scene.ecosystem();
+        if (eco.enabled && m_ecosystem_placed)
+        {
+            const Vec3  wind_dir      = [&]{ Vec3 d = m_wind_current;
+                                              float len = std::sqrt(d.x*d.x + d.y*d.y + d.z*d.z);
+                                              return len > 1e-4f ? Vec3{d.x/len, d.y/len, d.z/len}
+                                                                 : Vec3{1.f,0.f,0.f}; }();
+            const float wind_strength = std::sqrt(m_wind_current.x*m_wind_current.x +
+                                                   m_wind_current.y*m_wind_current.y +
+                                                   m_wind_current.z*m_wind_current.z);
+
+            // Only deform LODs that have placed instances (Near/Mid/FarCluster).
+            constexpr VegetationLOD k_wind_lods[] = {
+                VegetationLOD::Near, VegetationLOD::Mid, VegetationLOD::FarCluster };
+
+            const float spring_dt = m_last_delta_time;
+
+            for (size_t sp_idx = 0; sp_idx < eco.species.size(); ++sp_idx)
+            {
+                SpeciesDesc& sp = eco.species[sp_idx];
+
+                // ---------------------------------------------------------------
+                // Per-species damped spring oscillator
+                //
+                // Models the trunk as a second-order damped harmonic oscillator
+                // driven by the normalised wind speed (wind_t_target ∈ [0,1]):
+                //
+                //   ẍ + 2ζω₀ẋ + ω₀²x = ω₀² · wind_t_target
+                //
+                //   ω₀   = 2π × 0.22 Hz  →  ~4.5 s natural period
+                //   ζ    = 0.28           →  lightly underdamped (1-2 overshoots)
+                //
+                // Result: trunk_envelope builds up over ~3-4 s, overshoots
+                // slightly on gusts, and decays slowly when wind drops.
+                // This is the only layer that uses the spring; branches and
+                // leaves use wind_t_raw (instant) for hierarchical contrast.
+                //
+                // Per-species phase offset: a deterministic fractional offset
+                // derived from the species index ensures different species are
+                // out of phase and never animate in synchrony.
+                // ---------------------------------------------------------------
+                const float wind_t_target = std::min(wind_strength / 20.0f, 1.0f);
+
+                // Pseudorandom per-species phase offset in [0, 2π).
+                // Uses a simple integer hash (golden-ratio mixing) so each
+                // species index maps to a unique, well-distributed offset.
+                const uint32_t hash_val    = static_cast<uint32_t>(sp_idx) * 2654435761u;
+                const float    sp_phase    = static_cast<float>(hash_val >> 8) / static_cast<float>(1u << 24);
+                // sp_phase ∈ [0, 1) → convert to radians in dispatch call
+
+                if (sp_idx < m_species_wind_states.size())
+                {
+                    SpeciesWindState& ws = m_species_wind_states[sp_idx];
+
+                    // Natural frequency: 0.22 Hz → ~4.5 s period, matching a large tree's
+                    // fundamental sway mode.  Damping ratio 0.28 → lightly underdamped:
+                    // ~1-2 gentle overshoots before settling, ~3-4 s build-up / decay.
+                    constexpr float k_w0      = 6.28318f * 0.22f; // rad/s  (0.22 Hz)
+                    constexpr float k_zeta    = 0.28f;             // damping ratio
+                    constexpr float k_2zw0    = 2.0f * k_zeta * k_w0;
+                    constexpr float k_w0sq    = k_w0 * k_w0;
+
+                    // Semi-implicit Euler integration (stable even at large dt).
+                    const float accel = k_w0sq * (wind_t_target - ws.pos) - k_2zw0 * ws.vel;
+                    ws.vel += accel  * spring_dt;
+                    ws.pos += ws.vel * spring_dt;
+                    ws.pos  = std::max(0.0f, ws.pos);  // can't push below zero
+                }
+
+                const float trunk_envelope = (sp_idx < m_species_wind_states.size())
+                                             ? std::min(m_species_wind_states[sp_idx].pos, 1.5f)
+                                             : wind_t_target;
+
+                for (VegetationLOD lod : k_wind_lods)
+                {
+                    const auto li = static_cast<size_t>(lod);
+                    if (sp.model_indices[li] == UINT32_MAX) continue;
+                    if (sp.blas_indices[li].empty())        continue;
+
+                    const GpuModel& gm = m_resource_mgr.model(sp.model_indices[li]);
+
+                    for (size_t si = 0; si < sp.blas_indices[li].size(); ++si)
+                    {
+                        const uint32_t blas_idx = sp.blas_indices[li][si];
+                        if (blas_idx == UINT32_MAX)              continue;
+                        if (si >= gm.mesh_buffers.size())        break;
+
+                        const GpuMeshBuffer& mb = gm.mesh_buffers[si];
+                        if (!mb.skinned_vertex_buffer())         continue;
+                        if (mb.skinned_vertex_uav_slot() == UINT32_MAX) continue;
+
+                        // Mesh bounds for height-based per-vertex weighting.
+                        const float mesh_min_y  = gm.bounds.min_pt.y;
+                        const float mesh_height = gm.bounds.max_pt.y - gm.bounds.min_pt.y;
+
+                        m_path_tracer.dispatch_vegetation_wind(
+                            m_cmd_list.Get(),
+                            mb.vertex_count(),
+                            mb.vertex_srv_slot(),
+                            mb.skinned_vertex_uav_slot(),
+                            mb.wind_prev_pos_uav_slot(),
+                            mesh_min_y,
+                            mesh_height,
+                            wind_dir,
+                            wind_strength,
+                            m_elapsed_time_seconds,
+                            sp_phase * 6.28318f,  // per-species pseudorandom phase offset
+                            sp.wind_primary_bend,
+                            sp.wind_secondary_sway,
+                            sp.wind_leaf_flutter,
+                            trunk_envelope);
+
+                        // UAV barrier: ensure wind output is visible to BLAS refit.
+                        D3D12_RESOURCE_BARRIER uav_barrier{};
+                        uav_barrier.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                        uav_barrier.UAV.pResource = mb.skinned_vertex_buffer();
+                        m_cmd_list->ResourceBarrier(1, &uav_barrier);
+
+                        m_path_tracer.refit_blas(m_device_ctx, m_cmd_list.Get(),
+                                                 blas_idx, mb);
+                        any_vegetation_wind = true;
+                    }
+                }
+            }
+        }
+    }
+
     // Rebuild TLAS once if any BLAS was refitted this frame.
-    if (any_skinned || m_rigid_nodes_dirty || m_cloth_dirty)
+    if (any_skinned || m_rigid_nodes_dirty || m_cloth_dirty || any_vegetation_wind)
         rebuild_tlas();
 
     for (uint32_t oi = 0; oi < m_display_manager.output_count(); ++oi)
