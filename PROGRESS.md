@@ -3,7 +3,15 @@
 ---
 
 ## Current Focus
-M9 (Animation System) is complete, including GPU cloth simulation for waving flags and an animated wind system. The cloth solver is a canonical XPBD implementation (INTEGRATE → CONSTRAIN×N → FINALIZE, 3-position-state buffers, implicit velocity). Wind is driven by a layered CPU oscillator model (gust + direction wander + micro-turbulence + IIR smoothing) parsed from the `WindDesc` schema in `.marsscene`. Ready to proceed with M10 (Ecosystem / Vegetation + Wind).
+M10 (Ecosystem / Vegetation) is substantially implemented. Remaining M10 work: GPU frustum-cull prepass, offline OMM bake, offline impostor bake, per-frame TLAS update for dynamic instances.
+
+Sky rendering (part of M5/M8 scene infrastructure) has been extended with three selectable modes via `"type"` in the `"skybox"` scene block:
+
+- **`"debug"`** — the original procedural colour-coded cube-face sky with grids and crosshair.
+- **`"physical"`** — a new analytic non-debug procedural atmosphere (Rayleigh/Mie approximation in `path_trace.hlsl`).
+- **`"hdri"`** — equirectangular HDRI environment map loaded from an `.exr` or `.hdr` file specified by the `"hdri"` key.
+
+HDRI loading uses **tinyexr v1.0.9** (+ split miniz from the same deps tree) for `.exr` files, wired into `texture_loader.cpp`. The implementation (tinyexr + miniz) is compiled in separate third-party translation units (`exr_loader.cpp`, `miniz.c`) with `/W0 /WX-` to keep upstream warnings out of the strict engine build. `test_scene.marsscene` is currently configured with `"type": "hdri"` pointing at `models/hdri/DaySkyHDRI007B_8K_HDR.exr`.
 
 ---
 
@@ -28,12 +36,12 @@ M9 (Animation System) is complete, including GPU cloth simulation for waving fla
 | M2 | Multi-monitor display system | ✅ | `DisplayManager::load_config()` parses `display.json`; falls back to single monitor 0 / 90° FOV / center role when absent. `MonitorRole` enum: Center / Left / Right / Overhead / Custom. |
 | M3 | Asset pipeline: FBX/glTF load + GPU upload | ✅ | Vertex layout: position\|normal\|tangent\|uv\|bone\_indices\|bone\_weights; stride = 76 bytes (hardcoded in HLSL fetch). `GpuMeshBuffer` registers both a structured-buffer SRV (vertex) and a `ByteAddressBuffer` SRV (index) in the bindless heap. |
 | M4 | DXR pipeline: primary rays, basic PBR hit shader | ✅ | Miss shader is a procedural colour-coded cube-face skybox (not a real sky); physical sky is planned for M8+. Motion vectors and linear depth UAVs are written by the ray-gen shader each frame. `copy_to_back_buffer()` accepts a `use_denoised` flag to blit `denoised_output_resource` instead of the raw path-tracer UAV. |
-| M5 | Scene file parser, static scene rendering | ✅ | `SceneLoader` populates `Scene` with `SceneModelInstance`, `LightDesc`, `CameraDesc`, and `SkyboxDesc`. `FlyCamera` (WASD + mouse-look) lives in `camera.h` alongside `Camera`; it is the camera used by `test_app`. `Camera::advance_frame()` saves previous-frame matrices and applies Halton jitter for DLSS temporal accumulation. |
+| M5 | Scene file parser, static scene rendering | ✅ | `SceneLoader` populates `Scene` with `SceneModelInstance`, `LightDesc`, `CameraDesc`, and `SkyboxDesc`. `FlyCamera` (WASD + mouse-look) lives in `camera.h` alongside `Camera`; it is the camera used by `test_app`. `Camera::advance_frame()` saves previous-frame matrices and applies Halton jitter for DLSS temporal accumulation. `SkyboxDesc::Type` now has three values: `Debug`, `Physical`, `HDRI`; selected via `"type"` in the `"skybox"` scene block. HDRI loads `.exr` files via tinyexr; `.hdr` files via DirectXTex `LoadFromHDRFile`. |
 | M6 | DLSS 4 integration (SR, RR, MFG) | ✅ | DLSS-RR temporal stability fully resolved post-M8: depth buffer corrected to NDC projected depth; motion vectors corrected to NDC space with proper sign, Y-flip, and scale; `cameraMotionIncluded = eTrue`; `clipToPrevClip` set to identity when MVs carry full camera motion. See Notes in AGENTS.md. |
 | M7 | ReSTIR DI + real G-buffer AOV writes | ✅ | FrameConstants extended with 4 AOV UAV slots; path_tracer.cpp root signature expanded (spaces 5–8); AOV textures allocated and filled each frame; ClosestHit writes real diffuse albedo / specular F0 / world normals / roughness to DLSS-RR G-buffer; ReSTIR DI direct lighting via RIS + shadow ray replaces the old flat NdotL; restir_di.hlsli contains shared reservoir math; DXR-dependent helpers (RIS_GenerateCandidates, ReservoirShade + shadow TraceRay) live in path_trace.hlsl; verified: dxc -T lib_6_3 compiles with -WX clean |
 | M8 | ReSTIR GI — multi-bounce global illumination | ✅ | GI implemented as BRDF-importance-sampled MC estimator with configurable bounce depth (`gi_bounce_count`; 0=off, 1=single, 2=two-bounce). Russian Roulette path termination at depth >= 1. RTPSO max recursion = 3. Reservoir-based temporal/spatial reuse removed after debugging — see Notes. DLSS-RR denoises the noisy indirect signal. |
-| M9 | Animation system + skeletal mesh rendering | ✅ | Cloth sim: canonical XPBD solver (INTEGRATE → CONSTRAIN×N → FINALIZE), 3-position-state buffers, implicit velocity, compliance-based constraints, `final_srv` inversion bug fixed. Animated wind: `WindDesc` layered oscillator (gust + direction wander + micro + IIR smoother), parsed from `.marsscene`. |
-| M10 | Ecosystem / vegetation + wind | 🔲 Not started | Octahedral impostors (not flat billboards); stochastic LOD dither (no alpha blend); DXR 1.2 OMM for alpha foliage; SpeedTree ORCA v2 asset compatibility (Boston Fern, European Linden, Hedge, Japanese Maple, Red Maple Young, White Oak). |
+| M9 | Animation system + skeletal mesh rendering | ✅ | Cloth sim: canonical XPBD solver (INTEGRATE → CONSTRAIN×N → FINALIZE), 3-position-state buffers, implicit velocity, compliance-based constraints, `final_srv` inversion bug fixed. Global wind system (`WindDesc`) was implemented then **removed** — replaced by per-instance procedural cloth (`wind_direction`, `wave_amplitude`) and time-based tree bend. |
+| M10 | Ecosystem / vegetation + wind | 🔄 In progress | Core placement, LOD selection, stochastic dither, impostor BLAS, AnyHit alpha-test, and procedural vegetation/cloth motion all implemented. Remaining: GPU frustum-cull prepass, offline OMM bake, offline impostor bake, per-frame TLAS update for dynamic instances. SpeedTree ORCA v2 compatible (European Linden confirmed working). |
 | M11 | Particle system | 🔲 Not started |
 | M12 | Weather system (rain, clouds, fog) | 🔲 Not started |
 | M13 | Decal system (tire tracks, skid marks) | 🔲 Not started |
@@ -158,8 +166,9 @@ M9 (Animation System) is complete, including GPU cloth simulation for waving fla
 - ✅ PathTracer integration: build_skinned_blas(), dispatch_skinning(), refit_blas() — skinning dispatch, bone palette upload, and per-frame BLAS refit
 - ✅ Scene integration: animated mesh instances, clip assignment, playback control — SceneLoader parses `"animation"` blocks; Renderer creates AnimationState per instance, builds skinned BLASes, dispatches GPU skinning and BLAS refit each frame
 - ✅ Rigid node animation (wheels, doors, flags) — `RigidNodeInstance` in scene types; `SceneLoader` parses `"rigid_nodes"` array; `Renderer::update()` evaluates clip, composes world transform, updates TLAS slot; TLAS rebuilt when any rigid node moves
-- ✅ Compute cloth simulation for waving flags (spring lattice, wind vector) — `ClothDesc`/`ClothInstance` in scene types; `SceneLoader` parses `"cloth"` array; `GpuMeshBuffer::create_cloth_mesh()` procedural grid; `ClothGpuResources` ping-pong buffers; `cloth_sim.hlsl` two-pass compute (INTEGRATE + CONSTRAIN); `PathTracer::create_cloth_pipeline()` / `dispatch_cloth_sim()`; `Renderer` dispatches cloth each frame, refits BLAS, then rebuilds TLAS
-- ✅ Cloth solver: red-black Gauss-Seidel constraint relaxation (alternating checkerboard sub-passes via `color_pass` constant); per-type separate accumulators (structural/shear/bend averaged independently) to prevent spring-type cross-dilution; scene-driven wind via top-level `"wind"` field in `.marsscene`; renderer cloth delta-time clamped to 1/30s to survive window-drag stalls
+- ✅ Compute cloth simulation for waving flags — `ClothDesc`/`ClothInstance` in scene types; `SceneLoader` parses `"cloth"` array; `GpuMeshBuffer::create_cloth_mesh()` procedural grid; `ClothGpuResources` ping-pong buffers; `cloth_sim.hlsl` compute (WAVE → INTEGRATE → CONSTRAIN×N → FINALIZE); `PathTracer::create_cloth_pipeline()` / `dispatch_cloth_sim()`; `Renderer` dispatches cloth each frame, refits BLAS, then rebuilds TLAS
+- ✅ Cloth solver: XPBD compliance-based constraints; per-type separate accumulators (structural/shear/bend averaged independently); PASS 3 WAVE injects traveling sine wave into `pos_curr` each substep using per-instance `wind_direction` + `wave_amplitude` from `ClothDesc`; renderer cloth delta-time clamped to 1/30s to survive window-drag stalls
+- ✅ Global wind system (`WindDesc`, CPU layered oscillator, `m_species_wind_states`, spring envelope) **removed** — replaced by per-instance procedural motion for cloth and trees
 - ✅ ~~FABRIK IK solver for foot placement~~ (removed from scope — pit crew animations are pre-baked)
 
 ### M10 — Procedural Ecosystem / Vegetation + Wind
@@ -186,9 +195,11 @@ M9 (Animation System) is complete, including GPU cloth simulation for waving fla
 - ✅ Custom intersection shader: octahedral UV lookup, depth-offset parallax correction, reconstructed surface normal and hit position — `Intersection_Impostor` / `ClosestHit_Impostor` in `path_trace.hlsl`
 - ✅ Correct reflections, shadows, and grazing angles via per-ray depth reconstruction (not flat billboard)
 
-#### Wind & BLAS
-- 🟡 Wind compute shader: Bezier trunk/branch bend driven by WindDesc global wind vector; per-vertex bend weights from SpeedTree UV/colour channel — `vegetation_wind.hlsl` + `PathTracer::dispatch_vegetation_wind()` implemented; per-species output vertex buffer allocation and per-frame dispatch wiring still pending
-- 🟡 BLAS refit each frame for wind-deformed meshes (no full rebuild) — `PathTracer::build_vegetation_lod_blas()` builds ALLOW_UPDATE BLAS per LOD; refit invocation pending wind dispatch wiring
+#### Procedural Vegetation Motion & BLAS
+- ✅ Vegetation deformation compute shader (`vegetation_wind.hlsl`): pure time-based circular trunk bend (`primary_bend_strength`, `primary_bend_circle_time`) + constant leaf flutter (`wind_leaf_flutter`); per-species pseudorandom phase offset; cantilever beam deflection curve for natural trunk shape; no wind direction or physics simulation
+- ✅ `PathTracer::dispatch_vegetation_wind()` updated to new parameter layout (16 DWORDs); `SpeciesDesc` fields renamed (`primary_bend_strength`, `primary_bend_circle_time`, `wind_leaf_flutter`); scene loader and scene file updated
+- ✅ Per-species output vertex buffer allocation (`enable_wind_deform()`) and per-frame dispatch wired in `Renderer::render_frame_path_traced()`
+- ✅ BLAS refit each frame for deformed meshes — `PathTracer::build_vegetation_lod_blas()` builds ALLOW_UPDATE BLAS per LOD; refit called after each dispatch + UAV barrier
 - 🔲 Per-frame TLAS update for dynamic vegetation instances
 
 ### M11 — Particle System
@@ -299,6 +310,9 @@ M9 (Animation System) is complete, including GPU cloth simulation for waving fla
 
 | Decision |
 |---|
+| **Global wind system removed.** `WindDesc`, the layered CPU oscillator (gust + direction wander + micro + IIR smoother), `m_species_wind_states`, and the spring-envelope inertia model have been fully removed from the engine. Replaced by two independent per-instance procedural systems: (1) vegetation uses a pure time-based circular bend in `vegetation_wind.hlsl`; (2) cloth uses a new PASS 3 (WAVE) traveling sine wave in `cloth_sim.hlsl`. |
+| **Vegetation procedural motion uses time-only inputs — no wind vector.** `primary_bend_strength` (amplitude) and `primary_bend_circle_time` (seconds per full rotation) control the constant imperceptible trunk bend. `wind_leaf_flutter` controls constant-amplitude leaf flutter. This eliminates all CPU-side spring physics and GPU wind direction tracking. |
+| **Cloth wave pass (Option A) added as PASS 3 in `cloth_sim.hlsl`.** Injects a traveling sine wave into `pos_curr` before INTEGRATE each substep. Per-instance `wind_direction` (Vec3) and `wave_amplitude` (float) are parsed from `ClothDesc` in the scene file, replacing the old global `wind` vector from `WindDesc`. |
 | DirectX 12 + DXR chosen as the sole graphics API — no Vulkan, no OpenGL |
 | DLSS 4 as primary upscaler/denoiser/frame generator (Transformer model, Multi Frame Generation); FSR 4 / FSR 3 as open-source AMD fallback |
 | ReSTIR DI + ReSTIR GI chosen for lighting; no baked lightmaps |
@@ -321,6 +335,9 @@ M9 (Animation System) is complete, including GPU cloth simulation for waving fla
 | **`view_proj` passed to shaders must be `proj * view` (not `view * proj`).** HLSL `mul(M, v)` is column-vector (M × v). The C++ side must therefore compute `prev_view_proj = proj * view` when packing `FrameConstants`. Reversing the order produces garbage clip-space coordinates resulting in enormous garbage motion vectors. |
 | **`prev_view_proj` must be seeded to the current VP on the very first frame.** Leaving it zero-initialised on frame 0 produces NaN/Inf motion vectors that permanently corrupt DLSS-RR's history buffer. Detect first frame in `Renderer::set_camera()` and initialise `cam.prev_view_proj = curr_view_proj`. |
 | **Render resolution and display resolution must be explicitly separate throughout the pipeline.** DLSS-RR upscales from render resolution to display resolution. Path-tracer noisy-color, motion-vector, depth, and AOV textures must be allocated at render resolution; the denoised output UAV must be allocated at display resolution. Mixing the two causes the image to appear viewport-offset or cropped. |
+| **Sky mode is a three-way enum (`Debug`, `Physical`, `HDRI`) written into `FrameConstants::sky_mode` and branched in the DXR miss shader.** `Debug` = 0 (coloured cube faces + grid + crosshair), `Physical` = 1 (analytic procedural atmosphere), `HDRI` = 2 (equirectangular texture sampled via `g_Textures[hdri_sky_slot]`). Selected by `"type"` in the `"skybox"` scene block. |
+| **`DirectX::LoadFromHDRFile` only decodes Radiance `.hdr` — it cannot read OpenEXR `.exr` files.** Using it for `.exr` silently returns a failed HRESULT, causing `load_texture()` to return `UINT32_MAX` and the renderer to fall back to the debug sky. Fix: route `.exr` through tinyexr (`LoadEXR` → RGBA float32 → `DXGI_FORMAT_R32G32B32A32_FLOAT` `ScratchImage` → existing GPU upload path). |
+| **Compile tinyexr and miniz in dedicated third-party translation units (`exr_loader.cpp`, `miniz.c`) with `/W0 /WX-` via `set_source_files_properties`.** This prevents upstream warnings from failing the strict `/WX` engine build. `texture_loader.cpp` includes `tinyexr.h` with `TINYEXR_USE_MINIZ 0` (declarations only); `exr_loader.cpp` defines `TINYEXR_IMPLEMENTATION` and `TINYEXR_USE_MINIZ 1` (one implementation TU). |
 
 ## Notes & Lessons Learned
 **Agents:** This section is for recording any additional notes, observations, or lessons learned during implementation that may be useful for future agents working on the codebase. Update this section with any such insights, along with any relevant context or links to discussions.

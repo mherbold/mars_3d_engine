@@ -23,6 +23,8 @@ list(APPEND ENGINE_SOURCES
     "src/renderer/denoiser.cpp"
     "src/renderer/renderer.cpp"
     "src/asset/asset_importer.cpp"
+    "src/asset/exr_loader.cpp"
+    "src/asset/miniz.c"
     "src/asset/gpu_mesh_buffer.cpp"
     "src/asset/texture_loader.cpp"
     "src/asset/resource_manager.cpp"
@@ -32,6 +34,14 @@ list(APPEND ENGINE_SOURCES
     "src/animation/animation_system.cpp"
 )
 list(REMOVE_DUPLICATES ENGINE_SOURCES)
+
+# Third-party source files are compiled with warnings suppressed (/W0 /WX-)
+# so that upstream code issues don't fail our strict /WX build.
+set_source_files_properties(
+    "src/asset/exr_loader.cpp"
+    "src/asset/miniz.c"
+    PROPERTIES COMPILE_OPTIONS "/W0;/WX-"
+)
 
 list(APPEND ENGINE_HEADERS
     "include/mars_engine/renderer/device_context.h"
@@ -88,6 +98,7 @@ target_include_directories(mars_engine
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${d3d12memoryallocator_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/third_party
 )
 
 # -----------------------------------------------------------------------------

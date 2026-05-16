@@ -1,60 +1,26 @@
 // #profile cs_6_6
 // =============================================================================
-// vegetation_wind.hlsl  --  MARS GPU vegetation wind deformation
+// vegetation_wind.hlsl  --  MARS GPU vegetation procedural deformation
 //
-// Implements a physically-motivated three-layer hierarchical wind model.
+// Implements a pure time-based two-layer procedural motion model.
+// There is no wind direction or physics simulation; all motion is driven by
+// elapsed time and per-species/per-vertex deterministic parameters.
 //
 // ── Layer 1: Primary Trunk Bend ──────────────────────────────────────────────
-//   The trunk is treated as a fixed-base cantilever beam under a distributed
-//   horizontal load.  Displacement follows the analytic beam deflection curve:
+//   The trunk bends with a constant amplitude (primary_bend_strength) whose
+//   direction rotates in a complete circle over primary_bend_circle_time
+//   seconds.  Deflection follows the analytic cantilever beam curve:
 //
 //       d(h) = (3h² − h³) / 2
 //
 //   which enforces zero displacement AND zero slope at the root (h = 0) and
-//   maximum displacement at the crown (h = 1).  The resulting S-curved arc is
-//   how real trunks bend under wind — they curve, not rotate rigidly at the
-//   base.
+//   maximum displacement at the crown (h = 1).
 //
-//   The driving amplitude is NOT the instantaneous wind speed.  Instead it is
-//   `trunk_envelope`, a damped second-order spring output computed on the CPU
-//   (natural frequency ≈ 0.22 Hz, ζ ≈ 0.28).  This gives the trunk mass-like
-//   inertia: it builds up over ~3-4 s when a gust arrives and decays equally
-//   slowly when it subsides, with a small overshoot from the underdamped
-//   response.  Trunks are slow to react to wind changes.
-//
-// ── Layer 2: Branch Sway ─────────────────────────────────────────────────────
-//   Branches respond to localised wind drag and turbulence.  The motion is
-//   computed procedurally: four inharmonic sinusoids at different frequencies
-//   and spatial phases are summed to approximate the stochastic, aperiodic
-//   pattern of natural turbulence.  Each vertex's world position seeds its own
-//   unique phase so adjacent branches are never in synchrony.
-//
-//   Two orthogonal displacement components (along-wind and cross-wind) produce
-//   the elliptical orbital paths real branches trace.  Branches react faster
-//   than the trunk — they use `wind_t_raw` (the instantaneous normalised wind
-//   speed) so their amplitude responds within one frame.
-//
-// ── Layer 3: Leaf Detail Bending ─────────────────────────────────────────────
-//   Individual leaf vertices ripple and flutter via a combination of high-
-//   frequency sinusoids and a vertex-position noise seed.  Two uncorrelated
-//   oscillators at frequencies ~9.5 Hz and ~14.3 Hz are mixed with unequal
-//   weights to break periodicity.  The flutter is present even in calm
-//   conditions (wind_t_raw floor = 0.15) and uses a sqrt curve so there is
-//   always visible motion.  Leaves react almost instantly to wind changes.
-//
-// ── Phase Variation ──────────────────────────────────────────────────────────
-//   `wind_phase_offset` is a per-species pseudorandom offset (derived on the
-//   CPU from a golden-ratio integer hash of the species index) that ensures
-//   different tree species are never animated in synchronised lockstep.
-//   Within a single tree, all three layers derive additional spatial phase
-//   variation from vertex world-position coordinates, so branches and leaves
-//   within the same mesh are individually differentiated.
-//
-// ── Scaling ──────────────────────────────────────────────────────────────────
-//   wind_strength is in m/s.  Beaufort 3 (gentle breeze) ≈ 5 m/s; Beaufort 9
-//   (strong gale) ≈ 20 m/s.  All amplitudes are normalised against 20 m/s and
-//   scaled by mesh_height so proportional deformation is constant regardless
-//   of tree size.
+// ── Layer 2: Leaf Detail Flutter ─────────────────────────────────────────────
+//   Individual leaf vertices ripple via two uncorrelated high-frequency
+//   sinusoids seeded from vertex world-position.  The flutter is constant-
+//   amplitude; leaf_flutter_strength controls its magnitude and
+//   leaf_flutter_speed controls its rate.
 //
 // =============================================================================
 
@@ -67,21 +33,18 @@ struct WindConstants
 	uint   output_vertex_buffer_uav;   // RWByteAddressBuffer @ u0,space3
 	float  mesh_min_y;                 // Used to normalise height in the tree
 
-	float3 wind_direction;             // Normalised world-space wind direction
-	float  wind_strength;              // Wind speed, m/s
-
 	float  time_seconds;               // Global time (loops every ~6553s)
-	float  wind_phase_offset;          // Per-species/per-instance phase offset
-	float  primary_bend;               // Species trunk bend strength  [0..1]
-	float  secondary_sway;             // Species branch sway strength [0..1]
+	float  phase_offset;               // Per-species pseudorandom phase offset (radians)
+	float  primary_bend_strength;      // Trunk bend amplitude  [0..1]
+	float  primary_bend_speed;         // Trunk bend rotation speed (rotations per second)
 
-	float  leaf_flutter;               // Species leaf micro-flutter strength [0..1]
+	float  leaf_flutter_strength;      // Leaf micro-flutter amplitude [0..1]
+	float  leaf_flutter_speed;         // Leaf flutter speed multiplier [0..]
 	float  mesh_height;                // Height of the mesh AABB (for normalisation)
 	uint   prev_pos_buffer_uav;        // RWByteAddressBuffer for compact float3 prev positions
-	float  trunk_envelope;            // Spring-mass output from CPU [0..~1.5]: inertia-smoothed wind_t
+	uint   is_leaf_mesh;               // 1 = leaf/frond submesh
 
-	uint   is_leaf_mesh;               // 1 = leaf/frond submesh: flutter at all heights, not just upper canopy
-	float  leaf_envelope;              // IIR-smoothed wind_t for leaf flutter (~0.4 s time constant)
+	uint   _pad0;
 	uint   _pad1;
 	uint   _pad2;
 };
@@ -140,12 +103,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 	GpuVertex v = LoadVertex(g_Buffers[g_Wind.source_vertex_buffer_srv], vid);
 
 	// -------------------------------------------------------------------------
-	// Snapshot the current output position into the prev-pos buffer BEFORE
-	// computing the new deformed position. The closest-hit shader reads this
-	// compact float3 buffer (stride 12) to generate per-vertex motion vectors
-	// for the denoiser / TAA reprojection. On the very first frame the output
-	// buffer was seeded with rest-pose data by enable_wind_deform(), so the
-	// first-frame motion vector is correctly zero.
+	// Snapshot current output position into prev-pos buffer for motion vectors.
 	// -------------------------------------------------------------------------
 	{
 		const float3 cur_out_pos = asfloat(
@@ -155,165 +113,69 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 	}
 
 	// -------------------------------------------------------------------------
-	// Normalised height in tree, [0, 1]: roots = 0, crown = 1.
+	// Normalised height in tree [0, 1].
 	// -------------------------------------------------------------------------
 	const float h = saturate((v.position.y - g_Wind.mesh_min_y) /
 							  max(g_Wind.mesh_height, 1e-3));
 
-	// -------------------------------------------------------------------------
-	// Wind strength normalised to [0, 1] against a 20 m/s gale reference.
-	// wind_t_raw: instantaneous, used by Layer 2 (branches) and Layer 3 (leaves)
-	//             which are fast-reacting by design.
-	// trunk_env:  CPU spring-mass output; gives Layer 1 (trunk) its inertia.
-	//             Builds up / decays over ~3-4 s; may slightly overshoot.
-	// -------------------------------------------------------------------------
-	const float wind_t_raw = saturate(g_Wind.wind_strength / 20.0);
-	const float trunk_env  = saturate(g_Wind.trunk_envelope);
+	float3 displacement = float3(0.0, 0.0, 0.0);
 
-	// -------------------------------------------------------------------------
-	// Time arguments.
-	//   t_slow  — used for trunk and branch fundamentals; increases mildly with
-	//             wind so the tree doesn't spin like a top at high speed.
-	//   t_fast  — used for high-frequency branch harmonics and leaf flutter.
-	// Both incorporate wind_phase_offset so species are never in sync.
-	// -------------------------------------------------------------------------
-	const float speed_mod = 0.5 + wind_t_raw * 0.2;
-	const float t_slow = g_Wind.time_seconds * speed_mod       + g_Wind.wind_phase_offset;
-	const float t_fast = g_Wind.time_seconds * speed_mod * 1.4 + g_Wind.wind_phase_offset;
+	// =========================================================================
+	// Layer 1: PRIMARY TRUNK BEND (circular, time-based)
+	//
+	// The bend direction rotates once around the Y axis every
+	// primary_bend_circle_time seconds.  Amplitude is constant and equals
+	// primary_bend_strength scaled by mesh height.
+	// Deflection follows the cantilever curve d(h) = (3h² − h³) / 2.
+	// =========================================================================
+	const float trunk_curve = (3.0 * h * h - h * h * h) * 0.5;
 
-	// (wind_right removed — branch sway now operates in local XZ to stay
-	//  orientation-independent across randomly-rotated instances.)
+	const float bend_angle = g_Wind.time_seconds * max(g_Wind.primary_bend_speed, 0.0) * 6.28318
+							+ g_Wind.phase_offset;
 
-	// -------------------------------------------------------------------------
-	// Off-axis distance from the tree's vertical axis, normalised.
-	//   0 → trunk core   (only Layer 1 applied here)
-	//   1 → branch tip   (all three layers applied)
-	// -------------------------------------------------------------------------
+	const float bend_amp = trunk_curve
+						 * g_Wind.primary_bend_strength
+						 * max(g_Wind.mesh_height, 1.0) * 0.12;
+
+	displacement.x += cos(bend_angle) * bend_amp;
+	displacement.z += sin(bend_angle) * bend_amp;
+
+	// =========================================================================
+	// Layer 2: LEAF DETAIL FLUTTER
+	//
+	// Two uncorrelated high-frequency sinusoids seeded from vertex position.
+	// Applied to leaf/frond submeshes (is_leaf_mesh) at all heights, or to
+	// upper-canopy bark geometry above h > 0.55.
+	// =========================================================================
 	const float xz_dist  = length(v.position.xz);
-	const float off_axis = saturate(xz_dist * 0.35);   // 0=trunk core, 1=branch tip
+	const float off_axis = saturate(xz_dist * 0.35);
 
-	// =========================================================================
-	// Layer 1: PRIMARY TRUNK BEND
-	//
-	// Cantilever beam deflection: d(h) = (3h² − h³) / 2
-	//   h=0: d=0, d'=0  (root is clamped — no rigid rotation at the base)
-	//   h=1: d=1         (crown has maximum displacement)
-	//
-	// Two inharmonic trunk oscillators are summed for a subtle figure-8 sway
-	// rather than a pure back-and-forth pendulum.
-	//
-	// Amplitude driven by trunk_env (spring output) — NOT raw wind speed — so
-	// the trunk reacts slowly and with natural mass-like inertia.
-	// =========================================================================
-	const float trunk_curve     = (3.0 * h * h - h * h * h) * 0.5;
-	const float trunk_freq      = 0.7 + trunk_env * 0.25;         // Hz: slow primary sway
-	const float trunk_amplitude = trunk_curve
-								* g_Wind.primary_bend
-								* trunk_env
-								* max(g_Wind.mesh_height, 1.0) * 0.12;
-
-	// Circular orbit in local XZ: (cos(ωt), sin(ωt)).
-	// A circle is rotationally invariant — after any instance Y rotation the
-	// orbit shape is identical.  All trees sway the same amount and trace the
-	// same path; only their phase around the circle differs, which the eye reads
-	// as "all swaying in the same wind" rather than "facing different winds".
-	// A small second harmonic at an inharmonic ratio adds figure-8 character.
-	const float trunk_angle  = t_slow * trunk_freq * 6.28318;
-	const float trunk_osc_x  = cos(trunk_angle) + 0.18 * cos(trunk_angle * 2.13 + 0.9);
-	const float trunk_osc_z  = sin(trunk_angle) + 0.18 * sin(trunk_angle * 2.13 + 0.9);
-
-	float3 displacement = float3(trunk_osc_x, 0.0, trunk_osc_z) * trunk_amplitude;
-
-	// =========================================================================
-	// Layer 2: BRANCH SWAY
-	//
-	// Procedural stochastic motion: four inharmonic sinusoids at different
-	// frequencies and vertex-position-seeded spatial phases are summed to
-	// approximate the aperiodic turbulent patterns real branches exhibit.
-	//
-	// Vertex world-position is used as a unique phase seed so each branch
-	// vertex has its own oscillation phase — no two branches move identically.
-	//
-	// Two orthogonal components (along-wind + cross-wind) produce the elliptical
-	// orbital paths seen in nature.  Weight on cross-wind is ~45% of along-wind.
-	//
-	// Uses wind_t_raw: branches respond almost instantly to gusts, but because
-	// the trunk lags (spring), you see branches move first, trunk follows —
-	// the correct hierarchical order.
-	// =========================================================================
-	const float branch_h    = saturate((h - 0.15) * (1.0 / 0.85));  // zero below 15% height
-	const float branch_mask = branch_h * off_axis;
-
-	// Four inharmonic frequencies (ratios are irrational → never fully repeat).
-	const float vx = v.position.x;
-	const float vz = v.position.z;
-
-	// Per-vertex phase seeds derived from local position give each branch vertex
-	// its own oscillation phase.  cos/sin pairs per frequency produce circular
-	// orbits in local XZ; after any instance Y rotation the orbit is identical —
-	// so no tree looks like it's in a different wind.
-	const float p0 = vx * 0.93 + vz * 0.71;
-	const float p1 = vx * 1.41 + vz * 0.53 + 0.8;
-	const float p2 = vx * 2.07 + vz * 1.89 + 2.1;
-	const float p3 = vx * 0.67 + vz * 1.19 + 1.3;
-
-	const float2 b0 = float2(cos(t_slow * 2.20 * 6.28318 + p0), sin(t_slow * 2.20 * 6.28318 + p0));
-	const float2 b1 = float2(cos(t_slow * 3.67 * 6.28318 + p1), sin(t_slow * 3.67 * 6.28318 + p1));
-	const float2 b2 = float2(cos(t_fast * 1.13 * 6.28318 + p2), sin(t_fast * 1.13 * 6.28318 + p2));
-	const float2 b3 = float2(cos(t_fast * 1.73 * 6.28318 + p3), sin(t_fast * 1.73 * 6.28318 + p3));
-	const float2 branch_xz = b0 * 0.45 + b1 * 0.28 + b2 * 0.17 + b3 * 0.10;
-
-	const float branch_amp = g_Wind.secondary_sway * wind_t_raw * 0.40;
-
-	// Displace in local XZ (circular orbit per vertex); rotationally invariant.
-	displacement += float3(branch_xz.x, 0.0, branch_xz.y) * branch_amp * branch_mask;
-
-	// =========================================================================
-	// Layer 3: LEAF DETAIL BENDING
-	//
-	// Two uncorrelated high-
-	// frequency oscillators mixed with unequal weights to avoid periodicity.
-	// The vertex position seeds a unique phase per leaf so they are never in
-	// synchrony — each appears to flutter independently.
-	//
-	// A sqrt curve on leaf_envelope (+ 0.15 floor) keeps leaves alive in calm air
-	// and avoids the harsh on/off look of a linear threshold.
-	//
-	// Applied only to off-axis vertices to prevent trunk geometry from vibrating.
-	// For leaf submeshes the height gate is dropped (is_leaf_mesh flag).
-	// =========================================================================
-	// For leaf submeshes (is_leaf_mesh == 1) the height gate is dropped: every
-	// leaf vertex flutters regardless of where it sits on the tree. The off_axis
-	// mask still applies so trunk-core vertices never vibrate.
-	// For bark / branch geometry the original height gate (h > 0.55) is kept so
-	// the trunk and thick lower branches stay still.
 	const float flutter_mask = (g_Wind.is_leaf_mesh != 0u)
 		? saturate(off_axis * 2.0)
 		: saturate((h - 0.55) * 3.0) * saturate(off_axis * 2.0);
-	const float flutter_t    = sqrt(saturate(g_Wind.leaf_envelope + 0.15));
 
-	const float fp_a = v.position.x * 5.3 + v.position.y * 3.9 + v.position.z * 4.7;
-	const float fp_b = v.position.x * 7.1 + v.position.y * 5.3 + v.position.z * 6.9;
+	const float t_fast = g_Wind.time_seconds * 1.4 * max(g_Wind.leaf_flutter_speed, 0.0) + g_Wind.phase_offset;
 
-	// Two inharmonic oscillators at naturalistic leaf-flutter frequencies
-	// (~2-4 Hz). The irrational ratio (≈ 2:3 but not exact) ensures the
-	// combined waveform never exactly repeats.
-	const float flutter_a = sin(t_fast * 2.3  * 6.28318 + fp_a);
-	const float flutter_b = sin(t_fast * 3.5  * 6.28318 + fp_b + 2.4);
+	// High-frequency spatial seeds: large, incommensurate multipliers on all
+	// three axes so that leaves only a few centimetres apart differ
+	// significantly in phase.  The Y component deliberately uses a much
+	// higher and unrelated multiplier so height bands don't stay in-phase.
+	const float fp_a = v.position.x * 17.3 + v.position.z * 13.7 + v.position.y * 29.1;
+	const float fp_b = v.position.x * 23.9 + v.position.z * 19.1 + v.position.y * 11.7;
 
-	const float flutter_amp = g_Wind.leaf_flutter * flutter_t * 0.10;
+	const float flutter_a = sin(t_fast * 2.3 * 6.28318 + fp_a);
+	const float flutter_b = sin(t_fast * 3.5 * 6.28318 + fp_b + 2.4);
 
-	// Displace in XZ plane (tangential flutter) with a smaller Y component
-	// (vertical ripple — the leaf tilting up and down as it flutters).
+	const float flutter_amp = g_Wind.leaf_flutter_strength * 0.10;
+
 	displacement.x += (flutter_a * 0.65 + flutter_b * 0.35) * flutter_amp * flutter_mask;
-	displacement.y += (flutter_a * 0.20)                    * flutter_amp * flutter_mask;
-	displacement.z += (cos(t_fast * 2.3  * 6.28318 + fp_a)  * 0.65
-					+  cos(t_fast * 3.5  * 6.28318 + fp_b + 2.4) * 0.35)
+	displacement.y += (flutter_a * 0.15)                    * flutter_amp * flutter_mask;
+	displacement.z += (cos(t_fast * 2.3 * 6.28318 + fp_a) * 0.65
+					+  cos(t_fast * 3.5 * 6.28318 + fp_b + 2.4) * 0.35)
 					* flutter_amp * flutter_mask;
 
 	// =========================================================================
-	// Write output vertex (position only deformed; normals/tangents stay at
-	// rest-pose — small-angle approximation is acceptable for foliage).
+	// Write output vertex.
 	// =========================================================================
 	v.position += displacement;
 

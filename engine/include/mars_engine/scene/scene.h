@@ -103,10 +103,8 @@ public:
     const std::vector<LightDesc>&          lights()         const { return m_lights; }
     const std::vector<CameraDesc>&         cameras()        const { return m_cameras; }
     const SkyboxDesc&                      skybox()         const { return m_skybox; }
-    Vec3                                   wind()           const { return m_wind; }
-    const WindDesc&                        wind_desc()      const { return m_wind_desc; }
-    const EcosystemDesc&                   ecosystem()      const { return m_ecosystem; }
-    EcosystemDesc&                         ecosystem()            { return m_ecosystem; }
+    const std::vector<EcosystemDesc>&      ecosystems()     const { return m_ecosystems; }
+    std::vector<EcosystemDesc>&            ecosystems()           { return m_ecosystems; }
 
     bool is_loaded() const { return m_loaded; }
 
@@ -120,9 +118,7 @@ private:
     std::vector<LightDesc>          m_lights;
     std::vector<CameraDesc>         m_cameras;
     SkyboxDesc                      m_skybox;
-    Vec3                            m_wind      = {};
-    WindDesc                        m_wind_desc = {};
-    EcosystemDesc                   m_ecosystem = {};
+    std::vector<EcosystemDesc>      m_ecosystems;
     bool                            m_loaded = false;
 };
 

@@ -424,7 +424,7 @@ void PathTracer::create_cloth_pipeline(DeviceContext& ctx)
     {
         // 28 root constants (all ClothConstants fields packed as DWORDs)
         CD3DX12_ROOT_PARAMETER1 params[2]{};
-        params[0].InitAsConstants(28, 0, 0, D3D12_SHADER_VISIBILITY_ALL);
+        params[0].InitAsConstants(30, 0, 0, D3D12_SHADER_VISIBILITY_ALL);
 
         static constexpr UINT k_unbounded = UINT_MAX;
         static constexpr D3D12_DESCRIPTOR_RANGE_FLAGS k_volatile =
@@ -474,8 +474,8 @@ void PathTracer::create_cloth_pipeline(DeviceContext& ctx)
 // ---------------------------------------------------------------------------
 void PathTracer::dispatch_cloth_sim(ID3D12GraphicsCommandList6* cmd_list,
                                     ClothInstance&             ci,
-                                    const Vec3&                wind,
-                                    float                      delta_time)
+                                    float                      delta_time,
+                                    float                      time_seconds)
 {
     const ClothDesc& cd   = ci.cloth_desc;
     const uint32_t   n    = ci.vertex_count;
@@ -501,7 +501,7 @@ void PathTracer::dispatch_cloth_sim(ID3D12GraphicsCommandList6* cmd_list,
     cmd_list->SetPipelineState(m_cloth_pso.Get());
     cmd_list->SetComputeRootDescriptorTable(1, m_bindless_heap_gpu_start);
 
-    // ClothConstants HLSL layout (28 DWORDs):
+    // ClothConstants HLSL layout (30 DWORDs):
     //  [0]  grid_w       [1]  grid_h        [2]  vertex_count  [3]  delta_time
     //  [4..6] gravity    [7]  inv_mass
     //  [8..10] wind      [11] damping
@@ -514,6 +514,7 @@ void PathTracer::dispatch_cloth_sim(ID3D12GraphicsCommandList6* cmd_list,
     //  [24] sim_pass
     //  [25] constrain_read_srv   [26] constrain_write_uav
     //  [27] pin_corners
+    //  [28] wave_amplitude  [29] time_seconds
 
     const float    inv_mass   = (cd.mass > 0.0f) ? (1.0f / cd.mass) : 0.0f;
     auto&          gpu        = ci.gpu;
@@ -523,7 +524,7 @@ void PathTracer::dispatch_cloth_sim(ID3D12GraphicsCommandList6* cmd_list,
     uav_barrier.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     uav_barrier.UAV.pResource = nullptr;
 
-    auto fill_common = [&](uint32_t c[28])
+    auto fill_common = [&](uint32_t c[30])
     {
         c[ 0] = gw;
         c[ 1] = gh;
@@ -533,9 +534,9 @@ void PathTracer::dispatch_cloth_sim(ID3D12GraphicsCommandList6* cmd_list,
         c[ 5] = std::bit_cast<uint32_t>(-9.8f);
         c[ 6] = std::bit_cast<uint32_t>(0.0f);
         c[ 7] = std::bit_cast<uint32_t>(inv_mass);
-        c[ 8] = std::bit_cast<uint32_t>(wind.x);
-        c[ 9] = std::bit_cast<uint32_t>(wind.y);
-        c[10] = std::bit_cast<uint32_t>(wind.z);
+        c[ 8] = std::bit_cast<uint32_t>(cd.wind_direction.x);
+        c[ 9] = std::bit_cast<uint32_t>(cd.wind_direction.y);
+        c[10] = std::bit_cast<uint32_t>(cd.wind_direction.z);
         c[11] = std::bit_cast<uint32_t>(cd.damping);
         c[12] = std::bit_cast<uint32_t>(cd.structural_compliance);
         c[13] = std::bit_cast<uint32_t>(cd.shear_compliance);
@@ -549,17 +550,33 @@ void PathTracer::dispatch_cloth_sim(ID3D12GraphicsCommandList6* cmd_list,
         c[21] = gpu.pos_curr_uav();
         c[22] = gpu.pos_pred_a_uav();
         c[23] = gpu.output_vertex_uav();
+        c[28] = std::bit_cast<uint32_t>(cd.wave_amplitude);
+        c[29] = std::bit_cast<uint32_t>(time_seconds);
     };
+
+    // --- PASS 3: WAVE (procedural wave injection into pos_curr) -------------
+    if (cd.wave_amplitude > 0.0f)
+    {
+        uint32_t c[30]{};
+        fill_common(c);
+        c[24] = 3u;   // sim_pass = WAVE
+        c[25] = 0u;
+        c[26] = 0u;
+        c[27] = cd.pin_corners;
+        cmd_list->SetComputeRoot32BitConstants(0, 30, c, 0);
+        cmd_list->Dispatch(dispatch_x, 1, 1);
+        cmd_list->ResourceBarrier(1, &uav_barrier);
+    }
 
     // --- PASS 0: INTEGRATE ---------------------------------------------------
     {
-        uint32_t c[28]{};
+        uint32_t c[30]{};
         fill_common(c);
         c[24] = 0u;   // sim_pass = INTEGRATE
         c[25] = 0u;   // constrain_read_srv  (unused)
         c[26] = 0u;   // constrain_write_uav (unused)
         c[27] = cd.pin_corners;
-        cmd_list->SetComputeRoot32BitConstants(0, 28, c, 0);
+        cmd_list->SetComputeRoot32BitConstants(0, 30, c, 0);
         cmd_list->Dispatch(dispatch_x, 1, 1);
         cmd_list->ResourceBarrier(1, &uav_barrier);
     }
@@ -573,13 +590,13 @@ void PathTracer::dispatch_cloth_sim(ID3D12GraphicsCommandList6* cmd_list,
         const uint32_t read_srv  = read_pred_a ? gpu.pos_pred_a_srv() : gpu.pos_pred_b_srv();
         const uint32_t write_uav = read_pred_a ? gpu.pos_pred_b_uav() : gpu.pos_pred_a_uav();
 
-        uint32_t c[28]{};
+        uint32_t c[30]{};
         fill_common(c);
         c[24] = 1u;
         c[25] = read_srv;
         c[26] = write_uav;
         c[27] = cd.pin_corners;
-        cmd_list->SetComputeRoot32BitConstants(0, 28, c, 0);
+        cmd_list->SetComputeRoot32BitConstants(0, 30, c, 0);
         cmd_list->Dispatch(dispatch_x, 1, 1);
         cmd_list->ResourceBarrier(1, &uav_barrier);
 
@@ -593,13 +610,13 @@ void PathTracer::dispatch_cloth_sim(ID3D12GraphicsCommandList6* cmd_list,
     {
         const uint32_t final_srv = read_pred_a ? gpu.pos_pred_a_srv() : gpu.pos_pred_b_srv();
 
-        uint32_t c[28]{};
+        uint32_t c[30]{};
         fill_common(c);
         c[24] = 2u;
         c[25] = final_srv;
         c[26] = 0u;
         c[27] = cd.pin_corners;
-        cmd_list->SetComputeRoot32BitConstants(0, 28, c, 0);
+        cmd_list->SetComputeRoot32BitConstants(0, 30, c, 0);
         cmd_list->Dispatch(dispatch_x, 1, 1);
         cmd_list->ResourceBarrier(1, &uav_barrier);
     }
@@ -949,15 +966,12 @@ void PathTracer::dispatch_vegetation_wind(ID3D12GraphicsCommandList6* cmd_list,
                                           uint32_t       prev_pos_uav,
                                           float          mesh_min_y,
                                           float          mesh_height,
-                                          const Vec3&    wind_direction,
-                                          float          wind_strength,
                                           float          time_seconds,
-                                          float          wind_phase_offset,
-                                          float          primary_bend,
-                                          float          secondary_sway,
-                                          float          leaf_flutter,
-                                          float          trunk_envelope,
-                                          float          leaf_envelope,
+                                          float          phase_offset,
+                                          float          primary_bend_strength,
+                                          float          primary_bend_speed,
+                                          float          leaf_flutter_strength,
+                                          float          leaf_flutter_speed,
                                           bool           is_leaf_mesh)
 {
     if (vertex_count == 0 ||
@@ -969,46 +983,38 @@ void PathTracer::dispatch_vegetation_wind(ID3D12GraphicsCommandList6* cmd_list,
     cmd_list->SetPipelineState(m_vegetation_wind_pso.Get());
     cmd_list->SetComputeRootDescriptorTable(1, m_bindless_heap_gpu_start);
 
-    // WindConstants HLSL layout (20 DWORDs):
+    // WindConstants HLSL layout (16 DWORDs):
     //   [0]     vertex_count
     //   [1]     source_vertex_buffer_srv
     //   [2]     output_vertex_buffer_uav
     //   [3]     mesh_min_y
-    //   [4..6]  wind_direction
-    //   [7]     wind_strength
-    //   [8]     time_seconds
-    //   [9]     wind_phase_offset
-    //   [10]    primary_bend
-    //   [11]    secondary_sway
-    //   [12]    leaf_flutter
-    //   [13]    mesh_height
-    //   [14]    prev_pos_buffer_uav
-    //   [15]    trunk_envelope  (spring-mass oscillator output)
-    //   [16]    is_leaf_mesh    (1 = leaf/frond submesh: flutter at all heights)
-    //   [17]    leaf_envelope   (IIR-smoothed wind_t for leaf flutter)
-    //   [18..19] pad
+    //   [4]     time_seconds
+    //   [5]     phase_offset
+    //   [6]     primary_bend_strength
+    //   [7]     primary_bend_speed
+    //   [8]     leaf_flutter_strength
+    //   [9]     leaf_flutter_speed
+    //   [10]    mesh_height
+    //   [11]    prev_pos_buffer_uav
+    //   [12]    is_leaf_mesh
+    //   [13..15] pad
     union { float f; uint32_t u; } u;
-    uint32_t c[20]{};
+    uint32_t c[16]{};
     c[0] = vertex_count;
     c[1] = source_vertex_srv;
     c[2] = output_vertex_uav;
-    u.f = mesh_min_y;        c[3]  = u.u;
-    u.f = wind_direction.x;  c[4]  = u.u;
-    u.f = wind_direction.y;  c[5]  = u.u;
-    u.f = wind_direction.z;  c[6]  = u.u;
-    u.f = wind_strength;     c[7]  = u.u;
-    u.f = time_seconds;      c[8]  = u.u;
-    u.f = wind_phase_offset; c[9]  = u.u;
-    u.f = primary_bend;      c[10] = u.u;
-    u.f = secondary_sway;    c[11] = u.u;
-    u.f = leaf_flutter;      c[12] = u.u;
-    u.f = mesh_height;       c[13] = u.u;
-    c[14] = prev_pos_uav;
-    u.f = trunk_envelope;    c[15] = u.u;
-    c[16] = is_leaf_mesh ? 1u : 0u;
-    u.f = leaf_envelope;     c[17] = u.u;
-    // c[18..19] = 0 (pad)
-    cmd_list->SetComputeRoot32BitConstants(0, 20, c, 0);
+    u.f = mesh_min_y;               c[3]  = u.u;
+    u.f = time_seconds;             c[4]  = u.u;
+    u.f = phase_offset;             c[5]  = u.u;
+    u.f = primary_bend_strength;    c[6]  = u.u;
+    u.f = primary_bend_speed;        c[7]  = u.u;
+    u.f = leaf_flutter_strength;    c[8]  = u.u;
+    u.f = leaf_flutter_speed;       c[9]  = u.u;
+    u.f = mesh_height;              c[10] = u.u;
+    c[11] = prev_pos_uav;
+    c[12] = is_leaf_mesh ? 1u : 0u;
+    // c[13..15] = 0 (pad)
+    cmd_list->SetComputeRoot32BitConstants(0, 16, c, 0);
 
     const uint32_t group_count = (vertex_count + 63u) / 64u;
     cmd_list->Dispatch(group_count, 1, 1);
@@ -2614,6 +2620,20 @@ void PathTracer::upload_scene_buffers(DeviceContext& ctx,
 // ---------------------------------------------------------------------------
 // update_frame_constants
 // ---------------------------------------------------------------------------
+void PathTracer::set_sky(SkyboxDesc::Type type, uint32_t hdri_slot)
+{
+    if (type == SkyboxDesc::Type::HDRI && hdri_slot != UINT32_MAX)
+        m_sky_mode = 2u;
+    else if (type == SkyboxDesc::Type::Physical)
+        m_sky_mode = 1u;
+    else
+        m_sky_mode = 0u;  // Debug
+    m_hdri_sky_slot = hdri_slot;
+}
+
+// ---------------------------------------------------------------------------
+// update_frame_constants
+// ---------------------------------------------------------------------------
 void PathTracer::update_frame_constants(DeviceContext& ctx,
                                          uint32_t output_index,
                                          uint32_t frame_index,
@@ -2658,6 +2678,8 @@ void PathTracer::update_frame_constants(DeviceContext& ctx,
     fc.sun_intensity            = sun_intensity;
     fc.sun_color                = sun_color;
     fc.prev_view_proj           = prev_view_proj;
+    fc.sky_mode                 = m_sky_mode;
+    fc.hdri_sky_slot            = m_hdri_sky_slot;
 
     // Compute proj * view (world→clip) for depth and motion-vector projection in the shader.
     // Must be proj * view, not view * proj: the shader does mul(view_proj, worldPos)

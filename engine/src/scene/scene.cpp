@@ -57,8 +57,6 @@ void Scene::unload()
     m_lights.clear();
     m_cameras.clear();
     m_skybox    = {};
-    m_wind      = {};
-    m_wind_desc = {};
     m_loaded    = false;
 }
 

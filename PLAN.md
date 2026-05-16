@@ -176,7 +176,7 @@ eliminating per-draw descriptor binding.
 1. **Acceleration Structure Build** — build / update BLAS per mesh (including compute-skinned and wind-deformed meshes), compose TLAS
 2. **Ray Generation** — one ray per pixel at the internal render resolution (which is lower than output resolution when DLSS upscaling is active — e.g. 67% at Quality preset, 50% at Performance)
 3. **Hit shaders** — PBR material evaluation (GGX BRDF, Disney Principled)
-4. **Miss shaders** — sky / IBL lookup (physically-based sky model, HDRI)
+4. **Miss shaders** — three-way sky branch: `sky_mode 0` = debug procedural cube, `sky_mode 1` = analytic physical sky, `sky_mode 2` = HDRI equirectangular texture lookup
 5. **Lighting & Global Illumination** — Next Event Estimation (NEE) + Multiple Importance Sampling (MIS); Russian Roulette path termination, up to N bounces (configurable)
 6. **Denoising** — DLSS 4 Ray Reconstruction (primary): raw noisy frames + motion vectors fed directly into DLSS; temporal integration handled internally. NRD fallback: explicit temporal accumulation buffer (weighted blend with reprojection) applied first, then NRD denoiser.
 7. **Upscaling** — DLSS 4 Super Resolution reconstructs full output resolution from the internal render resolution
@@ -206,7 +206,7 @@ engine/shaders/
 |---|---|
 | Direct lighting | ReSTIR DI (Spatiotemporal Reservoir Resampling) |
 | Global illumination | BRDF-importance-sampled MC path tracing with configurable bounce depth (`gi_bounce_count`); Russian Roulette termination; DLSS-RR denoise |
-| Sky model | Hillaire 2020 Physically-Based Atmospheric Scattering |
+| Sky model | Three-mode enum: `Debug` (procedural colour-coded cube + grid), `Physical` (analytic atmosphere in HLSL), `HDRI` (equirectangular `.exr`/`.hdr` texture). Selected via `"type"` in the `"skybox"` scene block. EXR loading uses tinyexr v1.0.9. |
 | BRDF | Disney Principled PBR / GGX + Smith |
 | Anti-aliasing / upscale | DLSS 4 Super Resolution — Transformer model (RTX 40/50 series); FSR 4 / FSR 3 as AMD fallback |
 | Denoising | DLSS 4 Ray Reconstruction (primary) or NVIDIA NRD (fallback) |
@@ -259,7 +259,7 @@ The following invariants must be maintained for artifact-free DLSS-RR output:
 {
   "scene": {
     "name": "Test Track",
-    "skybox": { "type": "physical", "sun_direction": [0.3, 0.8, 0.1], "sun_intensity": 10 },
+    "skybox": { "type": "hdri", "hdri": "models/hdri/sky.exr", "sun_direction": [0.3, 0.8, 0.1], "sun_intensity": 10 },
     "wind": [0.0, 0.0, 0.0],
     "models": [
       {
@@ -385,86 +385,44 @@ OMM is the canonical modern D3D12/DXR 1.2 answer. Fallback (hardware without OMM
 
 ---
 
-### Wind Animation
+### Procedural Vegetation Motion
 
-Wind deformation is implemented as a hierarchical three-layer GPU compute model. The current implementation is in `engine/shaders/vegetation_wind.hlsl`, dispatched per-species per-frame by `Renderer::update()` via `PathTracer::dispatch_vegetation_wind()`.
+> **Note:** The global `WindDesc` wind system (CPU layered oscillator, spring inertia, per-species `m_species_wind_states`) has been **removed**. Vegetation motion is now fully deterministic and time-based — no wind direction input, no physics simulation.
 
-#### Layer 1 — Primary Trunk Bend
-The trunk is modelled as a fixed-base cantilever beam under a distributed horizontal load. Displacement follows the analytic beam deflection curve:
+Deformation is implemented in `engine/shaders/vegetation_wind.hlsl`, dispatched per-species per-frame by `Renderer::render_frame_path_traced()` via `PathTracer::dispatch_vegetation_wind()`.
 
-```
-d(h) = (3h² − h³) / 2
-```
+#### Trunk Bend
+The trunk is modelled as a fixed-base cantilever beam. A constant-amplitude bend rotates in a full circle over `primary_bend_circle_time` seconds. Displacement follows the analytic beam deflection curve `d(h) = (3h² − h³) / 2`, enforcing zero displacement and zero slope at the root. A **per-species pseudorandom phase offset** (golden-ratio Knuth hash of the species index) prevents multiple species from animating in synchronised lockstep.
 
-This enforces zero displacement *and* zero slope at the root (`h = 0`), so the trunk curves continuously rather than rotating rigidly at the base. Maximum displacement is at the crown (`h = 1`).
+#### Leaf Flutter
+Individual leaf vertices flutter at constant amplitude controlled by `wind_leaf_flutter`. Flutter is restricted by a spatial mask (`h > 0.55` AND `off_axis > 0.5`) to upper-canopy off-axis vertices only.
 
-The driving amplitude is **not** the instantaneous wind speed. Instead it is `trunk_envelope`, the output of a CPU-side damped second-order spring oscillator (per-species):
+#### Schema (`SpeciesDesc`)
 
-```
-ẍ + 2ζω₀ẋ + ω₀²x = ω₀² · wind_t_target
-
-ω₀   = 2π × 0.22 Hz   →   ~4.5 s natural period (large tree resonance)
-ζ    = 0.28            →   lightly underdamped (~1-2 overshoots before settling)
-```
-
-This gives the trunk realistic mass-like inertia: it builds up over ~3-4 s when a gust arrives, overshoots slightly, then decays slowly when the wind subsides. **Trunks are slow to react to wind changes.**
-
-The oscillator is integrated with semi-implicit Euler each frame using `m_last_delta_time`. The result is clamped to `[0, 1.5]` before upload to the shader as a `float` constant.
-
-#### Layer 2 — Branch Sway
-Branches respond to localised wind drag and turbulence. Motion is computed procedurally using **four inharmonic sinusoids** at different frequencies and vertex-position-seeded spatial phases, summed to approximate the stochastic, aperiodic patterns real branches exhibit under wind.
-
-Two orthogonal displacement components are produced:
-- **Along-wind**: primary + three harmonics at irrational frequency ratios (2.20, 3.67, ~1.13×, ~1.73× of a fast time axis)
-- **Cross-wind**: two independent harmonics (2.81, 4.11× of the slow axis), uncorrelated from along-wind
-
-Each vertex's world-space XZ position seeds its own unique phase offset, so adjacent branches are never in synchrony. The combined oscillators never exactly repeat (irrational frequency ratios), giving each branch a distinct, turbulent character.
-
-Branches use `wind_t_raw` (instantaneous normalised wind speed) so their amplitude responds within one frame — **faster than the trunk but slower than leaves**. Because the trunk lags via the spring, branches visibly lead the trunk on a gust: the correct hierarchical order.
-
-#### Layer 3 — Leaf Detail Bending
-Individual leaf vertices ripple and flutter using two uncorrelated high-frequency oscillators mixed with unequal weights to break periodicity (~9.5 Hz and ~14.3 Hz; ratio is near-but-not-exactly 2:3). Each vertex's world-position seeds a unique phase so every leaf appears to flutter independently.
-
-Displacement has three components:
-- **XZ tangential flutter** — the leaf swinging across the wind
-- **Y vertical ripple** — the leaf tilting up and down as it flutters
-- A `sqrt` wind-response curve keeps leaves visibly alive in calm air (floor at `wind_t_raw + 0.15`)
-
-A spatial mask (`h > 0.55` AND `off_axis > 0.5`) restricts flutter to upper-canopy off-axis vertices, preventing trunk geometry from vibrating. **Leaves react almost instantly to wind changes.**
-
-#### Phase Variation (Anti-Synchrony)
-To prevent multiple tree species from animating in synchronised lockstep, a **per-species pseudorandom phase offset** is derived on the CPU using a golden-ratio Knuth integer hash of the species index and passed to the shader as `wind_phase_offset`. This ensures all three time arguments (`t_slow`, `t_fast`) are phase-shifted independently per species.
-
-Within a single tree mesh, all three layers derive additional spatial phase variation from vertex world-position coordinates, individually differentiating branches and leaves without any per-instance CPU cost.
-
-#### CPU Wind Evaluation (WindDesc)
-The global wind vector fed to all systems (`m_wind_current`) is produced by a three-layer oscillator on the CPU:
-1. **Gust layer** — sinusoidal speed modulation at `gust_frequency` with strength `gust_strength`
-2. **Direction wander** — sinusoidal rotation of the base wind direction by ±`direction_wander_angle`°
-3. **Micro-turbulence** — small per-axis sinusoidal offsets at `micro_frequency`
-
-The output is then passed through a **frame-rate-independent one-pole IIR smoother**:
-```
-tau   = -1 / (60 × ln(response_smoothing))
-alpha = 1 − exp(−dt / tau)
-output += alpha × (target − output)
-```
-This smooths rapid gust transitions for cloth and other consumers without affecting the vegetation spring (which has its own inertia model).
+| Field | Purpose |
+|---|---|
+| `primary_bend_strength` | Trunk bend amplitude |
+| `primary_bend_circle_time` | Seconds for one full circular rotation of the bend direction |
+| `wind_leaf_flutter` | Constant-amplitude leaf flutter strength |
 
 #### GPU Pipeline
-- Deformation is dispatched per-species per-frame (one dispatch per mesh submesh)
-- Deformed vertices are written to a species-shared GPU output buffer (the "skinned vertex buffer")
-- A compact `float3` prev-position buffer is updated before each deform pass so the path-tracing closest-hit shader can compute per-vertex motion vectors for DLSS/denoiser temporal reprojection
-- BLAS refit is issued immediately after each UAV barrier on the output buffer
-- TLAS is rebuilt once per frame after all BLAS refits complete
+- Deformation dispatched per-species per-frame (one dispatch per mesh submesh)
+- Deformed vertices written to a species-shared GPU output buffer
+- BLAS refit issued immediately after each UAV barrier on the output buffer
+- TLAS rebuilt once per frame after all BLAS refits complete
 
-#### Summary Table
+---
 
-| Layer | Geometry target | Frequency | Response speed | Amplitude driver |
-|---|---|---|---|---|
-| 1 — Trunk bend | All vertices, weighted by `d(h)` | ~0.22 Hz (≈ 4.5 s period) | Slow (~3-4 s buildup via spring) | `trunk_envelope` (CPU spring output) |
-| 2 — Branch sway | Off-axis, canopy-height vertices | 2.2 – 4.1 Hz (4 harmonics) | Fast (1 frame) | `wind_t_raw` (instantaneous) |
-| 3 — Leaf flutter | Upper-canopy off-axis vertices only | ~9.5 and ~14.3 Hz (2 oscillators) | Near-instant (1 frame) | `wind_t_raw` with `sqrt` curve |
+### Cloth / Flag Wave Motion
+
+Cloth uses the canonical XPBD solver (INTEGRATE → CONSTRAIN×N → FINALIZE) extended with a new **PASS 3 (WAVE)** that runs before INTEGRATE each substep. The wave pass injects a traveling sine-wave positional offset into `pos_curr`, producing the flag-wave appearance without a physical wind force.
+
+#### Schema (`ClothDesc`)
+
+| Field | Purpose |
+|---|---|
+| `wind_direction` | Vec3 — direction the wave travels across the cloth |
+| `wave_amplitude` | Float — peak positional displacement of the wave |
 
 ---
 
@@ -479,8 +437,9 @@ This smooths rapid gust transitions for cloth and other consumers without affect
 | Far cluster foliage (LOD 2) | Simplified alpha cards + Opacity Micromaps |
 | Far impostor (LOD 3) | Octahedral impostor (16x16 view grid) with packed depth; procedural AABB in TLAS; parallax-corrected intersection |
 | Alpha handling | OMM (primary); AnyHit alpha test (OMM-unavailable fallback) |
-| Wind animation | Three-layer hierarchical compute shader (trunk cantilever bend driven by CPU spring, stochastic branch sway via 4-harmonic inharmonic sinusoids, dual-oscillator leaf flutter); BLAS refit + prev-pos snapshot each frame for motion vectors |
-| BLAS/TLAS | BLAS per species (instanced); TLAS updated each frame for dynamic wind instances |
+| Vegetation motion | Procedural time-based circular trunk bend + constant leaf flutter; BLAS refit + TLAS rebuild each frame |
+| Cloth/flag motion | XPBD solver + PASS 3 WAVE (traveling sine wave via per-instance `wind_direction` + `wave_amplitude`) |
+| BLAS/TLAS | BLAS per species (instanced); TLAS updated each frame for dynamic instances |
 | Culling | GPU-driven: frustum + max-distance cull in compute prepass before TLAS construction; no Hi-Z (no raster depth buffer) |
 | Asset compatibility | SpeedTree ORCA v2 - FBX meshes, DDS textures (BaseColor/Specular/Normal), GGX PBR channel convention |
 
@@ -523,7 +482,6 @@ This smooths rapid gust transitions for cloth and other consumers without affect
 | Fog | Heterogeneous exponential height fog; volumetric light shafts computed via in-scattering during ray-marched volume traversal (no screen-space post pass) |
 | Wet surfaces | PBR material blend: dry↔wet controlled by weather intensity float |
 | Snow | Particle system + snow accumulation on surfaces via compute-written coverage map |
-| Wind | Global wind vector drives vegetation, flags, particle drift |
 
 ---
 
@@ -545,7 +503,7 @@ This smooths rapid gust transitions for cloth and other consumers without affect
 | Blend trees | Simple 1D/2D blend trees; cross-fade between clips |
 | Procedural animation | IK solver (FABRIK) for foot placement |
 | Rigid animation | Node transform animation (flags, doors, wheels) via float-curve evaluation |
-| Waving flags | Compute shader cloth simulation (spring-mass lattice) driven by wind vector; two-pass dispatch: integrate (gravity+wind) then red-black Gauss-Seidel constraint relaxation with per-spring-type averaging; updated positions written back before BLAS refit |
+| Waving flags | XPBD cloth solver (INTEGRATE → CONSTRAIN×N → FINALIZE) extended with PASS 3 WAVE: traveling sine-wave offset injected into `pos_curr` each substep via per-instance `wind_direction` + `wave_amplitude`; updated positions written back before BLAS refit |
 | BLAS update | Dynamic meshes: BLAS refit each frame (no full rebuild for small deformations) |
 
 ---
@@ -746,7 +704,7 @@ Height maps are a new optional entry in the PBR material descriptor:
 ### Scope
 - Targets **static geometry only** (track surfaces, terrain, buildings, kerbs)
 - Dynamic/skinned meshes are excluded — BLAS refit on a heavily subdivided displaced mesh would be prohibitively expensive
-- Wind-deformed vegetation uses per-vertex bend (§10), not displacement
+- Procedurally bent vegetation uses per-vertex bend (§10), not displacement
 
 ### Key Tasks
 - [ ] `DisplacementBaker` class: CPU subdivide + normal-displaced vertex generation + MikkTSpace normal/tangent recompute

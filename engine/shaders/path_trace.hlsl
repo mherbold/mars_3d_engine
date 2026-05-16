@@ -55,6 +55,9 @@ struct FrameConstants
     uint     _pad_gi1;
     // current-frame view * projection — offset 320, registers 21..24
     float4x4 view_proj;
+    // sky control — offset 384
+    uint     sky_mode;        // 0 = procedural debug cube, 1 = HDRI equirectangular
+    uint     hdri_sky_slot;   // bindless SRV slot for the HDRI Texture2D (UINT_MAX when unused)
 };
 
 ConstantBuffer<FrameConstants> g_Frame : register(b0, space0);
@@ -352,89 +355,166 @@ void RayGen()
 }
 
 // ---------------------------------------------------------------------------
-// [shader("miss")]  Miss — procedural orientation skybox
+// [shader("miss")]  Miss — sky shader
 //
-// Each cube face is colour-coded and overlaid with an 8×8 UV grid and a
-// centre crosshair so the viewer can immediately tell which direction they
-// are looking.
+// sky_mode == 0  → procedural orientation skybox (debug)
+//   Each cube face is colour-coded and overlaid with an 8×8 UV grid and a
+//   centre crosshair so the viewer can immediately tell which direction they
+//   are looking.
 //
-// Face → colour mapping:
-//   +X  East    red       (0.80, 0.15, 0.15)
-//   −X  West    orange    (0.80, 0.45, 0.10)
-//   +Y  Up      white     (0.90, 0.90, 0.90)
-//   −Y  Down    brown     (0.25, 0.15, 0.05)
-//   +Z  South   blue      (0.15, 0.40, 0.80)
-//   −Z  North   green     (0.15, 0.70, 0.25)
+//   Face → colour mapping:
+//     +X  East    red       (0.80, 0.15, 0.15)
+//     −X  West    orange    (0.80, 0.45, 0.10)
+//     +Y  Up      white     (0.90, 0.90, 0.90)
+//     −Y  Down    brown     (0.25, 0.15, 0.05)
+//     +Z  South   blue      (0.15, 0.40, 0.80)
+//     −Z  North   green     (0.15, 0.70, 0.25)
+//
+// sky_mode == 1  → physical procedural sky (Preetham-style analytic atmosphere)
+//
+// sky_mode == 2  → HDRI equirectangular environment map
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Physical sky helpers — simplified Preetham/Hosek-style analytic atmosphere.
+//
+// Produces a plausible blue-sky gradient with sun disc and horizon haze.
+// Not physically accurate but visually convincing and parameter-free beyond
+// the sun direction and color already in FrameConstants.
+// ---------------------------------------------------------------------------
+float3 PhysicalSky(float3 dir, float3 sun_dir, float3 sun_color, float sun_intensity)
+{
+    // Normalise inputs
+    dir     = normalize(dir);
+    sun_dir = normalize(sun_dir);
+
+    float  cos_theta   = saturate(dir.y);            // elevation of ray above horizon
+    float  cos_sun     = saturate(sun_dir.y);         // sun elevation
+    float  cos_ray_sun = dot(dir, sun_dir);            // angle between ray and sun
+
+    // --- Atmosphere gradient ------------------------------------------------
+    // Zenith: deep blue, horizon: pale/orange depending on sun elevation.
+    float3 zenith_color  = float3(0.10f, 0.20f, 0.55f);
+    float3 horizon_color = lerp(float3(0.85f, 0.65f, 0.45f),  // warm sunset horizon
+                                float3(0.70f, 0.82f, 0.95f),  // clear day horizon
+                                saturate(cos_sun * 2.5f));
+
+    // Blend zenith↔horizon based on ray elevation; raise to power for realistic falloff
+    float  horizon_blend = pow(1.0f - cos_theta, 4.0f);
+    float3 sky_color     = lerp(zenith_color, horizon_color, horizon_blend);
+
+    // --- Sun disc -----------------------------------------------------------
+    // Sharp falloff around the sun direction; intensity drives its apparent size.
+    float  sun_disc  = smoothstep(0.9995f, 0.9999f, cos_ray_sun);
+    float3 sun_contrib = sun_disc * sun_color * sun_intensity * 20.0f;
+
+    // --- Atmospheric scattering haze near horizon ---------------------------
+    float  haze     = pow(saturate(1.0f - abs(dir.y) * 2.5f), 3.0f);
+    float3 haze_color = lerp(float3(0.85f, 0.80f, 0.75f),
+                             float3(0.90f, 0.55f, 0.25f),
+                             saturate(1.0f - cos_sun * 3.0f));
+    sky_color = lerp(sky_color, haze_color, haze * 0.5f);
+
+    // --- Ground (below horizon) ---------------------------------------------
+    if (dir.y < 0.0f)
+        sky_color = lerp(sky_color, float3(0.12f, 0.10f, 0.08f), saturate(-dir.y * 6.0f));
+
+    return sky_color * sun_intensity + sun_contrib;
+}
+
 [shader("miss")]
 void Miss(inout PrimaryPayload payload)
 {
     float3 dir = normalize(WorldRayDirection());
-    float  ax  = abs(dir.x);
-    float  ay  = abs(dir.y);
-    float  az  = abs(dir.z);
+    float3 color;
 
-    float2 uv;
-    float3 faceColor;
-
-    if (ax >= ay && ax >= az)
+    if (g_Frame.sky_mode == 2u && g_Frame.hdri_sky_slot != 0xFFFFFFFFu)
     {
-        float inv = 0.5f / ax;
-        if (dir.x > 0.0f)
-        {
-            uv        = float2(-dir.z, -dir.y) * inv + 0.5f;  // +X  East
-            faceColor = float3(0.80f, 0.15f, 0.15f);
-        }
-        else
-        {
-            uv        = float2( dir.z, -dir.y) * inv + 0.5f;  // -X  West
-            faceColor = float3(0.80f, 0.45f, 0.10f);
-        }
+        // --- HDRI equirectangular sampling -----------------------------------
+        // Convert direction to spherical (azimuth, elevation) → UV.
+        // atan2 range: [-π, π] → u in [0,1]; asin range: [-π/2,π/2] → v in [0,1]
+        const float kInvTwoPi = 0.15915494309f;  // 1/(2π)
+        const float kInvPi    = 0.31830988618f;  // 1/π
+        float u = atan2(dir.x, -dir.z) * kInvTwoPi + 0.5f;
+        float v = asin(clamp(dir.y, -1.0f, 1.0f)) * kInvPi + 0.5f;
+        // Flip V so +Y maps to the top of the image (typical HDRI convention)
+        v = 1.0f - v;
+        color = g_Textures[g_Frame.hdri_sky_slot].SampleLevel(g_SamplerLinear, float2(u, v), 0).rgb;
     }
-    else if (ay >= ax && ay >= az)
+    else if (g_Frame.sky_mode == 1u)
     {
-        float inv = 0.5f / ay;
-        if (dir.y > 0.0f)
-        {
-            uv        = float2( dir.x,  dir.z) * inv + 0.5f;  // +Y  Up
-            faceColor = float3(0.90f, 0.90f, 0.90f);
-        }
-        else
-        {
-            uv        = float2( dir.x, -dir.z) * inv + 0.5f;  // -Y  Down
-            faceColor = float3(0.25f, 0.15f, 0.05f);
-        }
+        // --- Physical procedural sky -----------------------------------------
+        color = PhysicalSky(dir, g_Frame.sun_direction, g_Frame.sun_color, g_Frame.sun_intensity);
     }
     else
     {
-        float inv = 0.5f / az;
-        if (dir.z > 0.0f)
+        // --- Procedural orientation skybox (debug) ---------------------------
+        float  ax  = abs(dir.x);
+        float  ay  = abs(dir.y);
+        float  az  = abs(dir.z);
+
+        float2 uv;
+        float3 faceColor;
+
+        if (ax >= ay && ax >= az)
         {
-            uv        = float2( dir.x, -dir.y) * inv + 0.5f;  // +Z  South
-            faceColor = float3(0.15f, 0.40f, 0.80f);
+            float inv = 0.5f / ax;
+            if (dir.x > 0.0f)
+            {
+                uv        = float2(-dir.z, -dir.y) * inv + 0.5f;  // +X  East
+                faceColor = float3(0.80f, 0.15f, 0.15f);
+            }
+            else
+            {
+                uv        = float2( dir.z, -dir.y) * inv + 0.5f;  // -X  West
+                faceColor = float3(0.80f, 0.45f, 0.10f);
+            }
+        }
+        else if (ay >= ax && ay >= az)
+        {
+            float inv = 0.5f / ay;
+            if (dir.y > 0.0f)
+            {
+                uv        = float2( dir.x,  dir.z) * inv + 0.5f;  // +Y  Up
+                faceColor = float3(0.90f, 0.90f, 0.90f);
+            }
+            else
+            {
+                uv        = float2( dir.x, -dir.z) * inv + 0.5f;  // -Y  Down
+                faceColor = float3(0.25f, 0.15f, 0.05f);
+            }
         }
         else
         {
-            uv        = float2(-dir.x, -dir.y) * inv + 0.5f;  // -Z  North
-            faceColor = float3(0.15f, 0.70f, 0.25f);
+            float inv = 0.5f / az;
+            if (dir.z > 0.0f)
+            {
+                uv        = float2( dir.x, -dir.y) * inv + 0.5f;  // +Z  South
+                faceColor = float3(0.15f, 0.40f, 0.80f);
+            }
+            else
+            {
+                uv        = float2(-dir.x, -dir.y) * inv + 0.5f;  // -Z  North
+                faceColor = float3(0.15f, 0.70f, 0.25f);
+            }
         }
+
+        // 8×8 UV grid with thin black lines
+        const float k_cells    = 8.0f;
+        const float k_line     = 0.04f;  // line half-width in cell UV space
+        float2 cellUV = frac(uv * k_cells);
+        bool   onGrid = cellUV.x < k_line || cellUV.x > (1.0f - k_line)
+                     || cellUV.y < k_line || cellUV.y > (1.0f - k_line);
+
+        // White crosshair at the face centre so the exact forward direction is clear
+        float2 fromCentre = abs(uv - 0.5f);
+        bool   onCross    = (fromCentre.x < 0.006f && fromCentre.y < 0.05f)
+                         || (fromCentre.y < 0.006f && fromCentre.x < 0.05f);
+
+        color = onCross ? float3(1.0f, 1.0f, 1.0f)
+              : onGrid  ? float3(0.0f, 0.0f, 0.0f)
+              : faceColor;
     }
-
-    // 8×8 UV grid with thin black lines
-    const float k_cells    = 8.0f;
-    const float k_line     = 0.04f;  // line half-width in cell UV space
-    float2 cellUV = frac(uv * k_cells);
-    bool   onGrid = cellUV.x < k_line || cellUV.x > (1.0f - k_line)
-                 || cellUV.y < k_line || cellUV.y > (1.0f - k_line);
-
-    // White crosshair at the face centre so the exact forward direction is clear
-    float2 fromCentre = abs(uv - 0.5f);
-    bool   onCross    = (fromCentre.x < 0.006f && fromCentre.y < 0.05f)
-                     || (fromCentre.y < 0.006f && fromCentre.x < 0.05f);
-
-    float3 color = onCross ? float3(1.0f, 1.0f, 1.0f)
-                 : onGrid  ? float3(0.0f, 0.0f, 0.0f)
-                 : faceColor;
 
     // At GI depth > 0 the sky radiance must be weighted by the accumulated throughput.
     payload.radiance = (payload.depth > 0u) ? color * payload.throughput : color;

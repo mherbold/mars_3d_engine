@@ -12,11 +12,20 @@
 
 #include <DirectXTex.h>
 
+#pragma warning(push, 0)
+// Declarations only — implementation is compiled in exr_loader.cpp.
+// TINYEXR_USE_MINIZ 0 prevents tinyexr from pulling in its own miniz copy;
+// the miniz implementation is already compiled in exr_loader.cpp.
+#define TINYEXR_USE_MINIZ 0
+#include <third_party/tinyexr.h>   // declarations only (implementation in exr_loader.cpp)
+#pragma warning(pop)
+
 #include "mars_engine/engine_api.h"
 #include <stdexcept>
 #include <format>
 #include <filesystem>
 #include <cstring>
+#include <vector>
 
 namespace mars
 {
@@ -258,7 +267,51 @@ GpuTexture TextureLoader::load(
     {
         hr = DirectX::LoadFromDDSFile(wpath.c_str(), DirectX::DDS_FLAGS_NONE, &meta, image);
     }
-    else if (ext == ".hdr" || ext == ".HDR" || ext == ".exr" || ext == ".EXR")
+    else if (ext == ".exr" || ext == ".EXR")
+    {
+        // tinyexr: load as RGBA float, then hand off to DirectXTex upload path
+        float*      exr_rgba  = nullptr;
+        int         exr_w     = 0;
+        int         exr_h     = 0;
+        const char* exr_err   = nullptr;
+        int ret = LoadEXR(&exr_rgba, &exr_w, &exr_h, file_path.c_str(), &exr_err);
+        if (ret != TINYEXR_SUCCESS)
+        {
+            MARS_LOG("[TextureLoader] tinyexr failed for '{}': {}", file_path, exr_err ? exr_err : "unknown");
+            if (exr_err) FreeEXRErrorMessage(exr_err);
+            return {};
+        }
+
+        // Wrap the float data into a DirectXTex ScratchImage so the rest of the
+        // upload path (mip generation, CreateTextureEx, etc.) is unchanged.
+        meta = {};
+        meta.width     = static_cast<size_t>(exr_w);
+        meta.height    = static_cast<size_t>(exr_h);
+        meta.depth     = 1;
+        meta.arraySize = 1;
+        meta.mipLevels = 1;
+        meta.format    = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        meta.dimension = DirectX::TEX_DIMENSION_TEXTURE2D;
+
+        hr = image.Initialize2D(meta.format, meta.width, meta.height, 1, 1);
+        if (SUCCEEDED(hr))
+        {
+            const size_t row_pitch = meta.width * 4 * sizeof(float);
+            const size_t slice_sz  = row_pitch * meta.height;
+            std::memcpy(image.GetPixels(), exr_rgba, slice_sz);
+        }
+        free(exr_rgba);
+
+        if (FAILED(hr))
+        {
+            MARS_LOG("[TextureLoader] Failed to initialise scratch image for EXR '{}' (HRESULT 0x{:08X})", file_path, static_cast<unsigned>(hr));
+            return {};
+        }
+
+        // Skip the generic FAILED(hr) check below — we already handled errors above.
+        hr = S_OK;
+    }
+    else if (ext == ".hdr" || ext == ".HDR")
     {
         hr = DirectX::LoadFromHDRFile(wpath.c_str(), &meta, image);
     }

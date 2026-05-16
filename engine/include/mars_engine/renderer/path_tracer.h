@@ -153,6 +153,11 @@ public:
                                 float sun_intensity,
                                 const Mat4x4& prev_view_proj = Mat4x4::identity());
 
+    // Set the sky mode used for ray misses.
+    // Pass Type::HDRI and the bindless SRV slot of the equirectangular texture to enable HDRI sky.
+    // Pass Type::Physical (or UINT32_MAX for hdri_slot) to revert to the procedural debug skybox.
+    void set_sky(SkyboxDesc::Type type, uint32_t hdri_slot = UINT32_MAX);
+
     // Record DispatchRays into `cmd_list` for the given output.
     void trace(ID3D12GraphicsCommandList6* cmd_list,
                uint32_t output_index,
@@ -289,8 +294,8 @@ public:
     // ---------------------------------------------------------------------------
     void dispatch_cloth_sim(ID3D12GraphicsCommandList6* cmd_list,
                             ClothInstance&             ci,
-                            const Vec3&                wind,
-                            float                      delta_time);
+                            float                      delta_time,
+                            float                      time_seconds);
 
     // ---------------------------------------------------------------------------
     // Ecosystem / vegetation
@@ -321,15 +326,12 @@ public:
                                   uint32_t       prev_pos_uav,
                                   float          mesh_min_y,
                                   float          mesh_height,
-                                  const Vec3&    wind_direction,
-                                  float          wind_strength,
                                   float          time_seconds,
-                                  float          wind_phase_offset,
-                                  float          primary_bend,
-                                  float          secondary_sway,
-                                  float          leaf_flutter,
-                                  float          trunk_envelope,
-                                  float          leaf_envelope,
+                                  float          phase_offset,
+                                  float          primary_bend_strength,
+                                  float          primary_bend_speed,
+                                  float          leaf_flutter_strength,
+                                  float          leaf_flutter_speed,
                                   bool           is_leaf_mesh = false);
 
 private:
@@ -457,6 +459,10 @@ private:
     std::vector<GIBuffer> m_gi_reservoir_buffers;
 
     uint32_t m_gi_bounce_count = 1;  // passed to FrameConstants::gi_bounce_count each frame
+
+    // --- Sky state -----------------------------------------------------------
+    uint32_t m_sky_mode     = 0;          // 0 = procedural debug cube, 1 = HDRI
+    uint32_t m_hdri_sky_slot = UINT32_MAX; // bindless SRV slot of the HDRI texture
 
     // --- Per-frame constant buffer ring --------------------------------------
     // One upload buffer per output × k_frame_count slots.

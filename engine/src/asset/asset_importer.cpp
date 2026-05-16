@@ -146,7 +146,8 @@ MaterialData AssetImporter::process_material(ImportContext& ctx, uint32_t mat_in
         const std::string& bc = mat.base_color_texture.path;
         static constexpr std::string_view k_leaf_tokens[] = {
             "leaves", "leaf", "frond", "fronds",
-            "atlas", "billboard", "facing", "card"
+            "atlas", "billboard", "facing", "card",
+            "blades", "blade", "fiddlehead"
         };
         for (auto tok : k_leaf_tokens)
         {

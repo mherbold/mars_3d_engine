@@ -58,10 +58,11 @@ struct CameraDesc
 // =============================================================================
 struct SkyboxDesc
 {
-    enum class Type : uint8_t { Physical = 0, HDRI = 1 };
+    enum class Type : uint8_t { Debug = 0, Physical = 1, HDRI = 2 };
 
-    Type        type           = Type::Physical;
+    Type        type           = Type::Debug;
     Vec3        sun_direction  = { 0.3f, 0.8f, 0.1f };
+    Vec3        sun_color      = { 1.0f, 0.98f, 0.95f };
     float       sun_intensity  = 10.0f;
     std::string hdri_path;                           // used when type == HDRI
 };
@@ -107,51 +108,7 @@ struct MaterialOverride
     }
 };
 
-// =============================================================================
-// WindDesc — animated wind parameters loaded from the scene file.
-//
-// The wind model layers three oscillators on top of a base direction + speed:
-//
-//   1. Gust      — slow amplitude modulation of speed
-//                  (gustStrength × baseSpeed, at gustFrequency Hz)
-//   2. Direction wander — slow angular drift of the wind direction in the
-//                  horizontal plane (±directionWanderAngle degrees,
-//                  at directionWanderFrequency Hz)
-//   3. Micro     — high-frequency turbulence added to the final vector
-//                  (microVariation as a fraction of current speed,
-//                  at microFrequency Hz)
-//
-// All three contributions are summed then passed through a one-pole IIR
-// low-pass smoother (responseSmoothing in [0,1); 0 = no smoothing,
-// values close to 1 = very sluggish response) before being handed to
-// the cloth solver each substep.
-//
-// All oscillator fields default to zero, so an old scene that only
-// specifies a static wind vector continues to work unchanged.
-// =============================================================================
-struct WindDesc
-{
-    // Base wind — direction is normalised at load time; speed in m/s.
-    Vec3  base_direction            = { 1.0f, 0.0f, 0.0f };
-    float base_speed                = 0.0f;
 
-    // Gust layer (amplitude oscillator on wind speed).
-    float gust_strength             = 0.0f;  // fraction of base_speed (e.g. 0.45 = ±45 %)
-    float gust_frequency            = 0.25f; // Hz
-
-    // Direction-wander layer (slow horizontal angular drift).
-    float direction_wander_angle    = 0.0f;  // degrees (half-range of the oscillation)
-    float direction_wander_frequency= 0.12f; // Hz
-
-    // Micro-turbulence layer (per-axis high-frequency noise on the final vector).
-    float micro_variation           = 0.0f;  // fraction of current speed
-    float micro_frequency           = 1.5f;  // Hz
-
-    // One-pole IIR low-pass smoother coefficient in [0, 1).
-    // output = mix(new_value, prev_output, responseSmoothing)
-    // 0 = instant response; 0.85 = heavy smoothing.
-    float response_smoothing        = 0.0f;
-};
 
 // =============================================================================
 // AnimationDesc — optional animation settings for a SceneModelInstance
@@ -222,6 +179,12 @@ struct ClothDesc
     // which is suitable for a curtain or banner hanging from two top points.
     uint32_t pin_corners = 0b0011u;
 
+    // Procedural flag wave parameters.
+    // wind_direction: world-space direction the flag leans / waves toward.
+    // wave_amplitude: controls wave height, speed, and trailing-edge flutter.
+    Vec3  wind_direction  = { 1.0f, 0.0f, 0.0f };
+    float wave_amplitude  = 0.5f;
+
     // Optional material override (same semantics as SceneModelInstance::material_override)
     MaterialOverride material;
 };
@@ -284,10 +247,11 @@ struct SpeciesDesc
     float lod_far_max       = 600.0f;   // LOD 2 → 3 transition
     float max_draw_distance = 2000.0f;  // Beyond this, don't draw at all
 
-    // Wind animation parameters
-    float wind_primary_bend   = 0.5f;   // Primary trunk/branch bend strength
-    float wind_secondary_sway = 0.3f;   // Secondary branch sway multiplier
-    float wind_leaf_flutter   = 0.2f;   // Leaf/foliage micro-movement
+    // Procedural animation parameters
+    float primary_bend_strength = 0.5f;   // Trunk/branch bend amplitude
+    float primary_bend_speed     = 0.067f; // Trunk bend rotation speed (rotations per second)
+    float wind_leaf_flutter_strength = 0.2f; // Leaf/foliage micro-movement amplitude
+    float wind_leaf_flutter_speed    = 1.0f; // Leaf/foliage flutter speed multiplier
 
     // Relative spawn weight (for multi-species density maps)
     float spawn_weight = 1.0f;

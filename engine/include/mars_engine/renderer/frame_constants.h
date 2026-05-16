@@ -37,7 +37,7 @@ namespace mars
 //   offset 304 : gi_reservoir_uav_slot (4) + gi_bounce_count (4)
 //   offset 312 : _pad_gi0 (4) + _pad_gi1 (4)  — align to 16-byte boundary
 //   offset 320 : view_proj (64)
-//   offset 384 : _pad[32] — 128 bytes padding to reach 512
+//   offset 384 : sky_mode (4) + hdri_sky_slot (4) + _pad[30] — 120 bytes padding to reach 512
 //   total = 512 bytes
 struct FrameConstants
 {
@@ -85,7 +85,12 @@ struct FrameConstants
     // current-frame view * projection matrix (for projecting hit points to NDC depth)
     Mat4x4   view_proj;                            //  64 bytes  (offset 320)
 
-    float    _pad[32]             = {};             //  128 bytes (offset 384) — pad to 512
+    // Sky mode and HDRI slot (offset 384)
+    // sky_mode: 0 = procedural/debug cube, 1 = HDRI equirectangular
+    uint32_t sky_mode             = 0;             //   4 bytes  (offset 384)
+    uint32_t hdri_sky_slot        = UINT32_MAX;    //   4 bytes  (offset 388)
+
+    float    _pad[30]             = {};             //  120 bytes (offset 392) — pad to 512
 };
 
 static_assert(sizeof(FrameConstants) % 256 == 0,

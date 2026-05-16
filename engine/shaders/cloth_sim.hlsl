@@ -44,7 +44,7 @@ struct ClothConstants
 	float3  gravity;
 	float   inv_mass;
 
-	float3  wind;
+	float3  wind;       // per-instance wind direction (from ClothDesc.wind_direction)
 	float   damping;
 
 	float   structural_compliance;
@@ -76,8 +76,8 @@ struct ClothConstants
 	//   Bit 6 = left edge    Bit 7 = right edge
 	uint    pin_corners;
 
-	uint    _pad0;
-	uint    _pad1;
+	float   wave_amplitude;  // procedural wave injection amplitude (from ClothDesc.wave_amplitude)
+	float   time_seconds;    // global elapsed time
 };
 
 ConstantBuffer<ClothConstants> g_Cloth : register(b0, space0);
@@ -284,6 +284,38 @@ void main(uint3 tid : SV_DispatchThreadID)
 
 		store_f3(g_RWBuffers[g_Cloth.pos_prev_uav], idx, xc);
 		store_f3(g_RWBuffers[g_Cloth.pos_curr_uav], idx, xnew);
+		return;
+	}
+
+	// =========================================================================
+	// PASS 3 -- WAVE  (procedural traveling-wave injection into pos_curr)
+	//
+	// Injects a sine-wave offset into the committed position buffer BEFORE
+	// the next INTEGRATE pass reads it.  This gives cloth a persistent wave
+	// motion that is independent of the XPBD solver.
+	//
+	// The wave travels along the column axis with a spatial frequency derived
+	// from the grid width.  Per-row phase seeds produce vertical variation so
+	// the cloth appears to ripple rather than oscillate as a rigid sheet.
+	// =========================================================================
+	if (g_Cloth.sim_pass == 3u)
+	{
+		float  w = particle_inv_mass(col, row);
+		if (w <= 0.0f) return; // pinned particles are immovable
+
+		float3 xc = load_f3(g_Buffers[g_Cloth.pos_curr_srv], idx);
+
+		// Traveling wave: spatial phase from column, temporal from time_seconds.
+		// Row seed breaks the wave into horizontal bands for visual richness.
+		const float k     = 6.28318 / max((float)g_Cloth.grid_w, 1.0);
+		const float phase = k * (float)col - g_Cloth.time_seconds * 2.5
+						  + (float)row * 0.4;
+		const float wave  = sin(phase) * g_Cloth.wave_amplitude;
+
+		// Displace along the stored per-instance wind direction.
+		xc += normalize(g_Cloth.wind + float3(0,0,1e-4)) * wave;
+
+		store_f3(g_RWBuffers[g_Cloth.pos_curr_uav], idx, xc);
 		return;
 	}
 }

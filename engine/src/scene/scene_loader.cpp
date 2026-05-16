@@ -87,73 +87,30 @@ bool SceneLoader::load(const std::string& file_path,
     MARS_LOG("[SceneLoader] Loading scene '{}' from '{}'", scene_name, file_path);
 
     scene.m_name   = scene_name;
-    scene.m_wind   = {};
     scene.m_loaded = false;
-
-    // ---- Wind ---------------------------------------------------------------
-    // Supports two schemas:
-    //   Legacy:  "wind": [x, y, z]                 — static Vec3, no animation
-    //   Current: "wind": { "baseDirection": [...],  — animated WindDesc
-    //                      "baseSpeed": 8.0, ... }
-    if (s.contains("wind"))
-    {
-        const json& jw = s["wind"];
-        if (jw.is_array())
-        {
-            // Legacy static vector — convert to WindDesc with no animation layers.
-            Vec3 v = json_vec3(jw);
-            float speed = std::sqrt(v.x*v.x + v.y*v.y + v.z*v.z);
-            scene.m_wind      = v;
-            scene.m_wind_desc.base_speed = speed;
-            if (speed > 0.0f)
-                scene.m_wind_desc.base_direction = { v.x/speed, v.y/speed, v.z/speed };
-        }
-        else if (jw.is_object())
-        {
-            WindDesc& wd = scene.m_wind_desc;
-
-            if (jw.contains("baseDirection"))
-            {
-                Vec3 d = json_vec3(jw["baseDirection"], { 1.0f, 0.0f, 0.0f });
-                float len = std::sqrt(d.x*d.x + d.y*d.y + d.z*d.z);
-                if (len > 1e-6f)
-                    wd.base_direction = { d.x/len, d.y/len, d.z/len };
-            }
-
-            wd.base_speed                 = jw.value("baseSpeed",                  0.0f);
-            wd.gust_strength              = jw.value("gustStrength",               0.0f);
-            wd.gust_frequency             = jw.value("gustFrequency",              0.25f);
-            wd.direction_wander_angle     = jw.value("directionWanderAngle",       0.0f);
-            wd.direction_wander_frequency = jw.value("directionWanderFrequency",   0.12f);
-            wd.micro_variation            = jw.value("microVariation",             0.0f);
-            wd.micro_frequency            = jw.value("microFrequency",             1.5f);
-            wd.response_smoothing         = jw.value("responseSmoothing",          0.0f);
-
-            // Pre-compute the base static wind vector so legacy Vec3 consumers still work.
-            scene.m_wind = {
-                wd.base_direction.x * wd.base_speed,
-                wd.base_direction.y * wd.base_speed,
-                wd.base_direction.z * wd.base_speed
-            };
-        }
-    }
 
     // ---- Skybox -------------------------------------------------------------
     if (s.contains("skybox"))
     {
         const json& sky = s["skybox"];
-        std::string type_str = sky.value("type", "physical");
+        std::string type_str = sky.value("type", "debug");
         if (type_str == "hdri")
         {
             scene.m_skybox.type      = SkyboxDesc::Type::HDRI;
             scene.m_skybox.hdri_path = resolve_path(base_dir, sky.value("hdri", ""));
         }
-        else
+        else if (type_str == "physical")
         {
             scene.m_skybox.type = SkyboxDesc::Type::Physical;
         }
+        else
+        {
+            scene.m_skybox.type = SkyboxDesc::Type::Debug;
+        }
         if (sky.contains("sun_direction"))
             scene.m_skybox.sun_direction = json_vec3(sky["sun_direction"], { 0.3f, 0.8f, 0.1f });
+        if (sky.contains("sun_color"))
+            scene.m_skybox.sun_color = json_vec3(sky["sun_color"], { 1.0f, 0.98f, 0.95f });
         scene.m_skybox.sun_intensity = sky.value("sun_intensity", 10.0f);
     }
 
@@ -186,8 +143,8 @@ bool SceneLoader::load(const std::string& file_path,
         LightDesc sun;
         sun.type      = LightType::Directional;
         sun.direction = scene.m_skybox.sun_direction; // NOTE: must point TOWARD the sky (+Y up)
+        sun.color     = scene.m_skybox.sun_color;
         sun.intensity = scene.m_skybox.sun_intensity;
-        sun.color     = { 1.0f, 0.98f, 0.95f };
         sun.name      = "Sun";
         scene.m_lights.push_back(sun);
     }
@@ -471,6 +428,15 @@ bool SceneLoader::load(const std::string& file_path,
             desc.xpbd_iterations         = jc.value("xpbd_iterations",         10u);
             desc.pin_corners             = jc.value("pin_corners",               0b0011u);
 
+            // Procedural flag wave parameters
+            if (jc.contains("wind_direction"))
+            {
+                Vec3 d = json_vec3(jc["wind_direction"], { 1.0f, 0.0f, 0.0f });
+                float len = std::sqrt(d.x*d.x + d.y*d.y + d.z*d.z);
+                desc.wind_direction = (len > 1e-6f) ? Vec3{d.x/len, d.y/len, d.z/len} : Vec3{1.0f, 0.0f, 0.0f};
+            }
+            desc.wave_amplitude = jc.value("wave_amplitude", 0.5f);
+
             // Optional material override
             if (jc.contains("material"))
             {
@@ -516,40 +482,47 @@ bool SceneLoader::load(const std::string& file_path,
         }
     }
 
-    // ---- Ecosystem ----------------------------------------------------------
-    if (s.contains("ecosystem"))
+    // ---- Ecosystems ---------------------------------------------------------
+    // Support both the new "ecosystems" array and the legacy "ecosystem" object.
+    std::vector<const json*> eco_sources;
+    if (s.contains("ecosystems") && s["ecosystems"].is_array())
     {
-        const json& je = s["ecosystem"];
+        for (const auto& je : s["ecosystems"])
+            eco_sources.push_back(&je);
+    }
+    else if (s.contains("ecosystem"))
+    {
+        eco_sources.push_back(&s["ecosystem"]);
+    }
 
-        scene.m_ecosystem.enabled = je.value("enabled", false);
+    for (const json* eco_ptr : eco_sources)
+    {
+        const json& je = *eco_ptr;
+        EcosystemDesc eco;
 
-        if (scene.m_ecosystem.enabled)
+        eco.enabled = je.value("enabled", false);
+
+        if (eco.enabled)
         {
-            MARS_LOG("[SceneLoader] Parsing ecosystem configuration...");
+            MARS_LOG("[SceneLoader] Parsing ecosystem '{}' configuration...", je.value("name", ""));
 
-            // Density map
+            eco.density_map_path = {};
             if (je.contains("density_map"))
             {
-                scene.m_ecosystem.density_map_path = resolve_path(base_dir, 
+                eco.density_map_path = resolve_path(base_dir,
                     je["density_map"].get<std::string>());
             }
 
-            // World bounds
             if (je.contains("world_min"))
-                scene.m_ecosystem.world_min = json_vec3(je["world_min"], 
-                    { -1000.0f, 0.0f, -1000.0f });
+                eco.world_min = json_vec3(je["world_min"], { -1000.0f, 0.0f, -1000.0f });
             if (je.contains("world_max"))
-                scene.m_ecosystem.world_max = json_vec3(je["world_max"], 
-                    { 1000.0f, 0.0f, 1000.0f });
+                eco.world_max = json_vec3(je["world_max"], {  1000.0f, 0.0f,  1000.0f });
 
-            scene.m_ecosystem.placement_y = je.value("placement_y", 0.0f);
+            eco.placement_y         = je.value("placement_y", 0.0f);
+            eco.density_multiplier  = je.value("density_multiplier", 1.0f);
+            eco.max_instances       = je.value("max_instances", 10000u);
+            eco.frustum_cull_margin = je.value("frustum_cull_margin", 50.0f);
 
-            // Density settings
-            scene.m_ecosystem.density_multiplier = je.value("density_multiplier", 1.0f);
-            scene.m_ecosystem.max_instances = je.value("max_instances", 10000u);
-            scene.m_ecosystem.frustum_cull_margin = je.value("frustum_cull_margin", 50.0f);
-
-            // Species
             if (je.contains("species"))
             {
                 for (const auto& jsp : je["species"])
@@ -559,38 +532,39 @@ bool SceneLoader::load(const std::string& file_path,
 
                     if (jsp.contains("asset_path"))
                     {
-                        species.asset_path = resolve_path(base_dir, 
+                        species.asset_path = resolve_path(base_dir,
                             jsp["asset_path"].get<std::string>());
                     }
 
-                    // LOD distances
-                    species.lod_near_max = jsp.value("lod_near_max", 50.0f);
-                    species.lod_mid_max = jsp.value("lod_mid_max", 200.0f);
-                    species.lod_far_max = jsp.value("lod_far_max", 600.0f);
+                    species.lod_near_max      = jsp.value("lod_near_max", 50.0f);
+                    species.lod_mid_max       = jsp.value("lod_mid_max", 200.0f);
+                    species.lod_far_max       = jsp.value("lod_far_max", 600.0f);
                     species.max_draw_distance = jsp.value("max_draw_distance", 2000.0f);
 
-                    // Wind parameters
-                    species.wind_primary_bend = jsp.value("wind_primary_bend", 0.5f);
-                    species.wind_secondary_sway = jsp.value("wind_secondary_sway", 0.3f);
-                    species.wind_leaf_flutter = jsp.value("wind_leaf_flutter", 0.2f);
+                    species.primary_bend_strength        = jsp.value("primary_bend_strength", 0.5f);
+                    species.primary_bend_speed           = jsp.value("primary_bend_speed", 0.067f);
+                    species.wind_leaf_flutter_strength   = jsp.value("wind_leaf_flutter_strength", 0.2f);
+                    species.wind_leaf_flutter_speed      = jsp.value("wind_leaf_flutter_speed", 1.0f);
 
-                    // Spawn weight
                     species.spawn_weight = jsp.value("spawn_weight", 1.0f);
 
-                    scene.m_ecosystem.species.push_back(species);
+                    eco.species.push_back(species);
 
-                    MARS_LOG("[SceneLoader]   Species '{}': asset='{}', LOD={{{}m,{}m,{}m}}, wind={{bend:{:.2f}, sway:{:.2f}, flutter:{:.2f}}}",
-                        species.name, species.asset_path, 
+                    MARS_LOG("[SceneLoader]   Species '{}': asset='{}', LOD={{{}m,{}m,{}m}}, anim={{bend_strength:{:.2f}, bend_speed:{:.3f}, flutter_strength:{:.2f}, flutter_speed:{:.2f}}}",
+                        species.name, species.asset_path,
                         species.lod_near_max, species.lod_mid_max, species.lod_far_max,
-                        species.wind_primary_bend, species.wind_secondary_sway, species.wind_leaf_flutter);
+                        species.primary_bend_strength, species.primary_bend_speed, species.wind_leaf_flutter_strength, species.wind_leaf_flutter_speed);
                 }
             }
 
-            MARS_LOG("[SceneLoader] Ecosystem: {} species, density_map='{}', max_instances={}",
-                scene.m_ecosystem.species.size(),
-                scene.m_ecosystem.density_map_path.empty() ? "<none>" : scene.m_ecosystem.density_map_path,
-                scene.m_ecosystem.max_instances);
+            MARS_LOG("[SceneLoader] Ecosystem '{}': {} species, density_map='{}', max_instances={}",
+                je.value("name", ""),
+                eco.species.size(),
+                eco.density_map_path.empty() ? "<none>" : eco.density_map_path,
+                eco.max_instances);
         }
+
+        scene.m_ecosystems.push_back(std::move(eco));
     }
 
     MARS_LOG("[SceneLoader] Scene '{}' loaded: {} model(s), {} rigid node(s), {} cloth(s), {} light(s), {} camera(s){} ",

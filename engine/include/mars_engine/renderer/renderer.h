@@ -85,15 +85,6 @@ public:
     // Must be called after init(). Returns false on parse/load errors.
     bool load_scene(const std::string& marsscene_path);
 
-    // Set the animated wind description used for cloth simulation.
-    // Call after load_scene() to override the scene-file wind, or let
-    // load_scene() populate it automatically.
-    void set_wind_desc(const WindDesc& desc) { m_wind_desc = desc; m_wind_state = {}; }
-    const WindDesc& wind_desc() const        { return m_wind_desc; }
-
-    // Returns the instantaneous evaluated wind vector (updated each update() call).
-    Vec3 wind() const { return m_wind_current; }
-
     // Rebuild the TLAS from the current scene (e.g. after adding instances).
     void rebuild_tlas();
 
@@ -183,39 +174,12 @@ private:
     bool     m_initialised       = false;
     bool     m_rigid_nodes_dirty = false;
     bool     m_cloth_dirty       = false;   // true when cloth instances need GPU sim + BLAS refit
-    bool     m_ecosystem_placed  = false;   // true after vegetation placement has run once
-    bool     m_ecosystem_dirty   = false;   // true when ecosystem instances need refit/TLAS rebuild
-    EcosystemGpuResources m_ecosystem_gpu;  // instance / counter / species GPU buffers (M10)
+    std::vector<bool>                  m_ecosystem_placed;   // per-layer: true after placement has run
+    std::vector<bool>                  m_ecosystem_dirty;    // per-layer: true when instances need TLAS rebuild
+    std::vector<EcosystemGpuResources> m_ecosystem_gpu;      // per-layer GPU buffers (M10)
     float    m_last_delta_time        = 0.0f;  // stored by update(), used by render_frame_path_traced()
-    float    m_elapsed_time_seconds   = 0.0f;  // total elapsed time, accumulated each update() for wind
+    float    m_elapsed_time_seconds   = 0.0f;  // total elapsed time, accumulated each update()
     float    m_cloth_time_accumulator  = 0.0f;  // leftover time carried between frames for fixed-step cloth sim
-
-    // ---- Wind state ---------------------------------------------------------
-    WindDesc m_wind_desc    = {};        // scene-file parameters (loaded once)
-    Vec3     m_wind_current = {};        // evaluated wind vector this frame (IIR-smoothed output)
-
-    // Runtime phase accumulators for the three oscillator layers.
-    struct WindState
-    {
-        float gust_phase      = 0.0f;
-        float wander_phase    = 0.0f;
-        float micro_phase_x   = 0.0f;
-        float micro_phase_z   = 0.0f;
-    } m_wind_state;
-
-    // Per-species spring-mass oscillator that gives trunk sway its inertia.
-    // Models the tree as a damped harmonic oscillator driven by wind_strength:
-    //   natural frequency  ~0.4 Hz  (large tree resonance)
-    //   damping ratio      ~0.15    (lightly damped, 3-4 cycles to settle)
-    // The output (trunk_envelope) replaces wind_t as the amplitude driver for
-    // Layer 1, so bending builds up over ~2-3 s and decays the same way.
-    struct SpeciesWindState
-    {
-        float pos           = 0.0f;   // trunk spring position  (normalised [0,1])
-        float vel           = 0.0f;   // trunk spring velocity
-        float leaf_envelope = 0.0f;   // IIR-smoothed wind_t for leaf flutter
-    };
-    std::vector<SpeciesWindState> m_species_wind_states;
 
     // Per-output flag: true when slEvaluateFeature (DLSS-RR) left DenoisedOutputUAV
     // in legacy D3D12_RESOURCE_STATE_UNORDERED_ACCESS (Streamline always issues a
