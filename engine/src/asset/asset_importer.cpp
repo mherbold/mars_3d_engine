@@ -181,12 +181,26 @@ MaterialData AssetImporter::process_material(ImportContext& ctx, uint32_t mat_in
 // ---------------------------------------------------------------------------
 // process_mesh
 // ---------------------------------------------------------------------------
-MeshData AssetImporter::process_mesh(ImportContext& /*ctx*/, const void* ai_mesh_ptr)
+MeshData AssetImporter::process_mesh(ImportContext& ctx, const void* ai_mesh_ptr)
 {
     const aiMesh* ai_mesh = static_cast<const aiMesh*>(ai_mesh_ptr);
     MeshData mesh;
     mesh.name           = ai_mesh->mName.C_Str();
     mesh.material_index = ai_mesh->mMaterialIndex;
+
+    // Classify as a leaf/foliage submesh by inspecting the material name.
+    // SpeedTree ORCA exports name leaf materials with "Leaf" in the name
+    // (e.g. "EuropeanLindenLeaf", "EuropeanLindenLeaf_2"). This flag tells
+    // the wind shader to apply leaf flutter at ALL heights, not just the
+    // upper canopy, so lower leaf clusters shimmer correctly.
+    if (mesh.material_index < static_cast<uint32_t>(ctx.asset->materials.size()))
+    {
+        const std::string& mat_name = ctx.asset->materials[mesh.material_index].name;
+        std::string lower = mat_name;
+        for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        mesh.is_leaf = (lower.find("leaf") != std::string::npos
+                     || lower.find("frond") != std::string::npos);
+    }
 
     // Vertices
     mesh.vertices.reserve(ai_mesh->mNumVertices);

@@ -1483,10 +1483,20 @@ void Renderer::render_frame_path_traced()
                     ws.vel += accel  * spring_dt;
                     ws.pos += ws.vel * spring_dt;
                     ws.pos  = std::max(0.0f, ws.pos);  // can't push below zero
+
+                    // Leaf envelope: first-order IIR low-pass with a ~0.4 s time
+                    // constant.  Much faster than the trunk spring (~4.5 s) so
+                    // leaves respond within a second, but not in a single frame.
+                    // alpha = 1 - exp(-dt / tau),  tau = 0.4 s
+                    const float leaf_alpha = 1.0f - std::exp(-spring_dt / 0.4f);
+                    ws.leaf_envelope += leaf_alpha * (wind_t_target - ws.leaf_envelope);
                 }
 
                 const float trunk_envelope = (sp_idx < m_species_wind_states.size())
                                              ? std::min(m_species_wind_states[sp_idx].pos, 1.5f)
+                                             : wind_t_target;
+                const float leaf_envelope  = (sp_idx < m_species_wind_states.size())
+                                             ? m_species_wind_states[sp_idx].leaf_envelope
                                              : wind_t_target;
 
                 for (VegetationLOD lod : k_wind_lods)
@@ -1511,6 +1521,8 @@ void Renderer::render_frame_path_traced()
                         const float mesh_min_y  = gm.bounds.min_pt.y;
                         const float mesh_height = gm.bounds.max_pt.y - gm.bounds.min_pt.y;
 
+                        const bool is_leaf = (si < gm.mesh_is_leaf.size()) && gm.mesh_is_leaf[si];
+
                         m_path_tracer.dispatch_vegetation_wind(
                             m_cmd_list.Get(),
                             mb.vertex_count(),
@@ -1526,7 +1538,9 @@ void Renderer::render_frame_path_traced()
                             sp.wind_primary_bend,
                             sp.wind_secondary_sway,
                             sp.wind_leaf_flutter,
-                            trunk_envelope);
+                            trunk_envelope,
+                            leaf_envelope,
+                            is_leaf);
 
                         // UAV barrier: ensure wind output is visible to BLAS refit.
                         D3D12_RESOURCE_BARRIER uav_barrier{};

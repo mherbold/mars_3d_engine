@@ -889,9 +889,9 @@ void PathTracer::create_vegetation_wind_pipeline(DeviceContext& ctx)
     auto* device = ctx.device();
 
     {
-        // 16 root constants (WindConstants packed as DWORDs)
+        // 20 root constants (WindConstants packed as DWORDs: 16 original + is_leaf_mesh + 3 pad)
         CD3DX12_ROOT_PARAMETER1 params[2]{};
-        params[0].InitAsConstants(16, 0, 0, D3D12_SHADER_VISIBILITY_ALL);
+        params[0].InitAsConstants(20, 0, 0, D3D12_SHADER_VISIBILITY_ALL);
 
         static constexpr UINT k_unbounded = UINT_MAX;
         static constexpr D3D12_DESCRIPTOR_RANGE_FLAGS k_volatile =
@@ -956,7 +956,9 @@ void PathTracer::dispatch_vegetation_wind(ID3D12GraphicsCommandList6* cmd_list,
                                           float          primary_bend,
                                           float          secondary_sway,
                                           float          leaf_flutter,
-                                          float          trunk_envelope)
+                                          float          trunk_envelope,
+                                          float          leaf_envelope,
+                                          bool           is_leaf_mesh)
 {
     if (vertex_count == 0 ||
         source_vertex_srv == UINT32_MAX ||
@@ -967,7 +969,7 @@ void PathTracer::dispatch_vegetation_wind(ID3D12GraphicsCommandList6* cmd_list,
     cmd_list->SetPipelineState(m_vegetation_wind_pso.Get());
     cmd_list->SetComputeRootDescriptorTable(1, m_bindless_heap_gpu_start);
 
-    // WindConstants HLSL layout (16 DWORDs):
+    // WindConstants HLSL layout (20 DWORDs):
     //   [0]     vertex_count
     //   [1]     source_vertex_buffer_srv
     //   [2]     output_vertex_buffer_uav
@@ -981,9 +983,12 @@ void PathTracer::dispatch_vegetation_wind(ID3D12GraphicsCommandList6* cmd_list,
     //   [12]    leaf_flutter
     //   [13]    mesh_height
     //   [14]    prev_pos_buffer_uav
-    //   [15]    trunk_envelope  (spring-mass oscillator output, replaces raw wind_t in Layer 1)
+    //   [15]    trunk_envelope  (spring-mass oscillator output)
+    //   [16]    is_leaf_mesh    (1 = leaf/frond submesh: flutter at all heights)
+    //   [17]    leaf_envelope   (IIR-smoothed wind_t for leaf flutter)
+    //   [18..19] pad
     union { float f; uint32_t u; } u;
-    uint32_t c[16]{};
+    uint32_t c[20]{};
     c[0] = vertex_count;
     c[1] = source_vertex_srv;
     c[2] = output_vertex_uav;
@@ -1000,7 +1005,10 @@ void PathTracer::dispatch_vegetation_wind(ID3D12GraphicsCommandList6* cmd_list,
     u.f = mesh_height;       c[13] = u.u;
     c[14] = prev_pos_uav;
     u.f = trunk_envelope;    c[15] = u.u;
-    cmd_list->SetComputeRoot32BitConstants(0, 16, c, 0);
+    c[16] = is_leaf_mesh ? 1u : 0u;
+    u.f = leaf_envelope;     c[17] = u.u;
+    // c[18..19] = 0 (pad)
+    cmd_list->SetComputeRoot32BitConstants(0, 20, c, 0);
 
     const uint32_t group_count = (vertex_count + 63u) / 64u;
     cmd_list->Dispatch(group_count, 1, 1);

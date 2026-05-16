@@ -86,12 +86,14 @@ uint32_t ResourceManager::load_model(DeviceContext& ctx, const std::string& file
     // Upload each mesh primitive.
     gpu_model.mesh_buffers.reserve(cpu_asset->meshes.size());
     gpu_model.mesh_material_indices.reserve(cpu_asset->meshes.size());
+    gpu_model.mesh_is_leaf.reserve(cpu_asset->meshes.size());
     for (const auto& mesh : cpu_asset->meshes)
     {
         GpuMeshBuffer buf;
         buf.upload(ctx, m_allocator, mesh);
         gpu_model.mesh_buffers.push_back(std::move(buf));
         gpu_model.mesh_material_indices.push_back(mesh.material_index);
+        gpu_model.mesh_is_leaf.push_back(mesh.is_leaf);
     }
 
     // Preserve CPU-side materials so callers (renderer) can read factors/flags.

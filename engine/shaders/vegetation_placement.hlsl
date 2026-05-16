@@ -103,8 +103,15 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 	const float3 world_size = g_Constants.world_max - g_Constants.world_min;
 	const float2 cell_size = world_size.xz / float(g_Constants.grid_resolution);
 
-	const float world_x = g_Constants.world_min.x + (grid_x + 0.5) * cell_size.x;
-	const float world_z = g_Constants.world_min.z + (grid_z + 0.5) * cell_size.y;
+	// Per-cell jitter: shift the spawn point randomly within the cell so trees
+	// do not sit on a visible regular grid.
+	const uint jitter_seed_x = Hash(Hash3(grid_x, grid_z, g_Constants.random_seed) + 6u);
+	const uint jitter_seed_z = Hash(Hash3(grid_x, grid_z, g_Constants.random_seed) + 7u);
+	const float jitter_x = (Hash01(jitter_seed_x) - 0.5f) * cell_size.x;
+	const float jitter_z = (Hash01(jitter_seed_z) - 0.5f) * cell_size.y;
+
+	const float world_x = g_Constants.world_min.x + (grid_x + 0.5f) * cell_size.x + jitter_x;
+	const float world_z = g_Constants.world_min.z + (grid_z + 0.5f) * cell_size.y + jitter_z;
 
 	// Sample density map (normalized UV coordinates)
 	const float2 uv = float2(grid_x, grid_z) / float(g_Constants.grid_resolution);

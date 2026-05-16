@@ -44,6 +44,7 @@ struct GpuModel
     std::string                    name;
     std::vector<GpuMeshBuffer>     mesh_buffers;  // parallel to ModelAsset::meshes
     std::vector<uint32_t>          mesh_material_indices; // material index per mesh (parallel to mesh_buffers)
+    std::vector<bool>              mesh_is_leaf;  // true for leaf/frond submeshes (parallel to mesh_buffers)
     std::vector<uint32_t>          texture_slots;  // SRV slot per material base-colour texture
     std::vector<uint32_t>          normal_slots;   // SRV slot per material normal texture (UINT32_MAX if none)
     std::vector<uint32_t>          mr_slots;       // SRV slot per material metallic-roughness texture (UINT32_MAX if none)

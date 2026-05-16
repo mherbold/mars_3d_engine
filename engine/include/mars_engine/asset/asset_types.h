@@ -74,6 +74,7 @@ struct MeshData
     std::vector<uint32_t> indices;
     uint32_t              material_index = 0; // Index into ModelAsset::materials
     AABB                  bounds         = {};
+    bool                  is_leaf        = false; // True for leaf/foliage submeshes (wind flutter applies at all heights)
 };
 
 // =============================================================================

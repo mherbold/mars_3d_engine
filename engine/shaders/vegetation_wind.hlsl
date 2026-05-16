@@ -79,6 +79,11 @@ struct WindConstants
 	float  mesh_height;                // Height of the mesh AABB (for normalisation)
 	uint   prev_pos_buffer_uav;        // RWByteAddressBuffer for compact float3 prev positions
 	float  trunk_envelope;            // Spring-mass output from CPU [0..~1.5]: inertia-smoothed wind_t
+
+	uint   is_leaf_mesh;               // 1 = leaf/frond submesh: flutter at all heights, not just upper canopy
+	float  leaf_envelope;              // IIR-smoothed wind_t for leaf flutter (~0.4 s time constant)
+	uint   _pad1;
+	uint   _pad2;
 };
 
 ByteAddressBuffer    g_Buffers[]        : register(t0, space1);
@@ -174,14 +179,10 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 	// -------------------------------------------------------------------------
 	const float speed_mod = 0.5 + wind_t_raw * 0.2;
 	const float t_slow = g_Wind.time_seconds * speed_mod       + g_Wind.wind_phase_offset;
-	const float t_fast = g_Wind.time_seconds * speed_mod * 3.1 + g_Wind.wind_phase_offset;
+	const float t_fast = g_Wind.time_seconds * speed_mod * 1.4 + g_Wind.wind_phase_offset;
 
-	// -------------------------------------------------------------------------
-	// Cross-wind axis — perpendicular to wind direction in the horizontal plane.
-	// Gives branch sway its elliptical orbital character.
-	// -------------------------------------------------------------------------
-	const float3 wind_right = normalize(float3(-g_Wind.wind_direction.z, 0.0,
-												g_Wind.wind_direction.x));
+	// (wind_right removed — branch sway now operates in local XZ to stay
+	//  orientation-independent across randomly-rotated instances.)
 
 	// -------------------------------------------------------------------------
 	// Off-axis distance from the tree's vertical axis, normalised.
@@ -206,14 +207,22 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 	// =========================================================================
 	const float trunk_curve     = (3.0 * h * h - h * h * h) * 0.5;
 	const float trunk_freq      = 0.7 + trunk_env * 0.25;         // Hz: slow primary sway
-	const float trunk_osc       = sin(t_slow * trunk_freq * 6.28318)
-								+ 0.18 * sin(t_slow * trunk_freq * 6.28318 * 2.13 + 0.9);
 	const float trunk_amplitude = trunk_curve
 								* g_Wind.primary_bend
 								* trunk_env
 								* max(g_Wind.mesh_height, 1.0) * 0.12;
 
-	float3 displacement = g_Wind.wind_direction * trunk_osc * trunk_amplitude;
+	// Circular orbit in local XZ: (cos(ωt), sin(ωt)).
+	// A circle is rotationally invariant — after any instance Y rotation the
+	// orbit shape is identical.  All trees sway the same amount and trace the
+	// same path; only their phase around the circle differs, which the eye reads
+	// as "all swaying in the same wind" rather than "facing different winds".
+	// A small second harmonic at an inharmonic ratio adds figure-8 character.
+	const float trunk_angle  = t_slow * trunk_freq * 6.28318;
+	const float trunk_osc_x  = cos(trunk_angle) + 0.18 * cos(trunk_angle * 2.13 + 0.9);
+	const float trunk_osc_z  = sin(trunk_angle) + 0.18 * sin(trunk_angle * 2.13 + 0.9);
+
+	float3 displacement = float3(trunk_osc_x, 0.0, trunk_osc_z) * trunk_amplitude;
 
 	// =========================================================================
 	// Layer 2: BRANCH SWAY
@@ -239,61 +248,67 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 	const float vx = v.position.x;
 	const float vz = v.position.z;
 
-	// Along-wind: primary + three harmonics at inharmonic ratios.
-	const float a0 = sin(t_slow * 2.20 * 6.28318 + vx * 0.93 + vz * 0.71);
-	const float a1 = sin(t_slow * 3.67 * 6.28318 + vx * 1.41 + vz * 0.53 + 0.8);
-	const float a2 = sin(t_fast * 1.13 * 6.28318 + vx * 2.07 + vz * 1.89 + 2.1);
-	const float a3 = sin(t_fast * 1.73 * 6.28318 + vx * 0.61 + vz * 2.33 + 4.2);
-	const float along_osc = a0 * 0.45 + a1 * 0.28 + a2 * 0.17 + a3 * 0.10;
+	// Per-vertex phase seeds derived from local position give each branch vertex
+	// its own oscillation phase.  cos/sin pairs per frequency produce circular
+	// orbits in local XZ; after any instance Y rotation the orbit is identical —
+	// so no tree looks like it's in a different wind.
+	const float p0 = vx * 0.93 + vz * 0.71;
+	const float p1 = vx * 1.41 + vz * 0.53 + 0.8;
+	const float p2 = vx * 2.07 + vz * 1.89 + 2.1;
+	const float p3 = vx * 0.67 + vz * 1.19 + 1.3;
 
-	// Cross-wind: independent seeds — uncorrelated from along-wind.
-	const float c0 = sin(t_slow * 2.81 * 6.28318 + vx * 0.67 + vz * 1.19 + 1.3);
-	const float c1 = sin(t_slow * 4.11 * 6.28318 + vx * 1.53 + vz * 0.87 + 3.0);
-	const float c2 = sin(t_fast * 1.47 * 6.28318 + vx * 2.91 + vz * 1.37 + 0.5);
-	const float cross_osc = c0 * 0.50 + c1 * 0.30 + c2 * 0.20;
+	const float2 b0 = float2(cos(t_slow * 2.20 * 6.28318 + p0), sin(t_slow * 2.20 * 6.28318 + p0));
+	const float2 b1 = float2(cos(t_slow * 3.67 * 6.28318 + p1), sin(t_slow * 3.67 * 6.28318 + p1));
+	const float2 b2 = float2(cos(t_fast * 1.13 * 6.28318 + p2), sin(t_fast * 1.13 * 6.28318 + p2));
+	const float2 b3 = float2(cos(t_fast * 1.73 * 6.28318 + p3), sin(t_fast * 1.73 * 6.28318 + p3));
+	const float2 branch_xz = b0 * 0.45 + b1 * 0.28 + b2 * 0.17 + b3 * 0.10;
 
-	const float along_amp = g_Wind.secondary_sway * wind_t_raw * 0.55;
-	const float cross_amp = g_Wind.secondary_sway * wind_t_raw * 0.25;
+	const float branch_amp = g_Wind.secondary_sway * wind_t_raw * 0.40;
 
-	displacement += g_Wind.wind_direction * along_osc * along_amp * branch_mask;
-	displacement += wind_right            * cross_osc * cross_amp * branch_mask;
+	// Displace in local XZ (circular orbit per vertex); rotationally invariant.
+	displacement += float3(branch_xz.x, 0.0, branch_xz.y) * branch_amp * branch_mask;
 
 	// =========================================================================
 	// Layer 3: LEAF DETAIL BENDING
 	//
-	// Individual leaf vertices ripple and flutter using two uncorrelated high-
+	// Two uncorrelated high-
 	// frequency oscillators mixed with unequal weights to avoid periodicity.
 	// The vertex position seeds a unique phase per leaf so they are never in
 	// synchrony — each appears to flutter independently.
 	//
-	// A sqrt curve on wind_t_raw (+ 0.15 floor) keeps leaves alive in calm air
+	// A sqrt curve on leaf_envelope (+ 0.15 floor) keeps leaves alive in calm air
 	// and avoids the harsh on/off look of a linear threshold.
 	//
-	// Applied only in the upper canopy (h > 0.55) AND to off-axis vertices
-	// (off_axis > 0.5) to prevent trunk geometry from vibrating.
-	//
-	// Leaves react almost instantly: wind_t_raw is used directly, so a gust
-	// produces leaf flutter within a single frame.
+	// Applied only to off-axis vertices to prevent trunk geometry from vibrating.
+	// For leaf submeshes the height gate is dropped (is_leaf_mesh flag).
 	// =========================================================================
-	const float flutter_mask = saturate((h - 0.55) * 3.0) * saturate(off_axis * 2.0);
-	const float flutter_t    = sqrt(saturate(wind_t_raw + 0.15));
+	// For leaf submeshes (is_leaf_mesh == 1) the height gate is dropped: every
+	// leaf vertex flutters regardless of where it sits on the tree. The off_axis
+	// mask still applies so trunk-core vertices never vibrate.
+	// For bark / branch geometry the original height gate (h > 0.55) is kept so
+	// the trunk and thick lower branches stay still.
+	const float flutter_mask = (g_Wind.is_leaf_mesh != 0u)
+		? saturate(off_axis * 2.0)
+		: saturate((h - 0.55) * 3.0) * saturate(off_axis * 2.0);
+	const float flutter_t    = sqrt(saturate(g_Wind.leaf_envelope + 0.15));
 
 	const float fp_a = v.position.x * 5.3 + v.position.y * 3.9 + v.position.z * 4.7;
 	const float fp_b = v.position.x * 7.1 + v.position.y * 5.3 + v.position.z * 6.9;
 
-	// Two inharmonic oscillators (ratio 9.5 : 14.3 ≈ 2 : 3, but with irrational
-	// frequency scaling so the combined waveform never exactly repeats).
-	const float flutter_a = sin(t_fast * 9.5  * 6.28318 + fp_a);
-	const float flutter_b = sin(t_fast * 14.3 * 6.28318 + fp_b + 2.4);
+	// Two inharmonic oscillators at naturalistic leaf-flutter frequencies
+	// (~2-4 Hz). The irrational ratio (≈ 2:3 but not exact) ensures the
+	// combined waveform never exactly repeats.
+	const float flutter_a = sin(t_fast * 2.3  * 6.28318 + fp_a);
+	const float flutter_b = sin(t_fast * 3.5  * 6.28318 + fp_b + 2.4);
 
-	const float flutter_amp = g_Wind.leaf_flutter * flutter_t * 0.14;
+	const float flutter_amp = g_Wind.leaf_flutter * flutter_t * 0.10;
 
 	// Displace in XZ plane (tangential flutter) with a smaller Y component
 	// (vertical ripple — the leaf tilting up and down as it flutters).
 	displacement.x += (flutter_a * 0.65 + flutter_b * 0.35) * flutter_amp * flutter_mask;
 	displacement.y += (flutter_a * 0.20)                    * flutter_amp * flutter_mask;
-	displacement.z += (cos(t_fast * 9.5  * 6.28318 + fp_a)  * 0.65
-					+  cos(t_fast * 14.3 * 6.28318 + fp_b + 2.4) * 0.35)
+	displacement.z += (cos(t_fast * 2.3  * 6.28318 + fp_a)  * 0.65
+					+  cos(t_fast * 3.5  * 6.28318 + fp_b + 2.4) * 0.35)
 					* flutter_amp * flutter_mask;
 
 	// =========================================================================

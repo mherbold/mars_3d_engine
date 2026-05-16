@@ -211,8 +211,9 @@ private:
     // Layer 1, so bending builds up over ~2-3 s and decays the same way.
     struct SpeciesWindState
     {
-        float pos = 0.0f;   // current oscillator position  (normalised [0,1])
-        float vel = 0.0f;   // current oscillator velocity
+        float pos           = 0.0f;   // trunk spring position  (normalised [0,1])
+        float vel           = 0.0f;   // trunk spring velocity
+        float leaf_envelope = 0.0f;   // IIR-smoothed wind_t for leaf flutter
     };
     std::vector<SpeciesWindState> m_species_wind_states;
 

@@ -26,8 +26,8 @@
   "cameras": [
     {
       "id": "main",
-      "position": [ 0.0, 1.5, 5.0 ],
-      "target": [ 0.0, 0.5, 0.0 ],
+      "position": [ 0.0, 3.0, 5.0 ],
+      "target": [ 0.0, 1.0, 0.0 ],
       "fov_deg": 90.0,
       "near_z": 0.1,
       "far_z": 10000.0
@@ -502,11 +502,11 @@
   "ecosystem": {
     "enabled": true,
     "density_map": "models/vegetation/density_white_4x4.png",
-    "world_min": [ -1.0, 0.0, -2.0 ],
-    "world_max": [  1.0, 0.0,  0.0 ],
+    "world_min": [ -10.0, 0.0, -10.0 ],
+    "world_max": [  10.0, 0.0,  10.0 ],
     "placement_y": 0.0,
     "density_multiplier": 1.0,
-    "max_instances": 1,
+    "max_instances": 30,
     "frustum_cull_margin": 50.0,
     "species": [
       {

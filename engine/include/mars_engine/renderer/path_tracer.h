@@ -328,7 +328,9 @@ public:
                                   float          primary_bend,
                                   float          secondary_sway,
                                   float          leaf_flutter,
-                                  float          trunk_envelope);
+                                  float          trunk_envelope,
+                                  float          leaf_envelope,
+                                  bool           is_leaf_mesh = false);
 
 private:
     // --- Helpers -------------------------------------------------------------
