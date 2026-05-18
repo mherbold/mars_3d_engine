@@ -174,6 +174,7 @@ void PathTracer::init(DeviceContext& ctx,
     create_skinning_pipeline(ctx);
     create_cloth_pipeline(ctx);
     create_vegetation_placement_pipeline(ctx);
+    create_vegetation_culling_pipeline(ctx);
     create_vegetation_lod_pipeline(ctx);
     create_vegetation_wind_pipeline(ctx);
     create_shader_tables(ctx);
@@ -780,6 +781,125 @@ void PathTracer::dispatch_vegetation_placement(ID3D12GraphicsCommandList6* cmd_l
 }
 
 // ---------------------------------------------------------------------------
+// create_vegetation_culling_pipeline
+// Compute pipeline that marks vegetation instances as LOD_CULLED based on
+// frustum and max-draw-distance tests. Runs once per frame before LOD selection.
+// CullingConstants: 24 DWORDs (float4x4 [16] + float3+uint [4] + 4x uint [4]).
+// ---------------------------------------------------------------------------
+void PathTracer::create_vegetation_culling_pipeline(DeviceContext& ctx)
+{
+    auto* device = ctx.device();
+
+    {
+        // 24 root constants (CullingConstants: float4x4 view_proj [16] + float3+uint [4] + 4x uint [4])
+        CD3DX12_ROOT_PARAMETER1 params[2]{};
+        params[0].InitAsConstants(24, 0, 0, D3D12_SHADER_VISIBILITY_ALL);
+
+        static constexpr UINT k_unbounded = UINT_MAX;
+        static constexpr D3D12_DESCRIPTOR_RANGE_FLAGS k_volatile =
+            D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE |
+            D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+
+        // vegetation_culling.hlsl uses:
+        //   u0, space1 — g_RWInstanceBuffers[]  (UAV: instance buffer, read+write)
+        //   t0, space2 — g_SpeciesBuffers[]     (SRV: per-species data)
+        CD3DX12_DESCRIPTOR_RANGE1 ranges[2]{};
+        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, k_unbounded, 0, 1, k_volatile, 0);
+        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, k_unbounded, 0, 2, k_volatile, 0);
+        params[1].InitAsDescriptorTable(2, ranges, D3D12_SHADER_VISIBILITY_ALL);
+
+        CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rs_desc;
+        rs_desc.Init_1_1(2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
+        ComPtr<ID3DBlob> rs_blob, err_blob;
+        throw_if_failed(
+            D3DX12SerializeVersionedRootSignature(&rs_desc,
+                D3D_ROOT_SIGNATURE_VERSION_1_1, &rs_blob, &err_blob),
+            "PathTracer: serialize vegetation culling root signature failed");
+        throw_if_failed(
+            device->CreateRootSignature(0,
+                rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(),
+                IID_PPV_ARGS(&m_vegetation_culling_root_sig)),
+            "PathTracer: create vegetation culling root signature failed");
+        m_vegetation_culling_root_sig->SetName(L"MARS::PathTracer::VegetationCullingRootSig");
+    }
+
+    auto dxil = load_dxil_blob(L"vegetation_culling.dxil");
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
+    pso_desc.pRootSignature = m_vegetation_culling_root_sig.Get();
+    pso_desc.CS             = { dxil.data(), dxil.size() };
+
+    throw_if_failed(
+        device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&m_vegetation_culling_pso)),
+        "PathTracer: create vegetation culling compute PSO failed");
+    m_vegetation_culling_pso->SetName(L"MARS::PathTracer::VegetationCullingPSO");
+
+    MARS_LOG("[PathTracer] Vegetation frustum culling compute pipeline created");
+}
+
+// ---------------------------------------------------------------------------
+// dispatch_vegetation_culling
+// Per-frame frustum and distance cull pass for all placed vegetation instances.
+// Instances outside the view frustum or beyond their species max_draw_distance
+// have their current_lod set to LOD_CULLED (0xFFFFFFFF). They are excluded from
+// the subsequent LOD selection pass and TLAS build.
+// ---------------------------------------------------------------------------
+void PathTracer::dispatch_vegetation_culling(ID3D12GraphicsCommandList6* cmd_list,
+                                              EcosystemDesc&              ecosystem,
+                                              const Vec3&                 camera_position,
+                                              const Mat4x4&               view_proj)
+{
+    if (!m_vegetation_culling_pso || !m_vegetation_culling_root_sig)
+        return;
+    if (ecosystem.instance_buffer_uav == UINT32_MAX ||
+        ecosystem.species_buffer_srv  == UINT32_MAX ||
+        ecosystem.instance_count      == 0)
+        return;
+
+    cmd_list->SetComputeRootSignature(m_vegetation_culling_root_sig.Get());
+    cmd_list->SetPipelineState(m_vegetation_culling_pso.Get());
+
+    // CullingConstants layout (24 DWORDs):
+    //   [0..15]  view_proj (float4x4, row-major)
+    //   [16..18] camera_position (float3)
+    //   [19]     instance_count
+    //   [20]     instance_buffer_uav
+    //   [21]     species_buffer_srv
+    //   [22]     species_count
+    //   [23]     _pad0
+    union { float f; uint32_t u; } cv;
+    uint32_t c[24]{};
+
+    // Row-major float4x4 — indices [0..15]
+    for (int r = 0; r < 4; ++r)
+        for (int col = 0; col < 4; ++col)
+        { cv.f = view_proj.m[r][col]; c[r * 4 + col] = cv.u; }
+
+    cv.f = camera_position.x; c[16] = cv.u;
+    cv.f = camera_position.y; c[17] = cv.u;
+    cv.f = camera_position.z; c[18] = cv.u;
+    c[19] = ecosystem.instance_count;
+    c[20] = ecosystem.instance_buffer_uav;
+    c[21] = ecosystem.species_buffer_srv;
+    c[22] = static_cast<uint32_t>(ecosystem.species.size());
+    c[23] = 0; // _pad0
+
+    cmd_list->SetComputeRoot32BitConstants(0, 24, c, 0);
+
+    // Root parameter [1] is a descriptor table covering the bindless heap
+    // (u0, space1 for UAVs and t0, space2 for SRVs). The heap is already
+    // bound at the frame level via SetDescriptorHeaps; we only need to point
+    // the root parameter at the heap start so the GPU can resolve the
+    // bindless indices stored in the root constants above.
+    cmd_list->SetComputeRootDescriptorTable(1, m_bindless_heap_gpu_start);
+
+    // Dispatch one thread per instance (64-thread groups)
+    const uint32_t dispatch_x = (ecosystem.instance_count + 63) / 64;
+    cmd_list->Dispatch(dispatch_x, 1, 1);
+}
+
+// ---------------------------------------------------------------------------
 // create_vegetation_lod_pipeline
 // Compute pipeline that reads vegetation instances + a per-species LOD-distance
 // table and updates each instance's `current_lod` based on camera distance.
@@ -1167,20 +1287,39 @@ void PathTracer::create_rtpso(DeviceContext& ctx)
     lib->DefineExport(L"ShadowMiss");
     lib->DefineExport(L"Intersection_Impostor");
     lib->DefineExport(L"ClosestHit_Impostor");
+    lib->DefineExport(L"Intersection_ImpostorShadow");
+    lib->DefineExport(L"AnyHit_ImpostorShadow");
 
-    // Hit group subobject (primary)
+    // Hit group subobject (primary triangles) — index 0
     auto* hg = so_desc.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
     hg->SetClosestHitShaderImport(L"ClosestHit");
     hg->SetAnyHitShaderImport(L"AnyHit_Primary");
     hg->SetHitGroupExport(L"HitGroup_Primary");
     hg->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
 
-    // Hit group subobject (octahedral impostor — procedural AABB BLAS)
+    // Hit group subobject (octahedral impostor, primary) — index 1
     auto* hg_imp = so_desc.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
     hg_imp->SetIntersectionShaderImport(L"Intersection_Impostor");
     hg_imp->SetClosestHitShaderImport(L"ClosestHit_Impostor");
     hg_imp->SetHitGroupExport(L"HitGroup_Impostor");
     hg_imp->SetHitGroupType(D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE);
+
+    // Hit group subobject (shadow triangles) — index 2
+    // SKIP_CLOSEST_HIT_SHADER is set on shadow rays so this record only needs
+    // AnyHit_Primary for alpha-cutout leaves; closest-hit is never invoked.
+    auto* hg_shadow = so_desc.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
+    hg_shadow->SetAnyHitShaderImport(L"AnyHit_Primary");
+    hg_shadow->SetHitGroupExport(L"HitGroup_ShadowTriangle");
+    hg_shadow->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
+
+    // Hit group subobject (octahedral impostor, shadow) — index 3
+    // Uses a ray-direction–facing card so the shadow footprint is independent
+    // of camera position.
+    auto* hg_imp_shadow = so_desc.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
+    hg_imp_shadow->SetIntersectionShaderImport(L"Intersection_ImpostorShadow");
+    hg_imp_shadow->SetAnyHitShaderImport(L"AnyHit_ImpostorShadow");
+    hg_imp_shadow->SetHitGroupExport(L"HitGroup_ImpostorShadow");
+    hg_imp_shadow->SetHitGroupType(D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE);
 
     // Shader config: payload = float3 radiance + float hit_t + uint missed + uint depth + float3 throughput + float3 sec_normal
     // Total: 12 + 4 + 4 + 4 + 12 + 12 = 48 bytes (C++ layout).
@@ -1191,7 +1330,7 @@ void PathTracer::create_rtpso(DeviceContext& ctx)
     auto* shader_cfg = so_desc.CreateSubobject<CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT>();
     shader_cfg->Config(
         56,                // payload size: 56 bytes (matches compiled HLSL Miss shader)
-        sizeof(float) * 4);                   // attribute size: max(barycentrics=8, ImpostorAttr=16)
+        sizeof(float) * 5);                   // attribute size: max(barycentrics=8, ImpostorAttr=20)
 
     // Pipeline config: max recursion depth 3 (primary + up to 2 GI bounces; shadow is a separate non-recursive dispatch)
     auto* pipe_cfg = so_desc.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG_SUBOBJECT>();
@@ -1215,6 +1354,10 @@ void PathTracer::create_rtpso(DeviceContext& ctx)
     lrs_assoc->AddExport(L"Intersection_Impostor");
     lrs_assoc->AddExport(L"ClosestHit_Impostor");
     lrs_assoc->AddExport(L"HitGroup_Impostor");
+    lrs_assoc->AddExport(L"HitGroup_ShadowTriangle");
+    lrs_assoc->AddExport(L"Intersection_ImpostorShadow");
+    lrs_assoc->AddExport(L"AnyHit_ImpostorShadow");
+    lrs_assoc->AddExport(L"HitGroup_ImpostorShadow");
 
     // ---- 4. Create RTPSO ----------------------------------------------------
     throw_if_failed(
@@ -1241,8 +1384,14 @@ void PathTracer::create_shader_tables(DeviceContext& ctx)
     uint64_t miss_size   = align_up(k_miss_record_stride * miss_count,
                                     D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT);
 
-    // Hit group table: 2 records (HitGroup_Primary, HitGroup_Impostor)
-    uint32_t hitgroup_count = 2;
+    // Hit group table: 4 records
+    // [0] HitGroup_Primary          (triangles, primary ray)
+    // [1] HitGroup_Impostor          (procedural impostor, primary ray)
+    // [2] HitGroup_ShadowTriangle    (triangles, shadow ray)
+    // [3] HitGroup_ImpostorShadow    (procedural impostor, shadow ray)
+    // Shadow rays use RayContributionToHitGroupIndex=2 so they offset by 2 into
+    // the same table, naturally landing on records [2] and [3].
+    uint32_t hitgroup_count = 4;
     uint64_t hitgroup_size = align_up(k_hitgroup_record_stride * hitgroup_count,
                                       D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT);
 
@@ -1280,6 +1429,12 @@ void PathTracer::create_shader_tables(DeviceContext& ctx)
            k_shader_id_size);
     memcpy(static_cast<uint8_t*>(hg_ptr) + k_hitgroup_record_stride,
            m_rtpso_props->GetShaderIdentifier(L"HitGroup_Impostor"),
+           k_shader_id_size);
+    memcpy(static_cast<uint8_t*>(hg_ptr) + k_hitgroup_record_stride * 2,
+           m_rtpso_props->GetShaderIdentifier(L"HitGroup_ShadowTriangle"),
+           k_shader_id_size);
+    memcpy(static_cast<uint8_t*>(hg_ptr) + k_hitgroup_record_stride * 3,
+           m_rtpso_props->GetShaderIdentifier(L"HitGroup_ImpostorShadow"),
            k_shader_id_size);
 }
 
@@ -1769,7 +1924,11 @@ uint32_t PathTracer::build_blas(DeviceContext& ctx,
     // Free scratch immediately after build — UNLESS allow_update is requested,
     // in which case the scratch must be kept alive for per-frame BLAS refits.
     if (!allow_update)
+    {
+        scratch->Release();
         scratch_alloc->Release();
+        scratch = nullptr;
+    }
 
     uint32_t index = static_cast<uint32_t>(m_blas_list.size());
     BlasEntry entry{};
@@ -2043,8 +2202,9 @@ uint32_t PathTracer::build_vegetation_model_blas(DeviceContext& ctx,
     }
 
     // Scratch is not needed past the build (no ALLOW_UPDATE).
+    scratch->Release();
     scratch_alloc->Release();
-    (void)scratch;
+    scratch = nullptr;
 
     BlasEntry entry{};
     entry.alloc        = result_alloc;
@@ -2177,8 +2337,12 @@ uint32_t PathTracer::build_vegetation_impostor_blas(DeviceContext& ctx,
     }
 
     // Scratch + upload buffer are no longer needed; release them.
+    scratch->Release();
     scratch_alloc->Release();
+    aabb_buf->Release();
     aabb_alloc->Release();
+    scratch  = nullptr;
+    aabb_buf = nullptr;
 
     BlasEntry entry{};
     entry.alloc        = result_alloc;
@@ -2355,7 +2519,19 @@ void PathTracer::set_instance(uint32_t instance_index,
     if (instance_index >= m_instances.size())
         m_instances.resize(instance_index + 1);
 
-    m_instances[instance_index] = { blas_index, material_index, transform };
+    auto& inst = m_instances[instance_index];
+    inst.blas_index     = blas_index;
+    inst.material_index = material_index;
+    inst.transform      = transform;
+    inst.hidden         = false;
+}
+
+void PathTracer::hide_instance(uint32_t instance_index)
+{
+    if (instance_index >= m_instances.size())
+        m_instances.resize(instance_index + 1);
+
+    m_instances[instance_index].hidden = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -2407,7 +2583,7 @@ void PathTracer::build_tlas(DeviceContext& ctx,
                 d.Transform[r][c] = src[r][c];
 
         d.InstanceID                          = i;
-        d.InstanceMask                        = 0xFF;
+        d.InstanceMask                        = inst.hidden ? 0x00 : 0xFF;
         d.InstanceContributionToHitGroupIndex =
             m_blas_list[inst.blas_index].is_impostor ? 1u : 0u;
         d.Flags                               = D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
@@ -2417,10 +2593,13 @@ void PathTracer::build_tlas(DeviceContext& ctx,
         if (s_tlas_log_count < instance_count)
         {
             ++s_tlas_log_count;
+
+/*
             MARS_LOG("[PathTracer] build_tlas: inst[{}] blas_index={} mat={} gpu_va={:#018x} allow_update={}",
                          i, inst.blas_index, inst.material_index,
                          d.AccelerationStructure,
                          m_blas_list[inst.blas_index].allow_update);
+*/
         }
     }
     m_instance_buffer->Unmap(0, nullptr);
@@ -2578,7 +2757,9 @@ void PathTracer::upload_scene_buffers(DeviceContext& ctx,
         ctx.direct_queue()->ExecuteCommandLists(1, lists);
         ctx.flush_gpu();
 
+        stage_res->Release();
         stage_alloc->Release();
+        stage_res = nullptr;
 
         // Register SRV
         if (out_srv_slot == UINT32_MAX)
@@ -2618,6 +2799,66 @@ void PathTracer::upload_scene_buffers(DeviceContext& ctx,
 }
 
 // ---------------------------------------------------------------------------
+// upload_instance_data_range
+// Partial update of the GPU instance buffer: overwrites `count` entries
+// starting at `first_index` using a small staging buffer + immediate copy.
+// The existing default-heap buffer and SRV remain valid; only the data changes.
+// ---------------------------------------------------------------------------
+void PathTracer::upload_instance_data_range(DeviceContext& ctx,
+                                             const CpuInstanceData* data,
+                                             uint32_t first_index,
+                                             uint32_t count)
+{
+    if (count == 0 || !m_instance_data_buffer) return;
+
+    auto* device = ctx.device();
+    const uint64_t stride      = static_cast<uint64_t>(sizeof(CpuInstanceData));
+    const uint64_t byte_offset = first_index * stride;
+    const uint64_t byte_size   = count * stride;
+
+    // Small upload-heap staging buffer for just these entries
+    D3D12MA::Allocation* stage_alloc = nullptr;
+    ID3D12Resource*      stage_res   = nullptr;
+    void*                stage_ptr   = nullptr;
+    create_upload_buffer(ctx, byte_size, L"MARS::InstanceDataRange::Staging",
+                         &stage_alloc, &stage_res, &stage_ptr);
+    std::memcpy(stage_ptr, data, static_cast<size_t>(byte_size));
+    stage_res->Unmap(0, nullptr);
+
+    ComPtr<ID3D12CommandAllocator>    copy_alloc;
+    ComPtr<ID3D12GraphicsCommandList> copy_cmd;
+    throw_if_failed(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                     IID_PPV_ARGS(&copy_alloc)), "CreateCommandAllocator (inst range)");
+    throw_if_failed(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                     copy_alloc.Get(), nullptr, IID_PPV_ARGS(&copy_cmd)),
+                    "CreateCommandList (inst range)");
+
+    // Transition to COPY_DEST, copy the range, transition back
+    D3D12_RESOURCE_BARRIER to_copy =
+        CD3DX12_RESOURCE_BARRIER::Transition(m_instance_data_buffer,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+    copy_cmd->ResourceBarrier(1, &to_copy);
+
+    copy_cmd->CopyBufferRegion(m_instance_data_buffer, byte_offset,
+                               stage_res, 0, byte_size);
+
+    D3D12_RESOURCE_BARRIER to_srv =
+        CD3DX12_RESOURCE_BARRIER::Transition(m_instance_data_buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    copy_cmd->ResourceBarrier(1, &to_srv);
+
+    throw_if_failed(copy_cmd->Close(), "CommandList::Close (inst range)");
+    ID3D12CommandList* lists[] = { copy_cmd.Get() };
+    ctx.direct_queue()->ExecuteCommandLists(1, lists);
+    ctx.flush_gpu();
+
+    stage_res->Release();
+    stage_alloc->Release();
+}
+
+// ---------------------------------------------------------------------------
 // update_frame_constants
 // ---------------------------------------------------------------------------
 void PathTracer::set_sky(SkyboxDesc::Type type, uint32_t hdri_slot)
@@ -2626,6 +2867,8 @@ void PathTracer::set_sky(SkyboxDesc::Type type, uint32_t hdri_slot)
         m_sky_mode = 2u;
     else if (type == SkyboxDesc::Type::Physical)
         m_sky_mode = 1u;
+    else if (type == SkyboxDesc::Type::Black)
+        m_sky_mode = 3u;
     else
         m_sky_mode = 0u;  // Debug
     m_hdri_sky_slot = hdri_slot;
@@ -2753,7 +2996,7 @@ void PathTracer::trace(ID3D12GraphicsCommandList6* cmd_list,
 
     // Hit group
     rays.HitGroupTable.StartAddress  = m_hitgroup_table->GetGPUVirtualAddress();
-    rays.HitGroupTable.SizeInBytes   = k_hitgroup_record_stride * 2;
+    rays.HitGroupTable.SizeInBytes   = k_hitgroup_record_stride * 4;
     rays.HitGroupTable.StrideInBytes = k_hitgroup_record_stride;
 
     rays.Width  = out.width;

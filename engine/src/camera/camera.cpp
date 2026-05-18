@@ -259,7 +259,9 @@ void FlyCamera::update(float dt, Vec3 move, float mouse_dx, float mouse_dy)
     Vec3 right    = fwd.cross(world_up).normalized();
     Vec3 up       = right.cross(fwd).normalized();
 
-    Vec3 vel     = right * move.x + world_up * move.y + fwd * (-move.z);
+    Vec3 fwd_xz = Vec3{ fwd.x, 0.0f, fwd.z }.normalized();
+
+    Vec3 vel     = right * move.x + world_up * move.y + fwd_xz * (-move.z);
     Vec3 new_pos = m_camera.position() + vel * (move_speed * dt);
 
     m_camera.set_position(new_pos);

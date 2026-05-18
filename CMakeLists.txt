@@ -132,3 +132,10 @@ endif()
 # =============================================================================
 add_subdirectory(engine)
 add_subdirectory(test_app)
+
+# =============================================================================
+# Offline asset-conditioning tools (standalone executables linked against
+# mars_engine — run on demand to generate pre-baked atlas assets).
+# =============================================================================
+add_subdirectory(tools/impostor_baker)
+add_subdirectory(tools/omm_baker)

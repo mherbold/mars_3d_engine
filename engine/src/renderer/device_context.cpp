@@ -266,4 +266,8 @@ void DeviceContext::flush_gpu()
     m_copy_fence.signal_and_wait(m_copy_queue.Get());
 }
 
+void DeviceContext::flush_direct_queue()  { m_direct_fence.signal_and_wait(m_direct_queue.Get()); }
+void DeviceContext::flush_compute_queue() { m_compute_fence.signal_and_wait(m_compute_queue.Get()); }
+void DeviceContext::flush_copy_queue()    { m_copy_fence.signal_and_wait(m_copy_queue.Get()); }
+
 } // namespace mars

@@ -22,6 +22,7 @@ set(HLSL_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/skinning.hlsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/cloth_sim.hlsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/vegetation_placement.hlsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/vegetation_culling.hlsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/vegetation_lod_selection.hlsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/vegetation_wind.hlsl"
 )
@@ -91,6 +92,12 @@ source_group("Shaders\\\\gi"        FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/gi/restir_di.hlsli"
     "${CMAKE_CURRENT_SOURCE_DIR}/gi/restir_gi.hlsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/gi/restir_gi.hlsli"
+)
+source_group("Shaders\\\\vegetation" FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/vegetation_placement.hlsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/vegetation_culling.hlsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/vegetation_lod_selection.hlsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/vegetation_wind.hlsl"
 )
 source_group("Shaders\\\\post"      FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/tone_map_blit_vs.hlsl"

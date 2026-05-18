@@ -51,7 +51,11 @@ struct CpuInstanceData
     float    lod_alpha               = 1.0f;       // Stochastic LOD opacity in [0,1]; AnyHit rejects when rand >= lod_alpha
     uint32_t impostor_atlas_srv      = UINT32_MAX; // Octahedral impostor atlas (LOD3); UINT32_MAX = not an impostor
     uint32_t impostor_view_count     = 16;         // View-grid resolution per octahedral axis (e.g. 16 -> 16x16 atlas)
-    float    impostor_half_extent    = 1.0f;       // AABB half-extent in metres; used by the intersection shader
+    uint32_t impostor_depth_normal_srv = UINT32_MAX; // Depth/normal atlas (RG=oct-normal, B=depth, A=roughness)
+    float    impostor_aabb_min[3]    = {};         // Object-space AABB min (must match the BLAS procedural AABB)
+    uint32_t _impostor_pad1          = 0;
+    float    impostor_aabb_max[3]    = {};         // Object-space AABB max (must match the BLAS procedural AABB)
+    uint32_t _impostor_pad2          = 0;
 };
 
 struct CpuMaterialData
@@ -122,6 +126,14 @@ public:
                               const std::vector<CpuInstanceData>& instances,
                               const std::vector<CpuMaterialData>& materials);
 
+    // Partial update: write `count` entries starting at `first_index` into the
+    // already-allocated GPU instance buffer.  Call this after a LOD transition
+    // to patch only the changed slots without reallocating the whole buffer.
+    void upload_instance_data_range(DeviceContext& ctx,
+                                    const CpuInstanceData* data,
+                                    uint32_t first_index,
+                                    uint32_t count);
+
     // ---------------------------------------------------------------------------
     // TLAS management
     // Rebuilds the top-level AS from the current instance list.
@@ -131,6 +143,10 @@ public:
                       uint32_t blas_index,
                       const Mat4x4& transform,
                       uint32_t material_index);
+
+    // Hide a TLAS instance from all ray types without removing it or aliasing
+    // its BLAS. Safe to call every frame; takes effect at the next build_tlas().
+    void hide_instance(uint32_t instance_index);
 
     void build_tlas(DeviceContext& ctx,
                     ID3D12GraphicsCommandList6* cmd_list,
@@ -306,10 +322,18 @@ public:
     void dispatch_vegetation_placement(ID3D12GraphicsCommandList6* cmd_list,
                                        EcosystemDesc&              ecosystem);
 
+    // Dispatch GPU frustum and distance culling for all vegetation instances.
+    // Marks instances outside the view frustum or beyond max_draw_distance as
+    // LOD_CULLED. Call once per frame before dispatch_vegetation_lod_selection().
+    void dispatch_vegetation_culling(ID3D12GraphicsCommandList6* cmd_list,
+                                     EcosystemDesc&              ecosystem,
+                                     const Vec3&                 camera_position,
+                                     const Mat4x4&               view_proj);
+
     // Dispatch per-instance LOD selection. Reads the placed instance buffer and
     // the camera position, then writes the resulting VegetationLOD tier and a
     // stochastic dither value back into each instance for use by the path tracer.
-    // Call once per frame after placement, before the path-trace dispatch.
+    // Call once per frame after culling, before the path-trace dispatch.
     void dispatch_vegetation_lod_selection(ID3D12GraphicsCommandList6* cmd_list,
                                            EcosystemDesc&              ecosystem,
                                            const Vec3&                 camera_position,
@@ -345,6 +369,7 @@ private:
     void create_blit_pipeline(DeviceContext& ctx);
     void create_skinning_pipeline(DeviceContext& ctx);
     void create_cloth_pipeline(DeviceContext& ctx);
+    void create_vegetation_culling_pipeline(DeviceContext& ctx);
     void create_vegetation_placement_pipeline(DeviceContext& ctx);
     void create_vegetation_lod_pipeline(DeviceContext& ctx);
     void create_vegetation_wind_pipeline(DeviceContext& ctx);
@@ -410,6 +435,7 @@ private:
         uint32_t blas_index;
         uint32_t material_index;
         Mat4x4   transform;
+        bool     hidden = false;  // InstanceMask=0 — invisible to all ray types
     };
     std::vector<InstanceDesc> m_instances;
 
@@ -491,6 +517,10 @@ private:
     // --- Cloth simulation compute pipeline --------------------------------
     ComPtr<ID3D12RootSignature> m_cloth_root_sig;
     ComPtr<ID3D12PipelineState> m_cloth_pso;
+
+    // --- Vegetation frustum culling compute pipeline ---------------------
+    ComPtr<ID3D12RootSignature> m_vegetation_culling_root_sig;
+    ComPtr<ID3D12PipelineState> m_vegetation_culling_pso;
 
     // --- Vegetation placement compute pipeline ----------------------------
     ComPtr<ID3D12RootSignature> m_vegetation_placement_root_sig;

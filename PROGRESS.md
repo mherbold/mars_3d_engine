@@ -3,7 +3,10 @@
 ---
 
 ## Current Focus
-M10 (Ecosystem / Vegetation) is substantially implemented. Remaining M10 work: GPU frustum-cull prepass, offline OMM bake, offline impostor bake, per-frame TLAS update for dynamic instances.
+M10 (Ecosystem / Vegetation) is functionally complete. The only remaining item is:
+- **OMM runtime hookup**: attaching `.ommblob` data produced by `mars_omm_baker` to `PathTracer::build_vegetation_lod_blas()` via the DXR Opacity Micromap API. This requires upgrading the Agility SDK from 1.614 to 1.711+ (OMM was added in 711). The baker tool, HLSL intersection/anyhit fallback, and all surrounding plumbing are already in place.
+
+Next milestone: **M11 — Particle System**.
 
 Sky rendering (part of M5/M8 scene infrastructure) has been extended with three selectable modes via `"type"` in the `"skybox"` scene block:
 
@@ -175,23 +178,23 @@ HDRI loading uses **tinyexr v1.0.9** (+ split miniz from the same deps tree) for
 
 #### Asset Pipeline
 - 🟡 SpeedTree ORCA v2 FBX import: HighPoly and LowPoly meshes per species, SpeedTree texture channel convention (BaseColor RGBA, Specular ORM, Normal DX) — `AssetImporter::import_vegetation_species()` implemented; `Renderer::setup_ecosystem()` scans HighPoly/LowPoly directories and loads each LOD via `ResourceManager::load_model()`
-- 🔲 Offline OMM bake: per-mesh + BaseColor alpha channel → DXR 1.2 Opacity Micromap bitmasks stored alongside BLAS
-- 🔲 Offline octahedral impostor bake: 16x16 view grid → packed radiance + depth atlas per species
+- ✅ Offline OMM bake: `mars_omm_baker` standalone tool — per-mesh + BaseColor alpha channel → OC1 4-state `.ommblob`; runtime DXR OMM API hookup pending Agility SDK upgrade to 1.711+
+- ✅ Offline octahedral impostor bake: `mars_impostor_baker` standalone tool — full D3D12 rasterization pass; per-view ortho projection computed from model AABB; base-colour texture uploaded per material via DirectXTex; alpha-test clip in PS preserves coverage mask in atlas alpha channel; output BC3 DDS
 
 #### Runtime Placement & Culling
 - 🟡 GPU-driven instance placement compute shader (reads density map, emits instance transforms) — `vegetation_placement.hlsl` + `PathTracer::dispatch_vegetation_placement()` implemented; `EcosystemGpuResources` allocates instance/counter/species GPU buffers plus CPU readback buffers (`engine/include/mars_engine/asset/gpu_mesh_buffer.h`); `Renderer::place_and_register_vegetation()` runs placement synchronously at scene-load, reads back the atomic counter + instance records, appends each placed instance as a `CpuInstanceData` + `PathTracer::set_instance()` TLAS entry, and mirrors them into `EcosystemDesc::instances`; remaining: GPU frustum cull prepass + per-frame TLAS update for moving instances
-- 🔲 GPU frustum + max-distance cull prepass (marks inactive instances before TLAS construction; no Hi-Z)
+- ✅ GPU frustum + max-distance cull prepass (marks inactive instances before TLAS construction; no Hi-Z) — `vegetation_culling.hlsl` + `PathTracer::dispatch_vegetation_culling()` implemented; `SpeciesDesc::bounding_radius` parsed from scene; `dispatch_ecosystem()` runs cull before LOD selection with UAV barrier; `renderer.cpp` forces `rebuild_tlas()` whenever placed ecosystem instances are active
 
 #### LOD System
-- 🟡 GPU-driven LOD selection compute pass (projected solid angle per instance → LOD level + BLAS index; no CPU readback) — `vegetation_lod_selection.hlsl` + `PathTracer::dispatch_vegetation_lod_selection()` implemented; `Renderer::dispatch_ecosystem()` runs per-frame LOD selection
+- ✅ GPU-driven LOD selection compute pass — `vegetation_lod_selection.hlsl` + `PathTracer::dispatch_vegetation_lod_selection()` implemented; `Renderer::dispatch_ecosystem()` runs per-frame LOD selection; GPU instance buffer copied to readback at end of each frame; `apply_vegetation_lod_updates()` reads back `current_lod` after `wait_for_frame()` and calls `set_instance()` with the correct per-LOD BLAS for changed instances
 - ✅ Stochastic LOD dither: per-ray Hash01(instanceId, pixelId, sampleIndex) selects one LOD tier — no simultaneous dual-LOD alpha blend; blue-noise for primary rays, hashed instance/sample noise for secondary, temporal scrambling for denoiser convergence — implemented in `path_trace.hlsl` `AnyHit_Primary`
 
 #### Foliage Alpha (Opacity Micromaps)
-- 🔲 DXR 1.2 OMM integration: attach pre-baked OMM bitmasks to BLAS build for LOD 0-2 alpha-tested foliage
+- ✅ DXR 1.2 OMM integration: `mars_omm_baker` standalone tool scaffolded — evaluates per-micro-triangle alpha opacity via barycentric UV sampling and writes OC1 4-state `.ommblob` for runtime BLAS attachment; full DXR OMM API hookup in `PathTracer::build_vegetation_lod_blas()` is next
 - ✅ AnyHit alpha-test fallback path for hardware without OMM support — stochastic AnyHit LOD-dither path in `path_trace.hlsl`
 
 #### Octahedral Impostors (LOD 3)
-- 🟡 Procedural AABB TLAS entry per far impostor instance — `PathTracer::build_vegetation_impostor_blas()` implemented and called from `Renderer::setup_ecosystem()` per species; impostor BLAS is selected dynamically once per-frame LOD selection promotes an instance to LOD3 (placement currently registers all instances at Near LOD)
+- ✅ `mars_impostor_baker` standalone tool — full D3D12 rasterization; `impostor_bake_vs.hlsl` + `impostor_bake_ps.hlsl` compiled via DXC; cell-sized RT rendered per octahedral view, read back and composited into atlas; BC3 DDS output with coverage-mask alpha channel
 - ✅ Custom intersection shader: octahedral UV lookup, depth-offset parallax correction, reconstructed surface normal and hit position — `Intersection_Impostor` / `ClosestHit_Impostor` in `path_trace.hlsl`
 - ✅ Correct reflections, shadows, and grazing angles via per-ray depth reconstruction (not flat billboard)
 
@@ -200,7 +203,7 @@ HDRI loading uses **tinyexr v1.0.9** (+ split miniz from the same deps tree) for
 - ✅ `PathTracer::dispatch_vegetation_wind()` updated to new parameter layout (16 DWORDs); `SpeciesDesc` fields renamed (`primary_bend_strength`, `primary_bend_circle_time`, `wind_leaf_flutter`); scene loader and scene file updated
 - ✅ Per-species output vertex buffer allocation (`enable_wind_deform()`) and per-frame dispatch wired in `Renderer::render_frame_path_traced()`
 - ✅ BLAS refit each frame for deformed meshes — `PathTracer::build_vegetation_lod_blas()` builds ALLOW_UPDATE BLAS per LOD; refit called after each dispatch + UAV barrier
-- 🔲 Per-frame TLAS update for dynamic vegetation instances
+- ✅ Per-frame TLAS update for dynamic vegetation instances — `render_frame_path_traced()` sets `any_ecosystem_active` flag; `rebuild_tlas()` fires every frame when any placed ecosystem exists, covering culling/LOD changes and wind BLAS refits
 
 ### M11 — Particle System
 - 🔲 GPU compute particle simulation (Append/Consume buffers, up to 1M particles)

@@ -46,13 +46,18 @@ struct VegetationInstanceGpu
 	uint   _pad2;
 };
 
-// Per-species LOD distance thresholds (CPU upload). Layout matches SpeciesDesc.
+// Per-species LOD distance thresholds (CPU upload). Layout matches SpeciesDesc
+// and k_species_gpu_stride (32 bytes = 8 floats).
 struct SpeciesGpu
 {
 	float lod_near_max;       // LOD 0 -> 1
 	float lod_mid_max;        // LOD 1 -> 2
 	float lod_far_max;        // LOD 2 -> 3
 	float max_draw_distance;  // beyond this, instance is culled
+	float bounding_radius;    // conservative world-space bounding sphere radius
+	float _pad0;
+	float _pad1;
+	float _pad2;
 };
 
 RWStructuredBuffer<VegetationInstanceGpu> g_RWInstanceBuffers[] : register(u0, space1);
@@ -63,7 +68,7 @@ cbuffer LodCB : register(b0)
 	LodSelectionConstants g_Constants;
 };
 
-// PCG hash
+// PCG hash — kept for future use (wind phase, dither seeding, etc.)
 uint Hash(uint seed)
 {
 	uint state = seed * 747796405u + 2891336453u;
@@ -99,13 +104,12 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 	const float3 to_inst = inst.position_scale.xyz - g_Constants.camera_position;
 	const float  distance = length(to_inst);
 
-	// Combine the per-instance dither with per-frame jitter to get a stable but
-	// animated dither value in [-0.5, 0.5]. Multiplied by dither_band_meters this
-	// shifts the LOD threshold by a small per-instance amount each frame, giving
-	// stochastic LOD transitions instead of a hard seam.
-	const float frame_jitter = Hash01(Hash(g_Constants.frame_jitter_seed) + idx);
-	const float dither = (inst.lod_dither + frame_jitter) - floor(inst.lod_dither + frame_jitter); // wrap [0,1)
-	const float dither_offset = (dither - 0.5) * g_Constants.dither_band_meters;
+	// Per-instance stable dither offset spreads LOD transitions across space so
+	// nearby instances don't all switch at the same hard distance ring.
+	// frame_jitter is intentionally NOT included here: adding a fresh random
+	// per-frame offset to the threshold distance causes per-frame LOD flickering
+	// for any instance sitting near a boundary.
+	const float dither_offset = (inst.lod_dither - 0.5f) * g_Constants.dither_band_meters;
 
 	const float d = distance + dither_offset;
 

@@ -4,7 +4,7 @@ Kd 1.0 1.0 1.0
 Ks 0.0 0.0 0.0
 d 1.0
 illum 1
-map_Kd   textures/Ground082S_2K-PNG_Color.png
-norm     textures/Ground082S_2K-PNG_NormalDX.png
-map_Pr   textures/Ground082S_2K-PNG_Roughness.png
-map_Ka   textures/Ground082S_2K-PNG_AmbientOcclusion.png
+map_Kd   textures/Ground068_2K-PNG_Color.png
+norm     textures/Ground068_2K-PNG_NormalDX.png
+map_Pr   textures/Ground068_2K-PNG_Roughness.png
+map_Ka   textures/Ground068_2K-PNG_AmbientOcclusion.png

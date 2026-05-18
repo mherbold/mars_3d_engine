@@ -45,7 +45,11 @@ struct GpuInstanceData
     float    lod_alpha;                  // Stochastic LOD opacity in [0,1] — AnyHit rejects when rand >= lod_alpha
     uint     impostor_atlas_srv;         // Octahedral impostor atlas SRV slot (LOD 3); UINT32_MAX = not an impostor
     uint     impostor_view_count;        // View-grid resolution per octahedral axis (e.g. 16 -> 16x16 atlas)
-    float    impostor_half_extent;       // AABB half-extent in metres used by the impostor intersection shader
+    uint     impostor_depth_normal_srv;  // Depth/normal atlas: RG=oct-normal, B=depth, A=roughness; UINT32_MAX = none
+    float3   impostor_aabb_min;          // Object-space AABB min (must match the BLAS procedural AABB)
+    uint     _impostor_pad1;
+    float3   impostor_aabb_max;          // Object-space AABB max (must match the BLAS procedural AABB)
+    uint     _impostor_pad2;
 };
 
 // Bindless structured buffer containing all materials for this frame

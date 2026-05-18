@@ -58,7 +58,7 @@ struct CameraDesc
 // =============================================================================
 struct SkyboxDesc
 {
-    enum class Type : uint8_t { Debug = 0, Physical = 1, HDRI = 2 };
+    enum class Type : uint8_t { Debug = 0, Physical = 1, HDRI = 2, Black = 3 };
 
     Type        type           = Type::Debug;
     Vec3        sun_direction  = { 0.3f, 0.8f, 0.1f };
@@ -253,6 +253,11 @@ struct SpeciesDesc
     float wind_leaf_flutter_strength = 0.2f; // Leaf/foliage micro-movement amplitude
     float wind_leaf_flutter_speed    = 1.0f; // Leaf/foliage flutter speed multiplier
 
+    // Conservative bounding sphere radius (metres) used by the GPU frustum-cull
+    // prepass. Applied in world space and scaled by the instance's uniform scale.
+    // Default is large enough to cover a typical tall tree; reduce for shrubs/ferns.
+    float bounding_radius = 20.0f;
+
     // Relative spawn weight (for multi-species density maps)
     float spawn_weight = 1.0f;
 
@@ -267,7 +272,8 @@ struct SpeciesDesc
     uint32_t model_indices[static_cast<size_t>(VegetationLOD::Count)] = { UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX };
 
     // Octahedral impostor atlas texture (LOD 3)
-    uint32_t impostor_atlas_srv = UINT32_MAX;  // Bindless SRV slot for packed radiance+depth atlas
+    uint32_t impostor_atlas_srv            = UINT32_MAX;  // Bindless SRV slot for base-color+alpha atlas
+    uint32_t impostor_depth_normal_srv     = UINT32_MAX;  // Bindless SRV slot for depth/normal atlas
 };
 
 // =============================================================================
@@ -279,7 +285,8 @@ struct VegetationInstance
     Transform   transform;              // World-space position, rotation, scale
     uint32_t    species_index = 0;      // Index into EcosystemDesc::species array
     VegetationLOD current_lod = VegetationLOD::Near;
-    uint32_t    tlas_instance = UINT32_MAX;  // PathTracer TLAS slot
+    uint32_t    tlas_instance = UINT32_MAX;  // PathTracer TLAS slot (first slot; contiguous)
+    uint32_t    tlas_slot_count = 0;         // Number of TLAS slots owned by this instance (Near LOD submesh count)
 
     // Wind animation state (per-instance phase offset for variety)
     float       wind_phase_offset = 0.0f;
@@ -291,6 +298,7 @@ struct VegetationInstance
 struct EcosystemDesc
 {
     bool        enabled = false;
+    bool        impostor_debug_atlas = false;  // When true, load impostor_atlas_debug.dds instead of impostor_atlas.dds
     std::string density_map_path;       // Single-channel R8 texture (pixel intensity = spawn density)
 
     // World-space bounding region for ecosystem placement
@@ -318,7 +326,7 @@ struct EcosystemDesc
     uint32_t    species_buffer_srv = UINT32_MAX;   // Bindless SRV slot for per-species LOD distances (SpeciesGpu[])
     uint32_t    instance_count = 0;                // Actual number of instances spawned
     uint32_t    random_seed = 0xC0FFEEu;           // Incremented each placement dispatch for variety
-    float       lod_dither_band_meters = 8.0f;     // Width of the dithered LOD-transition band
+    float       lod_dither_band_meters = 1.0f;     // Width of the dithered LOD-transition band (keep < smallest LOD spacing)
 };
 
 } // namespace mars

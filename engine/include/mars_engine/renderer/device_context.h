@@ -95,6 +95,9 @@ public:
 
     // Flush all three queues and wait for the GPU to be idle.
     void flush_gpu();
+    void flush_direct_queue();
+    void flush_compute_queue();
+    void flush_copy_queue();
 
 private:
     void create_dxgi_factory();

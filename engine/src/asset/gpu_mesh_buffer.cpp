@@ -899,10 +899,10 @@ ClothGpuResources& ClothGpuResources::operator=(ClothGpuResources&& o) noexcept
 // ===========================================================================
 namespace {
 
-// Strides must mirror the HLSL structs in vegetation_placement.hlsl and
-// vegetation_lod_selection.hlsl.
+// Strides must mirror the HLSL structs in vegetation_placement.hlsl,
+// vegetation_lod_selection.hlsl, and vegetation_culling.hlsl.
 constexpr uint32_t k_vegetation_instance_stride = 64u; // VegetationInstanceGpu
-constexpr uint32_t k_species_gpu_stride         = 16u; // SpeciesGpu (4 floats)
+constexpr uint32_t k_species_gpu_stride         = 32u; // SpeciesGpu (8 floats)
 
 static uint32_t register_structured_uav(DeviceContext& ctx, ID3D12Resource* res,
                                         uint32_t num_elements, uint32_t stride)

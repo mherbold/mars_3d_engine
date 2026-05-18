@@ -88,6 +88,11 @@ public:
     // Rebuild the TLAS from the current scene (e.g. after adding instances).
     void rebuild_tlas();
 
+    // Save a screenshot of the current rendered frame to disk.
+    // Files are written to the working directory as screenshot_<timestamp>_*.png.
+    // output_index selects which display output to capture (0 = primary).
+    void save_screenshot(uint32_t output_index = 0);
+
     // ---- PathTracer access -----------------------------------------------
 
     PathTracer&       path_tracer()       { return m_path_tracer; }
@@ -139,6 +144,12 @@ private:
     // render_frame_path_traced() before tracing rays.
     void dispatch_ecosystem();
 
+    // M10: Read back the GPU LOD selection results from the previous frame and
+    // update TLAS instance entries to point at the correct per-LOD BLAS.
+    // Called at the start of each frame AFTER wait_for_frame() so the GPU has
+    // finished writing the readback buffer.
+    void apply_vegetation_lod_updates();
+
     DeviceContext   m_device_ctx;
     DisplayManager  m_display_manager;
     PathTracer      m_path_tracer;
@@ -163,6 +174,7 @@ private:
         Vec3    position     = {};
         Mat4x4  view_inv     = Mat4x4::identity();
         Mat4x4  proj_inv     = Mat4x4::identity();
+        Mat4x4  view_proj    = Mat4x4::identity();  // proj * view (world→clip); used for culling
         // Previous-frame matrices (for motion vector / DLSS reprojection).
         Mat4x4  prev_view_proj = Mat4x4::identity();
         Mat4x4  prev_view_inv  = Mat4x4::identity();
@@ -177,6 +189,8 @@ private:
     std::vector<bool>                  m_ecosystem_placed;   // per-layer: true after placement has run
     std::vector<bool>                  m_ecosystem_dirty;    // per-layer: true when instances need TLAS rebuild
     std::vector<EcosystemGpuResources> m_ecosystem_gpu;      // per-layer GPU buffers (M10)
+    std::vector<bool>                  m_lod_readback_pending; // per-layer: true when a LOD readback copy was issued
+    std::vector<CpuInstanceData>       m_cpu_instances;      // persistent mirror of the GPU instance buffer
     float    m_last_delta_time        = 0.0f;  // stored by update(), used by render_frame_path_traced()
     float    m_elapsed_time_seconds   = 0.0f;  // total elapsed time, accumulated each update()
     float    m_cloth_time_accumulator  = 0.0f;  // leftover time carried between frames for fixed-step cloth sim
@@ -187,6 +201,14 @@ private:
     // ultimately succeeds). Must be cleaned up with a UAV→COMMON barrier on the
     // following frame if slEvaluateFeature failed (rr_evaluated==false).
     std::vector<bool> m_denoised_in_uav_state;
+
+    // Per-output flag: true when DLSS-RR ran and left output_resource (raw noisy
+    // color) in D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE. Streamline reads the
+    // path-tracer outputs as SRVs and leaves them in PSR state; the end-of-frame
+    // barrier block restores them to UAV for the next frame's DispatchRays.
+    // save_screenshot reads this to supply the correct StateBefore for the
+    // readback copy barrier, avoiding RESOURCE_BARRIER_BEFORE_AFTER_MISMATCH.
+    std::vector<bool> m_output_in_psr_state;
 };
 
 } // namespace mars

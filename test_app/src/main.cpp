@@ -81,6 +81,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
         return 0;
     case WM_KEYDOWN:
         if (wparam == VK_ESCAPE) { g_running = false; DestroyWindow(hwnd); }
+        if (wparam == VK_F9)     { MARS_LOG("[Main] F9 pressed - calling save_screenshot(0)"); g_renderer.save_screenshot(0); MARS_LOG("[Main] save_screenshot(0) returned"); }
         if (wparam < 256) g_keys[wparam] = true;
         return 0;
     case WM_KEYUP:
@@ -337,9 +338,11 @@ int WINAPI WinMain(
         if (fps_accum >= fps_interval)
         {
             fps_display = static_cast<float>(fps_frames) / fps_accum;
-            wchar_t title[128];
-            swprintf_s(title, L"MARS  |  %.1f fps  |  peak dt: %.1f ms",
-                       fps_display, peak_dt_ms);
+            const mars::Vec3 cam_pos = g_fly_cam.camera().position();
+            wchar_t title[192];
+            swprintf_s(title, L"MARS  |  %.1f fps  |  peak dt: %.1f ms  |  xyz: %.1f  %.1f  %.1f",
+                       fps_display, peak_dt_ms,
+                       cam_pos.x, cam_pos.y, cam_pos.z);
             SetWindowTextW(hwnds[0], title);
             fps_accum  = 0.0f;
             fps_frames = 0;

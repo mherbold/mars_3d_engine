@@ -11,7 +11,10 @@
 #include <format>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <windows.h>
+#include <wincodec.h>
+#include <DirectXTex.h>
 
 namespace mars
 {
@@ -21,6 +24,22 @@ static void throw_if_failed(HRESULT hr, const char* msg)
     if (FAILED(hr))
         throw std::runtime_error(std::format("{} (HRESULT 0x{:08X})", msg, static_cast<unsigned>(hr)));
 }
+
+// CPU mirror of the GPU VegetationInstanceGpu struct (must match vegetation_placement.hlsl /
+// vegetation_lod_selection.hlsl — 64 bytes, stride = k_vegetation_instance_stride).
+struct VegetationInstanceGpu {
+    float    position_scale[4];
+    float    rotation[4];
+    uint32_t species_index;
+    uint32_t current_lod;
+    uint32_t tlas_instance;
+    float    wind_phase_offset;
+    float    lod_dither;
+    uint32_t _pad0;
+    uint32_t _pad1;
+    uint32_t _pad2;
+};
+static_assert(sizeof(VegetationInstanceGpu) == 64, "VegetationInstanceGpu must be 64 bytes");
 
 // ---------------------------------------------------------------------------
 // Public init overloads
@@ -110,6 +129,7 @@ void Renderer::init_internal(const std::vector<DisplayConfig>& configs,
     // Initialise per-output camera state list
     m_cameras.resize(output_count);
     m_denoised_in_uav_state.assign(output_count, false);
+    m_output_in_psr_state.assign(output_count, false);
 
     m_initialised = true;
 }
@@ -273,9 +293,10 @@ void Renderer::set_camera(uint32_t output_index,
         cam.prev_proj_inv  = cam.proj_inv;
     }
 
-    cam.position = position;
-    cam.view_inv = view_inv;
-    cam.proj_inv = proj_inv;
+    cam.position  = position;
+    cam.view_inv  = view_inv;
+    cam.proj_inv  = proj_inv;
+    cam.view_proj = curr_view_proj;
 }
 
 // ---------------------------------------------------------------------------
@@ -353,7 +374,8 @@ bool Renderer::load_scene(const std::string& marsscene_path)
     // Populate TLAS instances from scene instances.
     // Also build CpuInstanceData and CpuMaterialData arrays for the shader.
     uint32_t tlas_instance = 0;
-    std::vector<CpuInstanceData> cpu_instances;
+    m_cpu_instances.clear();
+    std::vector<CpuInstanceData>& cpu_instances = m_cpu_instances;
     std::vector<CpuMaterialData> cpu_materials;
 
     // One default white material (index 0)
@@ -684,6 +706,11 @@ bool Renderer::load_scene(const std::string& marsscene_path)
             m_path_tracer.set_sky(SkyboxDesc::Type::Physical);
             MARS_LOG("[Renderer] Physical procedural sky active.");
         }
+        else if (sky.type == SkyboxDesc::Type::Black)
+        {
+            m_path_tracer.set_sky(SkyboxDesc::Type::Black);
+            MARS_LOG("[Renderer] Black sky active.");
+        }
         else
         {
             m_path_tracer.set_sky(SkyboxDesc::Type::Debug);
@@ -731,6 +758,7 @@ void Renderer::setup_ecosystem()
     m_ecosystem_placed.assign(ecosystems.size(), false);
     m_ecosystem_dirty.assign(ecosystems.size(), false);
     m_ecosystem_gpu.resize(ecosystems.size());
+    m_lod_readback_pending.assign(ecosystems.size(), false);
 
     namespace fs = std::filesystem;
     auto find_first_fbx = [](const fs::path& dir) -> std::string
@@ -806,11 +834,93 @@ void Renderer::setup_ecosystem()
             if (sp.model_indices[0] != UINT32_MAX)
             {
                 const GpuModel& m0 = m_resource_mgr.model(sp.model_indices[0]);
+
+                // The AABB passed to DXR is the *culling volume* — the intersection
+                // shader only runs when a ray enters this box.  It must be large
+                // enough to contain the full billboard square from every camera
+                // direction: that square has half-extent = bounding_sphere_radius.
+                // Using the tight mesh AABB here means rays that hit the billboard
+                // outside the narrow tree silhouette never reach the shader, producing
+                // a "cube with a clipping plane" artefact.  Use a sphere-cube instead.
+                const Vec3& mn  = m0.bounds.min_pt;
+                const Vec3& mx  = m0.bounds.max_pt;
+                const Vec3  ctr { (mn.x + mx.x) * 0.5f,
+                                  (mn.y + mx.y) * 0.5f,
+                                  (mn.z + mx.z) * 0.5f };
+                const float dx  = (mx.x - mn.x) * 0.5f;
+                const float dy  = (mx.y - mn.y) * 0.5f;
+                const float dz  = (mx.z - mn.z) * 0.5f;
+                const float r   = std::sqrt(dx*dx + dy*dy + dz*dz);  // bounding sphere radius — matches baker
+
+                const Vec3 sphere_min { ctr.x - r, ctr.y - r, ctr.z - r };
+                const Vec3 sphere_max { ctr.x + r, ctr.y + r, ctr.z + r };
+
                 const auto i_idx = static_cast<size_t>(VegetationLOD::Impostor);
                 sp.blas_indices[i_idx].clear();
                 sp.blas_indices[i_idx].push_back(
                     m_path_tracer.build_vegetation_impostor_blas(
-                        m_device_ctx, m0.bounds.min_pt, m0.bounds.max_pt));
+                        m_device_ctx, sphere_min, sphere_max));
+            }
+
+            // ---- Impostor atlas texture ------------------------------------------
+            // Look for impostor_atlas.dds (or impostor_atlas_debug.dds if debug mode
+            // is enabled) in the species asset_path root.
+            {
+                const fs::path atlas_path = eco.impostor_debug_atlas
+                                            ? base / "impostor_atlas_debug.dds"
+                                            : base / "impostor_atlas.dds";
+                if (fs::exists(atlas_path))
+                {
+                    uint32_t slot = m_resource_mgr.load_texture(m_device_ctx,
+                                                                 atlas_path.string(),
+                                                                 /*is_srgb=*/true);
+                    if (slot != UINT32_MAX)
+                    {
+                        sp.impostor_atlas_srv = slot;
+                        MARS_LOG("[Renderer]   Species '{}': impostor atlas loaded{} (srv={})",
+                                 sp.name,
+                                 eco.impostor_debug_atlas ? " [DEBUG]" : "",
+                                 slot);
+                    }
+                    else
+                    {
+                        MARS_LOG("[Renderer]   Species '{}': WARNING — failed to load impostor atlas '{}'",
+                                 sp.name, atlas_path.string());
+                    }
+                }
+                else
+                {
+                    MARS_LOG("[Renderer]   Species '{}': impostor atlas not found at '{}' — impostor LOD will be invisible",
+                             sp.name, atlas_path.string());
+                }
+
+                // Depth/normal atlas (only when using the real atlas, not debug).
+                if (!eco.impostor_debug_atlas)
+                {
+                    const fs::path dn_atlas_path = base / "impostor_atlas_depth_normal.dds";
+                    if (fs::exists(dn_atlas_path))
+                    {
+                        uint32_t dn_slot = m_resource_mgr.load_texture(m_device_ctx,
+                                                                        dn_atlas_path.string(),
+                                                                        /*is_srgb=*/false);
+                        if (dn_slot != UINT32_MAX)
+                        {
+                            sp.impostor_depth_normal_srv = dn_slot;
+                            MARS_LOG("[Renderer]   Species '{}': depth/normal atlas loaded (srv={})",
+                                     sp.name, dn_slot);
+                        }
+                        else
+                        {
+                            MARS_LOG("[Renderer]   Species '{}': WARNING — failed to load depth/normal atlas '{}'",
+                                     sp.name, dn_atlas_path.string());
+                        }
+                    }
+                    else
+                    {
+                        MARS_LOG("[Renderer]   Species '{}': depth/normal atlas not found at '{}' — shading will use flat normal",
+                                 sp.name, dn_atlas_path.string());
+                    }
+                }
             }
 
             MARS_LOG("[Renderer]   Species '{}': submeshes/LOD = [{},{},{},{}]",
@@ -820,14 +930,22 @@ void Renderer::setup_ecosystem()
         }
 
         // ---- GPU resources ---------------------------------------------------
+        // SpeciesGpu layout (32 bytes / 8 floats — must match vegetation_lod_selection.hlsl
+        // and vegetation_culling.hlsl):
+        //   [0] lod_near_max  [1] lod_mid_max  [2] lod_far_max  [3] max_draw_distance
+        //   [4] bounding_radius  [5..7] _pad
         const uint32_t species_count = static_cast<uint32_t>(eco.species.size());
-        std::vector<float> species_table(static_cast<size_t>(species_count) * 4u);
+        std::vector<float> species_table(static_cast<size_t>(species_count) * 8u);
         for (uint32_t i = 0; i < species_count; ++i)
         {
-            species_table[i * 4 + 0] = eco.species[i].lod_near_max;
-            species_table[i * 4 + 1] = eco.species[i].lod_mid_max;
-            species_table[i * 4 + 2] = eco.species[i].lod_far_max;
-            species_table[i * 4 + 3] = eco.species[i].max_draw_distance;
+            species_table[i * 8 + 0] = eco.species[i].lod_near_max;
+            species_table[i * 8 + 1] = eco.species[i].lod_mid_max;
+            species_table[i * 8 + 2] = eco.species[i].lod_far_max;
+            species_table[i * 8 + 3] = eco.species[i].max_draw_distance;
+            species_table[i * 8 + 4] = eco.species[i].bounding_radius;
+            species_table[i * 8 + 5] = 0.0f; // _pad
+            species_table[i * 8 + 6] = 0.0f; // _pad
+            species_table[i * 8 + 7] = 0.0f; // _pad
         }
 
         m_ecosystem_gpu[layer_idx].destroy();
@@ -858,20 +976,6 @@ void Renderer::place_and_register_vegetation(uint32_t&                          
                                              std::vector<CpuInstanceData>&      cpu_instances,
                                              std::vector<CpuMaterialData>&      cpu_materials)
 {
-    struct VegetationInstanceGpu {
-        float    position_scale[4];
-        float    rotation[4];
-        uint32_t species_index;
-        uint32_t current_lod;
-        uint32_t tlas_instance;
-        float    wind_phase_offset;
-        float    lod_dither;
-        uint32_t _pad0;
-        uint32_t _pad1;
-        uint32_t _pad2;
-    };
-    static_assert(sizeof(VegetationInstanceGpu) == 64, "VegetationInstanceGpu must be 64 bytes");
-
     auto& ecosystems = m_scene.ecosystems();
 
     auto ensure_species_materials = [&](SpeciesDesc& sp)
@@ -1053,6 +1157,33 @@ void Renderer::place_and_register_vegetation(uint32_t&                          
                                               : m0.mesh_buffers[s].vertex_srv_slot();
                 inst_data.index_buffer_srv  = m0.mesh_buffers[s].index_srv_slot();
                 inst_data.prev_vertex_buffer_srv = m0.mesh_buffers[s].wind_prev_pos_srv_slot();
+                // Impostor fields — used by the intersection/closest-hit shaders
+                // when this instance transitions to LOD3 (Impostor). Set here so
+                // the initial upload_scene_buffers() call already has valid values.
+                inst_data.impostor_atlas_srv        = sp.impostor_atlas_srv;
+                inst_data.impostor_depth_normal_srv = sp.impostor_depth_normal_srv;
+                inst_data.impostor_view_count  = 16u;
+                {
+                    // Store the sphere-cube AABB that matches the BLAS built above.
+                    // The intersection shader uses these to derive the billboard center
+                    // and half-extent; they must match the BLAS extents so every ray
+                    // that enters the BLAS AABB also enters the billboard card.
+                    const Vec3& mn  = m0.bounds.min_pt;
+                    const Vec3& mx  = m0.bounds.max_pt;
+                    const float cx  = (mn.x + mx.x) * 0.5f;
+                    const float cy  = (mn.y + mx.y) * 0.5f;
+                    const float cz  = (mn.z + mx.z) * 0.5f;
+                    const float hdx = (mx.x - mn.x) * 0.5f;
+                    const float hdy = (mx.y - mn.y) * 0.5f;
+                    const float hdz = (mx.z - mn.z) * 0.5f;
+                    const float r   = std::sqrt(hdx*hdx + hdy*hdy + hdz*hdz);
+                    inst_data.impostor_aabb_min[0] = cx - r;
+                    inst_data.impostor_aabb_min[1] = cy - r;
+                    inst_data.impostor_aabb_min[2] = cz - r;
+                    inst_data.impostor_aabb_max[0] = cx + r;
+                    inst_data.impostor_aabb_max[1] = cy + r;
+                    inst_data.impostor_aabb_max[2] = cz + r;
+                }
                 cpu_instances.push_back(inst_data);
 
                 m_path_tracer.set_instance(tlas_instance, blas_idx, world, mat_idx);
@@ -1064,6 +1195,7 @@ void Renderer::place_and_register_vegetation(uint32_t&                          
             vi.species_index     = g.species_index;
             vi.current_lod       = VegetationLOD::Near;
             vi.tlas_instance     = first_tlas_for_inst;
+            vi.tlas_slot_count   = static_cast<uint32_t>(tlas_instance - first_tlas_for_inst);
             vi.wind_phase_offset = g.wind_phase_offset;
             eco.instances.push_back(vi);
         }
@@ -1082,9 +1214,8 @@ void Renderer::place_and_register_vegetation(uint32_t&                          
 // dispatch_ecosystem (M10 step-10)
 //
 // Per-frame ecosystem GPU work. Runs vegetation placement once (when
-// instance/counter/species GPU resources are valid), and vegetation LOD
-// selection every frame thereafter. Wind deformation + BLAS refit per LOD
-// will be wired in once the per-species output vertex buffers are allocated.
+// instance/counter/species GPU resources are valid), frustum culling every
+// frame to mark out-of-view instances, then LOD selection on visible instances.
 // ---------------------------------------------------------------------------
 void Renderer::dispatch_ecosystem()
 {
@@ -1112,8 +1243,190 @@ void Renderer::dispatch_ecosystem()
 
         if (eco.instance_count > 0 && !m_cameras.empty())
         {
+            const CameraState& cam = m_cameras[0];
+
+            // Frustum + distance culling — marks LOD_CULLED on invisible instances
+            m_path_tracer.dispatch_vegetation_culling(
+                m_cmd_list.Get(), eco, cam.position, cam.view_proj);
+
+            // UAV barrier: culling writes must be visible to LOD selection
+            D3D12_RESOURCE_BARRIER cull_uav{};
+            cull_uav.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            cull_uav.UAV.pResource = nullptr; // all UAVs
+            m_cmd_list->ResourceBarrier(1, &cull_uav);
+
+            // LOD selection — assigns Near/Mid/FarCluster/Impostor to visible instances
             m_path_tracer.dispatch_vegetation_lod_selection(
-                m_cmd_list.Get(), eco, m_cameras[0].position, m_frame_index);
+                m_cmd_list.Get(), eco, cam.position, m_frame_index);
+
+            // Schedule readback of updated LOD values. A UAV→COPY_SOURCE
+            // transition is needed so the copy engine can read the UAV buffer.
+            // The actual CPU read happens at the start of the NEXT frame after
+            // wait_for_frame() confirms the GPU has finished this work.
+            if (layer_idx < m_ecosystem_gpu.size() &&
+                m_ecosystem_gpu[layer_idx].instance_resource() &&
+                m_ecosystem_gpu[layer_idx].instance_readback())
+            {
+                ID3D12Resource* src = m_ecosystem_gpu[layer_idx].instance_resource();
+                const uint64_t  bytes = static_cast<uint64_t>(eco.instance_count) *
+                                        sizeof(VegetationInstanceGpu);
+
+                D3D12_RESOURCE_BARRIER to_copy =
+                    CD3DX12_RESOURCE_BARRIER::Transition(src,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+                m_cmd_list->ResourceBarrier(1, &to_copy);
+
+                m_cmd_list->CopyBufferRegion(
+                    m_ecosystem_gpu[layer_idx].instance_readback(), 0,
+                    src, 0, bytes);
+
+                D3D12_RESOURCE_BARRIER to_common =
+                    CD3DX12_RESOURCE_BARRIER::Transition(src,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COMMON);
+                m_cmd_list->ResourceBarrier(1, &to_common);
+
+                if (layer_idx < m_lod_readback_pending.size())
+                    m_lod_readback_pending[layer_idx] = true;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// apply_vegetation_lod_updates
+//
+// Reads back the per-instance current_lod values written by the previous
+// frame's LOD selection compute pass and updates each vegetation instance's
+// TLAS entry to reference the correct per-LOD BLAS.
+//
+// Must be called AFTER wait_for_frame() so the GPU has finished writing the
+// readback buffer.  LOD_CULLED (0xFFFFFFFF) instances are hidden by pointing
+// them at the same BLAS but with a degenerate (zero-scale) transform would be
+// ideal; for now we simply keep them at their last valid LOD so culled
+// instances are merely frozen in their previous LOD tier.
+// ---------------------------------------------------------------------------
+void Renderer::apply_vegetation_lod_updates()
+{
+    auto& ecosystems = m_scene.ecosystems();
+
+    for (size_t layer_idx = 0; layer_idx < ecosystems.size(); ++layer_idx)
+    {
+        if (layer_idx >= m_lod_readback_pending.size() ||
+            !m_lod_readback_pending[layer_idx])
+            continue;
+
+        m_lod_readback_pending[layer_idx] = false;
+
+        EcosystemDesc& eco = ecosystems[layer_idx];
+        if (eco.instances.empty() || eco.instance_count == 0)
+            continue;
+
+        const uint32_t read_count = std::min(eco.instance_count,
+            static_cast<uint32_t>(eco.instances.size()));
+
+        std::vector<VegetationInstanceGpu> gpu_instances(read_count);
+        m_ecosystem_gpu[layer_idx].read_instances(gpu_instances.data(), read_count);
+
+        for (uint32_t i = 0; i < read_count; ++i)
+        {
+            const VegetationInstanceGpu& gi = gpu_instances[i];
+            VegetationInstance&          vi = eco.instances[i];
+
+            constexpr uint32_t LOD_CULLED = 0xFFFFFFFFu;
+            if (gi.current_lod == LOD_CULLED)
+                continue; // keep previous LOD BLAS until instance becomes visible again
+
+            const auto new_lod = static_cast<VegetationLOD>(
+                std::min(gi.current_lod,
+                         static_cast<uint32_t>(VegetationLOD::Impostor)));
+
+            if (new_lod == vi.current_lod)
+                continue; // no change — skip redundant set_instance calls
+
+            const uint32_t sp_idx = vi.species_index;
+            if (sp_idx >= eco.species.size()) continue;
+            const SpeciesDesc& sp = eco.species[sp_idx];
+
+            const auto li = static_cast<size_t>(new_lod);
+            if (sp.blas_indices[li].empty()) continue;
+            // Note: sp.model_indices[li] is UINT32_MAX for the Impostor LOD (procedural
+            // AABB — no model). Only skip if this is a mesh LOD with no model loaded.
+            const bool is_impostor_lod = (new_lod == VegetationLOD::Impostor);
+            if (!is_impostor_lod && sp.model_indices[li] == UINT32_MAX) continue;
+
+            const size_t submesh_n = sp.blas_indices[li].size(); // 1 for impostor, N for mesh LODs
+            const Mat4x4 world = vi.transform.to_matrix();
+
+            // Update only the slots used by the new LOD.
+            for (size_t s = 0; s < submesh_n; ++s)
+            {
+                const uint32_t blas_idx  = sp.blas_indices[li][s];
+                if (blas_idx == UINT32_MAX) continue;
+
+                const uint32_t tlas_slot = vi.tlas_instance + static_cast<uint32_t>(s);
+
+                const uint32_t mat_idx = (s < sp.material_indices[li].size())
+                                         ? sp.material_indices[li][s] : 0u;
+
+                m_path_tracer.set_instance(tlas_slot, blas_idx, world, mat_idx);
+
+                // Also patch the persistent CPU instance mirror so the GPU instance
+                // buffer reflects the new LOD's vertex/index/material data.
+                // Without this, shaders keep reading HighPoly mesh buffers even after
+                // the TLAS has been switched to a LowPoly or Impostor BLAS.
+                if (tlas_slot < m_cpu_instances.size())
+                {
+                    CpuInstanceData& id = m_cpu_instances[tlas_slot];
+                    id.material_index = mat_idx;
+
+                    if (is_impostor_lod)
+                    {
+                        // Impostor: no mesh geometry — clear mesh buffer slots so any
+                        // errant mesh-path code reads UINT32_MAX rather than stale data.
+                        id.vertex_buffer_srv      = UINT32_MAX;
+                        id.index_buffer_srv       = UINT32_MAX;
+                        id.prev_vertex_buffer_srv = UINT32_MAX;
+                    }
+                    else if (sp.model_indices[li] != UINT32_MAX)
+                    {
+                        const GpuModel& lod_model = m_resource_mgr.model(sp.model_indices[li]);
+                        if (s < lod_model.mesh_buffers.size())
+                        {
+                            const auto& mb = lod_model.mesh_buffers[s];
+                            id.vertex_buffer_srv = (mb.skinned_vertex_srv_slot() != UINT32_MAX)
+                                                   ? mb.skinned_vertex_srv_slot()
+                                                   : mb.vertex_srv_slot();
+                            id.index_buffer_srv       = mb.index_srv_slot();
+                            id.prev_vertex_buffer_srv = mb.wind_prev_pos_srv_slot();
+                        }
+                    }
+                }
+            }
+
+            // Flush the changed GPU instance buffer entries immediately so the
+            // next frame's shaders see the correct mesh/material data.
+            {
+                const uint32_t first = vi.tlas_instance;
+                const uint32_t n     = static_cast<uint32_t>(
+                    std::min(submesh_n, static_cast<size_t>(vi.tlas_slot_count)));
+                if (first < m_cpu_instances.size() && n > 0)
+                    m_path_tracer.upload_instance_data_range(
+                        m_device_ctx, m_cpu_instances.data() + first, first, n);
+            }
+
+            // Hide any extra slots that the previous LOD used but the new LOD does not.
+            // Use InstanceMask=0 so they are invisible to all ray types without
+            // creating aliased GPU virtual address ranges in the TLAS.
+            for (uint32_t s = static_cast<uint32_t>(submesh_n);
+                 s < vi.tlas_slot_count; ++s)
+            {
+                const uint32_t tlas_slot = vi.tlas_instance + s;
+                m_path_tracer.hide_instance(tlas_slot);
+            }
+
+            vi.current_lod = new_lod;
         }
     }
 }
@@ -1208,6 +1521,11 @@ void Renderer::render_frame_path_traced()
         MARS_LOG("[Renderer] render_frame_path_traced: frame {}", m_frame_index);
 
     wait_for_frame(back_index);
+
+    // Apply per-instance LOD updates from the previous frame's GPU readback.
+    // Must happen after wait_for_frame() (readback buffer is valid) and before
+    // dispatch_ecosystem() (which issues a new readback copy for this frame).
+    apply_vegetation_lod_updates();
 
     throw_if_failed(m_cmd_allocators[back_index]->Reset(), "CommandAllocator::Reset failed");
     throw_if_failed(m_cmd_list->Reset(m_cmd_allocators[back_index].Get(), nullptr),
@@ -1308,7 +1626,8 @@ void Renderer::render_frame_path_traced()
     // a UAV barrier, then refit the refittable BLAS. All placed instances of
     // the same species share the same BLAS, so one dispatch per submesh is
     // enough regardless of instance count.
-    bool any_vegetation_wind = false;
+    bool any_vegetation_wind    = false;
+    bool any_ecosystem_active   = false;   // true when any placed ecosystem is visible
     {
         auto& ecosystems = m_scene.ecosystems();
         for (size_t layer_idx = 0; layer_idx < ecosystems.size(); ++layer_idx)
@@ -1316,6 +1635,8 @@ void Renderer::render_frame_path_traced()
             EcosystemDesc& eco = ecosystems[layer_idx];
             if (!eco.enabled) continue;
             if (layer_idx >= m_ecosystem_placed.size() || !m_ecosystem_placed[layer_idx]) continue;
+            if (eco.instance_count > 0)
+                any_ecosystem_active = true;
 
             constexpr VegetationLOD k_wind_lods[] = {
                 VegetationLOD::Near, VegetationLOD::Mid, VegetationLOD::FarCluster };
@@ -1379,8 +1700,11 @@ void Renderer::render_frame_path_traced()
         }
     }
 
-    // Rebuild TLAS once if any BLAS was refitted this frame.
-    if (any_skinned || m_rigid_nodes_dirty || m_cloth_dirty || any_vegetation_wind)
+    // Rebuild TLAS once if any BLAS was refitted or ecosystem instances changed
+    // visibility / LOD this frame (culling + LOD selection both modify the GPU
+    // instance buffer; the TLAS must see the updated acceleration structures).
+    if (any_skinned || m_rigid_nodes_dirty || m_cloth_dirty ||
+        any_vegetation_wind || any_ecosystem_active)
         rebuild_tlas();
 
     for (uint32_t oi = 0; oi < m_display_manager.output_count(); ++oi)
@@ -1508,6 +1832,8 @@ void Renderer::render_frame_path_traced()
             {
                 if (oi < m_denoised_in_uav_state.size())
                     m_denoised_in_uav_state[oi] = true;
+                if (oi < m_output_in_psr_state.size())
+                    m_output_in_psr_state[oi] = true;
             }
 
             // After slEvaluateFeature (DLSS-RR), DenoisedOutputUAV is left in
@@ -1595,7 +1921,13 @@ void Renderer::render_frame_path_traced()
                     b.Type                       = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                     b.Flags                      = D3D12_RESOURCE_BARRIER_FLAG_NONE;
                     b.Transition.pResource       = res;
-                    b.Transition.StateBefore     = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                    b.Transition.StateBefore     = rr_evaluated
+                            ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE  // DLSS-RR consumed resources as SRVs
+                            : D3D12_RESOURCE_STATE_COMMON;                 // DLSS-RR skipped — resources still in COMMON
+                    // After the UAV restore barrier below, output_resource is back in UAV.
+                    if (res == m_path_tracer.output_resource(oi) &&
+                        oi < m_output_in_psr_state.size())
+                        m_output_in_psr_state[oi] = false;
                     b.Transition.StateAfter      = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
                     b.Transition.Subresource     = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
                 }
@@ -1724,5 +2056,389 @@ void Renderer::render_frame_clear()
     m_frame_fence_values[back_index] = m_frame_fence_next;
 }
 
-} // namespace mars
+// ---------------------------------------------------------------------------
+// save_screenshot
+// ---------------------------------------------------------------------------
+// Saves the denoised (and raw noisy) output buffers as PNG files.
+// File names: screenshot_<timestamp>_denoised.png, screenshot_<timestamp>_raw.png
+// Both are tone-mapped via DirectXTex convert (RGBA16F → RGBA8_UNORM).
+// ---------------------------------------------------------------------------
+void Renderer::save_screenshot(uint32_t output_index)
+{
+    MARS_LOG("[Screenshot] save_screenshot() called for output_index={}", output_index);
 
+    // Flush GPU so the frame is complete before we read it back.
+    MARS_LOG("[Screenshot] Flushing GPU (direct queue)...");
+    m_device_ctx.flush_direct_queue();
+    MARS_LOG("[Screenshot] Direct queue flush complete.");
+    MARS_LOG("[Screenshot] Flushing GPU (compute queue)...");
+    m_device_ctx.flush_compute_queue();
+    MARS_LOG("[Screenshot] Compute queue flush complete.");
+    MARS_LOG("[Screenshot] Flushing GPU (copy queue)...");
+    m_device_ctx.flush_copy_queue();
+    MARS_LOG("[Screenshot] Copy queue flush complete.");
+
+    // Helper: read back one RGBA16F texture → save as PNG.
+    auto readback_and_save = [&](ID3D12Resource* src,
+                                   D3D12_RESOURCE_STATES src_state,
+                                   const std::wstring& path)
+    {
+        const std::string path_str = std::filesystem::path(path).string();
+        MARS_LOG("[Screenshot] readback_and_save: '{}', src={}, src_state={:#x}",
+                 path_str, static_cast<void*>(src), static_cast<uint32_t>(src_state));
+
+        if (!src)
+        {
+            MARS_LOG("[Screenshot] Source resource is null, skipping '{}'.", path_str);
+            return;
+        }
+
+        D3D12_RESOURCE_DESC desc = src->GetDesc();
+        const uint32_t w = static_cast<uint32_t>(desc.Width);
+        const uint32_t h = desc.Height;
+        MARS_LOG("[Screenshot]   texture: {}x{}, format={:#x}, flags={:#x}",
+                 w, h, static_cast<uint32_t>(desc.Format), static_cast<uint32_t>(desc.Flags));
+
+        // Calculate the row pitch aligned to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT.
+        const uint32_t bytes_per_pixel = 8u; // RGBA16F = 4 * 2 bytes
+        const uint32_t row_pitch = (w * bytes_per_pixel + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u)
+                                   & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
+        const uint64_t total_bytes = static_cast<uint64_t>(row_pitch) * h;
+        MARS_LOG("[Screenshot]   row_pitch={}, total_bytes={}", row_pitch, total_bytes);
+
+        // Create a READBACK buffer.
+        MARS_LOG("[Screenshot]   Creating readback buffer...");
+        D3D12_HEAP_PROPERTIES heap_props{};
+        heap_props.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC buf_desc{};
+        buf_desc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buf_desc.Width            = total_bytes;
+        buf_desc.Height           = 1;
+        buf_desc.DepthOrArraySize = 1;
+        buf_desc.MipLevels        = 1;
+        buf_desc.Format           = DXGI_FORMAT_UNKNOWN;
+        buf_desc.SampleDesc       = { 1, 0 };
+        buf_desc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        buf_desc.Flags            = D3D12_RESOURCE_FLAG_NONE;
+
+        Microsoft::WRL::ComPtr<ID3D12Resource> readback_buf;
+        HRESULT hr = m_device_ctx.device()->CreateCommittedResource(
+            &heap_props, D3D12_HEAP_FLAG_NONE, &buf_desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&readback_buf));
+        if (FAILED(hr))
+        {
+            MARS_LOG("[Screenshot] Failed to create readback buffer (hr={:#x}).", static_cast<uint32_t>(hr));
+            return;
+        }
+        MARS_LOG("[Screenshot]   Readback buffer created OK.");
+
+        // Record the copy.
+        MARS_LOG("[Screenshot]   Resetting cmd allocator [0]...");
+        throw_if_failed(m_cmd_allocators[0]->Reset(), "Screenshot: CmdAlloc::Reset");
+        MARS_LOG("[Screenshot]   Resetting cmd list...");
+        throw_if_failed(m_cmd_list->Reset(m_cmd_allocators[0].Get(), nullptr), "Screenshot: CmdList::Reset");
+        MARS_LOG("[Screenshot]   Command list reset OK.");
+
+        // Transition source to COPY_SOURCE.
+        MARS_LOG("[Screenshot]   Recording barrier: state {:#x} -> COPY_SOURCE ({:#x})...",
+                 static_cast<uint32_t>(src_state),
+                 static_cast<uint32_t>(D3D12_RESOURCE_STATE_COPY_SOURCE));
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource   = src;
+        barrier.Transition.StateBefore = src_state;
+        barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        m_cmd_list->ResourceBarrier(1, &barrier);
+        MARS_LOG("[Screenshot]   Barrier recorded.");
+
+        D3D12_TEXTURE_COPY_LOCATION src_loc{};
+        src_loc.pResource        = src;
+        src_loc.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src_loc.SubresourceIndex = 0;
+
+        D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+        dst_loc.pResource                          = readback_buf.Get();
+        dst_loc.Type                               = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst_loc.PlacedFootprint.Offset             = 0;
+        dst_loc.PlacedFootprint.Footprint.Format   = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        dst_loc.PlacedFootprint.Footprint.Width    = w;
+        dst_loc.PlacedFootprint.Footprint.Height   = h;
+        dst_loc.PlacedFootprint.Footprint.Depth    = 1;
+        dst_loc.PlacedFootprint.Footprint.RowPitch = row_pitch;
+
+        MARS_LOG("[Screenshot]   Recording CopyTextureRegion...");
+        m_cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+        MARS_LOG("[Screenshot]   CopyTextureRegion recorded.");
+
+        // Transition back.
+        MARS_LOG("[Screenshot]   Recording barrier back: COPY_SOURCE -> {:#x}...",
+                 static_cast<uint32_t>(src_state));
+        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+        m_cmd_list->ResourceBarrier(1, &barrier);
+        MARS_LOG("[Screenshot]   Return barrier recorded.");
+
+        MARS_LOG("[Screenshot]   Closing command list...");
+        throw_if_failed(m_cmd_list->Close(), "Screenshot: CmdList::Close");
+        MARS_LOG("[Screenshot]   Executing command list...");
+        ID3D12CommandList* lists[] = { m_cmd_list.Get() };
+        m_device_ctx.direct_queue()->ExecuteCommandLists(1, lists);
+        MARS_LOG("[Screenshot]   Flushing GPU after copy...");
+        m_device_ctx.flush_gpu();
+        MARS_LOG("[Screenshot]   GPU flush after copy complete.");
+
+        // Map the readback buffer.
+        MARS_LOG("[Screenshot]   Mapping readback buffer...");
+        void* mapped = nullptr;
+        hr = readback_buf->Map(0, nullptr, &mapped);
+        if (FAILED(hr))
+        {
+            MARS_LOG("[Screenshot] Failed to map readback buffer (hr={:#x}).", static_cast<uint32_t>(hr));
+            return;
+        }
+        MARS_LOG("[Screenshot]   Readback buffer mapped at {:p}.", mapped);
+
+        // Build a DirectXTex image from the mapped RGBA16F data.
+        DirectX::Image img{};
+        img.width      = w;
+        img.height     = h;
+        img.format     = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        img.rowPitch   = row_pitch;
+        img.slicePitch = static_cast<size_t>(row_pitch) * h;
+        img.pixels     = static_cast<uint8_t*>(mapped);
+
+        // Convert RGBA16F → RGBA8_UNORM with simple tone-mapping (clamp).
+        MARS_LOG("[Screenshot]   Converting RGBA16F -> RGBA8...");
+        DirectX::ScratchImage converted;
+        hr = DirectX::Convert(img, DXGI_FORMAT_R8G8B8A8_UNORM,
+                              DirectX::TEX_FILTER_DEFAULT | DirectX::TEX_FILTER_FORCE_NON_WIC,
+                              DirectX::TEX_THRESHOLD_DEFAULT, converted);
+
+        readback_buf->Unmap(0, nullptr);
+        MARS_LOG("[Screenshot]   Readback buffer unmapped.");
+
+        if (FAILED(hr))
+        {
+            MARS_LOG("[Screenshot] DirectXTex Convert failed (hr={:#x}).", static_cast<uint32_t>(hr));
+            return;
+        }
+        MARS_LOG("[Screenshot]   Convert OK. Saving PNG to '{}'...", path_str);
+
+        // Save as PNG using WIC.
+        hr = DirectX::SaveToWICFile(*converted.GetImages(), DirectX::WIC_FLAGS_NONE,
+                                    GUID_ContainerFormatPng, path.c_str());
+        if (SUCCEEDED(hr))
+            MARS_LOG("[Screenshot] Saved: {}", path_str);
+        else
+            MARS_LOG("[Screenshot] SaveToWICFile failed (hr={:#x}) for '{}'.", static_cast<uint32_t>(hr), path_str);
+    };
+
+    // Build a timestamp string for unique filenames.
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    const std::wstring ts = std::format(L"{:04d}{:02d}{:02d}_{:02d}{:02d}{:02d}",
+                                        st.wYear, st.wMonth, st.wDay,
+                                        st.wHour, st.wMinute, st.wSecond);
+    MARS_LOG("[Screenshot] Timestamp: {}", std::filesystem::path(ts).string());
+
+    // Ensure the dumps output directory exists.
+    const std::filesystem::path dump_dir = "dumps";
+    std::filesystem::create_directories(dump_dir);
+
+    // Log what state flags say about each output resource.
+    MARS_LOG("[Screenshot] m_output_in_psr_state size={}, output_index={}",
+             m_output_in_psr_state.size(), output_index);
+    if (output_index < m_output_in_psr_state.size())
+        MARS_LOG("[Screenshot] m_output_in_psr_state[{}]={}", output_index, m_output_in_psr_state[output_index]);
+
+    // denoised_output_resource ends the frame in COMMON: render_frame_path_traced
+    // explicitly transitions it UAV→COMMON after slEvaluateFeature (DLSS-RR).
+    // output_resource (raw noisy) ends the frame in UNORDERED_ACCESS: it is
+    // restored to UAV at the end of the per-output barrier block.
+    MARS_LOG("[Screenshot] --- Capturing denoised output ---");
+    readback_and_save(m_path_tracer.denoised_output_resource(output_index),
+                      D3D12_RESOURCE_STATE_COMMON,
+                      (dump_dir / std::format(L"screenshot_{}_denoised.png", ts)).wstring());
+    // output_resource ends each frame in UAV, UNLESS DLSS-RR ran and the
+    // per-output PSR tracking flag was not yet cleared (e.g. screenshot taken
+    // immediately after the frame fence wait, before the barrier loop ran).
+    // In practice flush_gpu() ensures the frame is complete, but the CPU-side
+    // flag reflects the barrier state that was recorded into the command list,
+    // so honour it to avoid RESOURCE_BARRIER_BEFORE_AFTER_MISMATCH.
+    const D3D12_RESOURCE_STATES raw_state =
+        (output_index < m_output_in_psr_state.size() && m_output_in_psr_state[output_index])
+        ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+        : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    MARS_LOG("[Screenshot] --- Capturing raw output (assumed state={:#x}) ---",
+             static_cast<uint32_t>(raw_state));
+    readback_and_save(m_path_tracer.output_resource(output_index),
+                      raw_state,
+                      (dump_dir / std::format(L"screenshot_{}_raw.png", ts)).wstring());
+
+    // ---- Scene / camera JSON dump -------------------------------------------
+    {
+        const std::string json_path = (dump_dir / std::format("screenshot_{}.json",
+                                                   std::filesystem::path(ts).string())).string();
+
+        std::ofstream f(json_path);
+        if (f)
+        {
+            // Tiny helpers to write JSON without pulling in a full library.
+            auto jvec3 = [](const Vec3& v) {
+                return std::format("[{:.4f}, {:.4f}, {:.4f}]", v.x, v.y, v.z);
+            };
+            auto jfloat = [](float v) { return std::format("{:.4f}", v); };
+
+            f << "{\n";
+
+            // ---- frame info -----------------------------------------------
+            f << "  \"frame_timestamp\": \"" << std::filesystem::path(ts).string() << "\",\n";
+
+            // ---- active camera (runtime state) ----------------------------
+            f << "  \"active_camera\": {\n";
+            if (output_index < m_cameras.size())
+            {
+                const CameraState& cs = m_cameras[output_index];
+
+                // Extract forward, right, up from the inverse-view matrix
+                // (columns of the rotation part in a standard view-inv).
+                // view_inv col 0 = right, col 1 = up, col 2 = forward (into scene).
+                Vec3 right   = { cs.view_inv.m[0][0], cs.view_inv.m[1][0], cs.view_inv.m[2][0] };
+                Vec3 up      = { cs.view_inv.m[0][1], cs.view_inv.m[1][1], cs.view_inv.m[2][1] };
+                Vec3 forward = { cs.view_inv.m[0][2], cs.view_inv.m[1][2], cs.view_inv.m[2][2] };
+
+                f << "    \"position\": " << jvec3(cs.position) << ",\n";
+                f << "    \"forward\":  " << jvec3(forward)     << ",\n";
+                f << "    \"up\":       " << jvec3(up)          << ",\n";
+                f << "    \"right\":    " << jvec3(right)       << "\n";
+            }
+            f << "  },\n";
+
+            // ---- scene name / skybox --------------------------------------
+            const Scene&     sc  = m_scene;
+            const SkyboxDesc& sky = sc.skybox();
+            const char* sky_type_str = "debug";
+            switch (sky.type)
+            {
+                case SkyboxDesc::Type::Physical: sky_type_str = "physical"; break;
+                case SkyboxDesc::Type::HDRI:     sky_type_str = "hdri";     break;
+                case SkyboxDesc::Type::Black:    sky_type_str = "black";    break;
+                default: break;
+            }
+            f << "  \"scene_name\": \"" << sc.name() << "\",\n";
+            f << "  \"skybox\": {\n";
+            f << "    \"type\": \"" << sky_type_str << "\",\n";
+            f << "    \"sun_direction\": " << jvec3(sky.sun_direction) << ",\n";
+            f << "    \"sun_color\": "     << jvec3(sky.sun_color)     << ",\n";
+            f << "    \"sun_intensity\": " << jfloat(sky.sun_intensity) << "\n";
+            f << "  },\n";
+
+            // ---- scene lights ---------------------------------------------
+            f << "  \"lights\": [\n";
+            for (size_t i = 0; i < sc.lights().size(); ++i)
+            {
+                const LightDesc& l = sc.lights()[i];
+                const char* lt = l.type == LightType::Point  ? "point"
+                               : l.type == LightType::Spot   ? "spot"
+                               : "directional";
+                f << "    {\n";
+                f << "      \"name\": \""      << l.name      << "\",\n";
+                f << "      \"type\": \""      << lt          << "\",\n";
+                f << "      \"direction\": "   << jvec3(l.direction)  << ",\n";
+                f << "      \"position\": "    << jvec3(l.position)   << ",\n";
+                f << "      \"color\": "       << jvec3(l.color)      << ",\n";
+                f << "      \"intensity\": "   << jfloat(l.intensity) << "\n";
+                f << "    }" << (i + 1 < sc.lights().size() ? "," : "") << "\n";
+            }
+            f << "  ],\n";
+
+            // ---- model instances -----------------------------------------
+            f << "  \"models\": [\n";
+            for (size_t i = 0; i < sc.instances().size(); ++i)
+            {
+                const SceneModelInstance& inst = sc.instances()[i];
+                const Transform& t = inst.transform;
+                f << "    {\n";
+                f << "      \"name\": \""     << inst.name     << "\",\n";
+                f << "      \"position\": "   << jvec3(t.position) << ",\n";
+                f << "      \"scale\": "      << jfloat(t.scale)   << ",\n";
+                f << "      \"rotation\": [" << std::format("{:.4f}, {:.4f}, {:.4f}, {:.4f}",
+                                                            t.rotation.x, t.rotation.y,
+                                                            t.rotation.z, t.rotation.w) << "]\n";
+                f << "    }" << (i + 1 < sc.instances().size() ? "," : "") << "\n";
+            }
+            f << "  ],\n";
+
+            // ---- ecosystems ----------------------------------------------
+            f << "  \"ecosystems\": [\n";
+            for (size_t ei = 0; ei < sc.ecosystems().size(); ++ei)
+            {
+                const EcosystemDesc& eco = sc.ecosystems()[ei];
+                f << "    {\n";
+                f << "      \"enabled\": "         << (eco.enabled ? "true" : "false") << ",\n";
+                f << "      \"instance_count\": "  << eco.instance_count << ",\n";
+                f << "      \"world_min\": "        << jvec3(eco.world_min) << ",\n";
+                f << "      \"world_max\": "        << jvec3(eco.world_max) << ",\n";
+                f << "      \"placement_y\": "      << jfloat(eco.placement_y) << ",\n";
+                f << "      \"lod_dither_band_meters\": " << jfloat(eco.lod_dither_band_meters) << ",\n";
+                f << "      \"species\": [\n";
+                for (size_t si = 0; si < eco.species.size(); ++si)
+                {
+                    const SpeciesDesc& sp = eco.species[si];
+                    f << "        {\n";
+                    f << "          \"name\": \""           << sp.name          << "\",\n";
+                    f << "          \"lod_near_max\": "     << jfloat(sp.lod_near_max)     << ",\n";
+                    f << "          \"lod_mid_max\": "      << jfloat(sp.lod_mid_max)      << ",\n";
+                    f << "          \"lod_far_max\": "      << jfloat(sp.lod_far_max)      << ",\n";
+                    f << "          \"max_draw_distance\": "<< jfloat(sp.max_draw_distance) << "\n";
+                    f << "        }" << (si + 1 < eco.species.size() ? "," : "") << "\n";
+                }
+                f << "      ],\n";
+                // Dump first few placed instances for spatial context
+                const auto& insts = eco.instances;
+                f << "      \"placed_instance_count\": " << insts.size() << ",\n";
+                f << "      \"placed_instances_sample\": [\n";
+                const size_t sample_max = std::min(insts.size(), size_t(20));
+                for (size_t ii = 0; ii < sample_max; ++ii)
+                {
+                    const VegetationInstance& vi = insts[ii];
+                    const char* lod_str =
+                        vi.current_lod == VegetationLOD::Near        ? "Near"
+                      : vi.current_lod == VegetationLOD::Mid         ? "Mid"
+                      : vi.current_lod == VegetationLOD::FarCluster  ? "FarCluster"
+                      : vi.current_lod == VegetationLOD::Impostor    ? "Impostor"
+                      : "Culled";
+                    // Derive Y-axis rotation in degrees from the quaternion (vegetation
+                    // is only ever rotated around world-Y by the placement shader).
+                    const Quaternion& q = vi.transform.rotation;
+                    const float yaw_rad = 2.0f * std::atan2(q.y, q.w);
+                    const float yaw_deg = yaw_rad * (180.0f / 3.14159265358979323846f);
+                    f << "        {\n";
+                    f << "          \"pos\": "      << jvec3(vi.transform.position) << ",\n";
+                    f << "          \"rotation_quat\": [" << std::format("{:.4f}, {:.4f}, {:.4f}, {:.4f}", q.x, q.y, q.z, q.w) << "],\n";
+                    f << "          \"yaw_deg\": "  << std::format("{:.2f}", yaw_deg) << ",\n";
+                    f << "          \"scale\": "    << jfloat(vi.transform.scale) << ",\n";
+                    f << "          \"species\": "  << vi.species_index << ",\n";
+                    f << "          \"lod\": \""    << lod_str << "\"\n";
+                    f << "        }" << (ii + 1 < sample_max ? "," : "") << "\n";
+                }
+                f << "      ]\n";
+                f << "    }" << (ei + 1 < sc.ecosystems().size() ? "," : "") << "\n";
+            }
+            f << "  ]\n";
+
+            f << "}\n";
+            f.flush();
+            MARS_LOG("[Screenshot] Scene JSON saved: {}", json_path);
+        }
+        else
+        {
+            MARS_LOG("[Screenshot] WARNING: could not open '{}' for writing.", json_path);
+        }
+    }
+
+    MARS_LOG("[Screenshot] Done.");
+}
+
+} // namespace mars

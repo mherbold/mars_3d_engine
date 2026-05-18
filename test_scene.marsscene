@@ -4,10 +4,10 @@
   },
   "skybox": {
     "type": "hdri",
-    "hdri": "models/hdri/DaySkyHDRI007B_8K_HDR.exr",
+    "hdri": "models/hdri/DayEnvironmentHDRI107_4K_HDR.exr",
     "sun_direction": [ 0.5, 0.5, 0.5 ],
     "sun_color": [ 1.0, 0.95, 0.85 ],
-    "sun_intensity": 5.0,
+    "sun_intensity": 3.0,
     "_note": "Switch type to 'physical' for the procedural debug skybox. Switch to 'hdri' with an equirectangular .hdr/.exr path for HDRI sky."
   },
   "cameras": [
@@ -26,12 +26,13 @@
       "type": "directional",
       "direction": [ 0.5, 0.5, 0.5 ],
       "color": [ 1.0, 0.95, 0.85 ],
-      "intensity": 5.0
+      "intensity": 3.0
     }
   ],
   "models": [
     {
       "id": "ground_plane",
+      "enabled": true,
       "file": "models/ground_plane.obj",
       "transform": {
         "position": [ 0.0, 0.0, 0.0 ]
@@ -488,23 +489,51 @@
 
   "ecosystems": [
     {
+      "name": "Single Test Tree",
+      "enabled": false,
+      "density_map": "models/vegetation/density_white_4x4.png",
+      "world_min": [ -1.0, 0.0, -1.0 ],
+      "world_max": [ 1.0, 0.0, 1.0 ],
+      "placement_y": 0.0,
+      "density_multiplier": 1.0,
+      "max_instances": 1,
+      "frustum_cull_margin": 50.0,
+      "lod_dither_band_meters": 0,
+      "species": [
+        {
+          "name": "White Oak",
+          "asset_path": "models/vegetation/White_Oak",
+          "lod_near_max":10.0,
+          "lod_mid_max": 11.0,
+          "lod_far_max": 12.0,
+          "max_draw_distance": 100.0,
+          "primary_bend_strength": 0.0,
+          "primary_bend_speed": 0.0,
+          "wind_leaf_flutter_strength": 0.0,
+          "wind_leaf_flutter_speed": 0.0,
+          "spawn_weight": 1.0
+        }
+      ]
+    },
+    {
       "name": "Tree Canopy",
       "enabled": true,
       "density_map": "models/vegetation/density_white_4x4.png",
-      "world_min": [ -10.0, 0.0, -10.0 ],
-      "world_max": [  10.0, 0.0,  10.0 ],
+      "world_min": [ -15.0, 0.0, -15.0 ],
+      "world_max": [ 15.0, 0.0, 15.0 ],
       "placement_y": 0.0,
       "density_multiplier": 1.0,
       "max_instances": 30,
       "frustum_cull_margin": 50.0,
+      "lod_dither_band_meters": 1.0,
       "species": [
         {
           "name": "European Linden",
           "asset_path": "models/vegetation/European_Linden",
-          "lod_near_max": 50.0,
-          "lod_mid_max": 200.0,
-          "lod_far_max": 600.0,
-          "max_draw_distance": 2000.0,
+          "lod_near_max": 10.0,
+          "lod_mid_max": 20.0,
+          "lod_far_max": 30.0,
+          "max_draw_distance": 100.0,
           "primary_bend_strength": 0.2,
           "primary_bend_speed": 0.15,
           "wind_leaf_flutter_strength": 0.15,
@@ -514,40 +543,40 @@
         {
           "name": "White Oak",
           "asset_path": "models/vegetation/White_Oak",
-          "lod_near_max": 50.0,
-          "lod_mid_max": 200.0,
-          "lod_far_max": 600.0,
-          "max_draw_distance": 2000.0,
+          "lod_near_max": 10.0,
+          "lod_mid_max": 20.0,
+          "lod_far_max": 30.0,
+          "max_draw_distance": 100.0,
           "primary_bend_strength": 0.05,
           "primary_bend_speed": 0.04,
-          "wind_leaf_flutter_strength": 0.1,
+          "wind_leaf_flutter_strength": 0.2,
           "wind_leaf_flutter_speed": 0.4,
           "spawn_weight": 1.0
         },
         {
           "name": "Japanese Maple",
           "asset_path": "models/vegetation/Japanese_Maple",
-          "lod_near_max": 50.0,
-          "lod_mid_max": 200.0,
-          "lod_far_max": 600.0,
-          "max_draw_distance": 2000.0,
+          "lod_near_max": 10.0,
+          "lod_mid_max": 20.0,
+          "lod_far_max": 30.0,
+          "max_draw_distance": 100.0,
           "primary_bend_strength": 0.25,
           "primary_bend_speed": 0.18,
           "wind_leaf_flutter_strength": 0.2,
-          "wind_leaf_flutter_speed": 0.7,
+          "wind_leaf_flutter_speed": 0.6,
           "spawn_weight": 1.0
         },
         {
           "name": "Red Maple Young",
           "asset_path": "models/vegetation/Red_Maple_Young",
-          "lod_near_max": 50.0,
-          "lod_mid_max": 200.0,
-          "lod_far_max": 600.0,
-          "max_draw_distance": 2000.0,
+          "lod_near_max": 10.0,
+          "lod_mid_max": 20.0,
+          "lod_far_max": 30.0,
+          "max_draw_distance": 100.0,
           "primary_bend_strength": 0.3,
           "primary_bend_speed": 0.22,
           "wind_leaf_flutter_strength": 0.25,
-          "wind_leaf_flutter_speed": 0.8,
+          "wind_leaf_flutter_speed": 0.5,
           "spawn_weight": 1.0
         }
       ]
@@ -556,19 +585,20 @@
       "name": "Ground Cover",
       "enabled": true,
       "density_map": "models/vegetation/density_white_4x4.png",
-      "world_min": [ -10.0, 0.0, -10.0 ],
-      "world_max": [  10.0, 0.0,  10.0 ],
+      "world_min": [ -20.0, 0.0, -20.0 ],
+      "world_max": [ 20.0, 0.0, 20.0 ],
       "placement_y": 0.0,
       "density_multiplier": 30.0,
-      "max_instances": 2000,
+      "max_instances": 5000,
       "frustum_cull_margin": 20.0,
+      "lod_dither_band_meters": 1.0,
       "species": [
         {
           "name": "Backyard Grass",
           "asset_path": "models/vegetation/Backyard_Grass",
           "lod_near_max": 10.0,
-          "lod_mid_max": 30.0,
-          "lod_far_max": 60.0,
+          "lod_mid_max": 20.0,
+          "lod_far_max": 30.0,
           "max_draw_distance": 100.0,
           "primary_bend_strength": 0,
           "primary_bend_speed": 0,
@@ -579,10 +609,10 @@
         {
           "name": "Boston Fern",
           "asset_path": "models/vegetation/Boston_Fern",
-          "lod_near_max": 15.0,
-          "lod_mid_max": 40.0,
-          "lod_far_max": 80.0,
-          "max_draw_distance": 150.0,
+          "lod_near_max": 10.0,
+          "lod_mid_max": 20.0,
+          "lod_far_max": 30.0,
+          "max_draw_distance": 100.0,
           "primary_bend_strength": 0,
           "primary_bend_speed": 0,
           "wind_leaf_flutter_strength": 0.45,
@@ -592,10 +622,10 @@
         {
           "name": "Azalea",
           "asset_path": "models/vegetation/Azalea",
-          "lod_near_max": 20.0,
-          "lod_mid_max": 60.0,
-          "lod_far_max": 120.0,
-          "max_draw_distance": 200.0,
+          "lod_near_max": 10.0,
+          "lod_mid_max": 20.0,
+          "lod_far_max": 30.0,
+          "max_draw_distance": 100.0,
           "primary_bend_strength": 0,
           "primary_bend_speed": 0,
           "wind_leaf_flutter_strength": 0.2,

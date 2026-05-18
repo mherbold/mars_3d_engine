@@ -103,6 +103,10 @@ bool SceneLoader::load(const std::string& file_path,
         {
             scene.m_skybox.type = SkyboxDesc::Type::Physical;
         }
+        else if (type_str == "black")
+        {
+            scene.m_skybox.type = SkyboxDesc::Type::Black;
+        }
         else
         {
             scene.m_skybox.type = SkyboxDesc::Type::Debug;
@@ -518,10 +522,12 @@ bool SceneLoader::load(const std::string& file_path,
             if (je.contains("world_max"))
                 eco.world_max = json_vec3(je["world_max"], {  1000.0f, 0.0f,  1000.0f });
 
-            eco.placement_y         = je.value("placement_y", 0.0f);
-            eco.density_multiplier  = je.value("density_multiplier", 1.0f);
-            eco.max_instances       = je.value("max_instances", 10000u);
-            eco.frustum_cull_margin = je.value("frustum_cull_margin", 50.0f);
+            eco.placement_y            = je.value("placement_y", 0.0f);
+            eco.density_multiplier     = je.value("density_multiplier", 1.0f);
+            eco.max_instances          = je.value("max_instances", 10000u);
+            eco.frustum_cull_margin    = je.value("frustum_cull_margin", 50.0f);
+            eco.lod_dither_band_meters = je.value("lod_dither_band_meters", 1.0f);
+            eco.impostor_debug_atlas   = je.value("impostor_debug_atlas", false);
 
             if (je.contains("species"))
             {
@@ -546,7 +552,8 @@ bool SceneLoader::load(const std::string& file_path,
                     species.wind_leaf_flutter_strength   = jsp.value("wind_leaf_flutter_strength", 0.2f);
                     species.wind_leaf_flutter_speed      = jsp.value("wind_leaf_flutter_speed", 1.0f);
 
-                    species.spawn_weight = jsp.value("spawn_weight", 1.0f);
+                    species.bounding_radius = jsp.value("bounding_radius", 20.0f);
+                    species.spawn_weight    = jsp.value("spawn_weight", 1.0f);
 
                     eco.species.push_back(species);
 
